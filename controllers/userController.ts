@@ -4,41 +4,67 @@ import bcrypt from 'bcrypt';
 import path from 'path';
 import jwt from 'jsonwebtoken';
 import { RequestHandler } from 'express';
+import { ResultSetHeader, FieldPacket } from 'mysql2/promise';
+
 import { DB } from '../db';
 import { generateUserKeys } from './encryptionController';
-import { createUserDirectories, deleteUserDirectories } from './directoryController';
+import { createUserDirectories, deleteUserDirectories, DataAccessContext } from './directoryController';
 
 const basePath = path.join(process.env.MIRRORSTORAGE!);
-const storagePath = path.join(basePath,'users');
+const storagePath = path.join(basePath, 'users');
 const SALT_ROUNDS = 10;
 
 // === CORE LOGIC FUNCTIONS ===
 
-export async function createUserInDB(username: string, email: string, password: string): Promise<void> {
+export async function createUserInDB(username: string, email: string, password: string): Promise<number> {
   console.log(`[CreateUserInDb()]: Attempting to create account for ${username}`);
 
   const [existing] = await DB.query('SELECT id FROM users WHERE email=?', [email]);
   if ((existing as any[]).length > 0) {
-    throw new Error('EMAIL ALREADY REGISTERED');
+    throw new Error('EMAIL_ALREADY_REGISTERED');
   }
 
   const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
-  const result: any = await DB.query(
+
+  const [result] = await DB.query<ResultSetHeader>(
     'INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)',
     [username, email, hashedPassword]
-  );
+  )
+	
+  // Get the inserted user ID
+  const userId = result.insertId;
+  console.log(`[New user created with] -> ID:${userId}`);
 
-  const userInfo = await fetchUserInfo(email);
-  console.log(`[User Info] -> ${userInfo.id}`);
-  
-  const userId = userInfo.id.toString();
-  await createUserDirectories(userId,storagePath);
-  await generateUserKeys(userId,storagePath);
+  // Create user directories and keys
+  await createUserDirectories(userId.toString(), storagePath);
+  await generateUserKeys(userId.toString(), storagePath);
+
+  // Return the user ID
+  return userId;
 }
 
-export async function deleteUserData(userId: string): Promise<void> {
-  await DB.query('DELETE FROM users WHERE id = ?', [userId]);
-  await deleteUserDirectories(userId, basePath);
+export async function deleteUserFromDB(userId: string, adminUserId: number): Promise<void> {
+  console.log(`[DeleteUserFromDB]: Attempting to delete user ${userId}`);
+
+  try {
+    // Create context for the deletion operation
+    const context: DataAccessContext = {
+      userId: parseInt(userId),
+      accessedBy: adminUserId,
+      reason: 'user_account_deletion'
+    };
+
+    // Delete user directories with proper context
+    await deleteUserDirectories(userId, context);
+
+    // Delete user from database
+    await DB.query('DELETE FROM users WHERE id = ?', [userId]);
+
+    console.log(`[DeleteUserFromDB]: Successfully deleted user ${userId}`);
+  } catch (error) {
+    console.error(`[DeleteUserFromDB ERROR]: Failed to delete user ${userId}:`, error);
+    throw new Error(`Failed to delete user: ${(error as Error).message}`);
+  }
 }
 
 export async function userLogin(email: string, password: string): Promise<string> {
@@ -75,17 +101,22 @@ export async function updateUserEmail(userId: string, newEmail: string): Promise
   if ((existing as any[]).length > 0) {
     throw new Error('EMAIL ALREADY REGISTERED');
   }
-
   await DB.query('UPDATE users SET email = ? WHERE id = ?', [newEmail, userId]);
 }
 
-export async function fetchUserInfo(email: string): Promise<{ id: number; email: string }> {
-  const [rows] = await DB.query('SELECT * FROM users WHERE email = ?', [email]);
-  const user = (rows as any[])[0];
+export async function fetchUserInfo(email: string): Promise<{ id: number; email: string; username: string }> {
+  const [rows] = await DB.query('SELECT id, email, username FROM users WHERE email = ?', [email]);
+  const users = rows as any[];
 
-  if (!user) throw new Error('INVALID CREDENTIALS');
+  if (users.length === 0) {
+    throw new Error('User not found');
+  }
 
-  return { id: user.id, email: user.email };
+  return {
+    id: users[0].id,
+    email: users[0].email,
+    username: users[0].username
+  };
 }
 
 // === EXPRESS HANDLERS ===
@@ -125,15 +156,18 @@ export const updateUserEmailHandler: RequestHandler = async (req, res) => {
 };
 
 export const deleteUserHandler: RequestHandler = async (req, res) => {
-  const { userId } = req.body;
+  const { userId, adminUserId } = req.body;
 
   if (!userId) {
     res.status(400).json({ error: 'Missing userId' });
     return;
   }
 
+  // If adminUserId is not provided, assume the user is deleting their own account
+  const effectiveAdminUserId = adminUserId || parseInt(userId);
+
   try {
-    await deleteUserData(userId);
+    await deleteUserFromDB(userId, effectiveAdminUserId);
     res.status(200).json({ message: 'User deleted successfully' });
   } catch (err) {
     console.error('[User Deletion Error]', err);
