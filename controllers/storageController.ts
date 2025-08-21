@@ -43,6 +43,7 @@ export const createDirectoriesHandler: RequestHandler = async (req, res) => {
 // Store data endpoint
 export const storeDataHandler: RequestHandler = async (req, res) => {
   try {
+  	console.log('USER SUBMITTED Data ->', req.body);
     const { userId, tier, filename, data, metadata } = req.body;
     
     if (!userId || !tier || !filename || !data) {

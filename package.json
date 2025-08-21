@@ -16,6 +16,7 @@
     "express": "^5.1.0",
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
+    "multer": "^2.0.2",
     "mysql2": "^3.14.1",
     "ws": "^8.18.2"
   },
@@ -23,6 +24,7 @@
     "@types/bcrypt": "^5.0.2",
     "@types/express": "^5.0.2",
     "@types/jsonwebtoken": "^9.0.9",
+    "@types/multer": "^2.0.0",
     "@types/node": "^22.15.27",
     "@types/ws": "^8.18.1",
     "ts-node": "^10.9.2",

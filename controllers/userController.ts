@@ -9,7 +9,6 @@ import { ResultSetHeader, FieldPacket } from 'mysql2/promise';
 import { DB } from '../db';
 import { generateUserKeys } from './encryptionController';
 import { createUserDirectories, deleteUserDirectories, DataAccessContext } from './directoryController';
-
 const basePath = path.join(process.env.MIRRORSTORAGE!);
 const storagePath = path.join(basePath, 'users');
 const SALT_ROUNDS = 10;
