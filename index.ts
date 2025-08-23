@@ -12,6 +12,7 @@ import authRoutes from './routes/auth';
 import userRoutes from './routes/user';
 import storageRoutes from './routes/storage';
 import debugRoutes from './routes/debug';
+import intakeRoutes from './routes/intake';
 
 // WEBSOCKET
 import { SetupWebSocket } from './wss/setupWSS';
@@ -53,6 +54,7 @@ APP.use('/mirror/api/auth', authRoutes);
 APP.use('/mirror/api/user', userRoutes);
 APP.use('/mirror/api/storage', storageRoutes);
 APP.use('/mirror/api/debug', debugRoutes);
+APP.use('/mirror/api/intake', intakeRoutes);
 
 
 // ✅ 5. SSL certificate loading
