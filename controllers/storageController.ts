@@ -140,7 +140,7 @@ export const storeDataHandler: RequestHandler = async (req, res) => {
       const tier = normalizeTier(tierRaw, typeRaw);
 
       // Ensure user directories exist before writes
-      await createUserDirectories(userId);
+      //await createUserDirectories(userId);
 
       const results: Array<{
         success: boolean;
@@ -230,7 +230,7 @@ export const storeDataHandler: RequestHandler = async (req, res) => {
     const normalizedTier = normalizeTier(String(tier), typeRaw);
 
     // Ensure user directories exist before writes
-    await createUserDirectories(String(userId));
+    //await createUserDirectories(String(userId));
 
     // Detect base64 vs utf8
     const likelyBase64 = /^[A-Za-z0-9+/=\s]+$/.test(data) && data.length % 4 === 0;
