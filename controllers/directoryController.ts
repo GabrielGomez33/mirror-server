@@ -648,4 +648,4 @@ export async function deleteFile(filePath: string): Promise<void> {
 }
 
 export default DirectoryController;
-export { DirectoryController, TierType, SubDirType, FileMetadata, DataAccessContext };// controllers/directoryController.ts
+export { DirectoryController, TierType, SubDirType, FileMetadata, DataAccessContext };
