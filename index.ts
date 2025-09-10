@@ -13,6 +13,7 @@ import userRoutes from './routes/user';
 import storageRoutes from './routes/storage';
 import debugRoutes from './routes/debug';
 import intakeRoutes from './routes/intake';
+import dashboardRoutes from './routes/dashboard';
 
 // WEBSOCKET
 import { SetupWebSocket } from './wss/setupWSS';
@@ -43,7 +44,7 @@ APP.use((req, res, next) => {
 
   // If you still need the raw body for some reason, you'd need to buffer it differently
   // or use a library that provides it after parsing.
-  // For debugging parsed body:
+  // For debugging parsed body
   console.log('[DEBUG] Parsed Body:', req.body);
 
   next();
@@ -55,7 +56,7 @@ APP.use('/mirror/api/user', userRoutes);
 APP.use('/mirror/api/storage', storageRoutes);
 APP.use('/mirror/api/debug', debugRoutes);
 APP.use('/mirror/api/intake', intakeRoutes);
-
+APP.use('/mirror/api/dashboard', dashboardRoutes);
 
 // ✅ 5. SSL certificate loading
 const PRIV = fs.readFileSync(process.env.TUGRRPRIV!, 'utf8');

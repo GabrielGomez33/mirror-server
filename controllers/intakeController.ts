@@ -523,9 +523,9 @@ export class IntakeDataManager {
         encryptionLevel: row.encryption_level,
         hasPhoto: Boolean(row.has_photo),
         hasVoice: Boolean(row.has_voice),
-        fileReferences: JSON.parse(row.file_references || '{}'),
-        componentStructure: JSON.parse(row.component_structure),
-        dataIntegrity: JSON.parse(row.data_integrity),
+        fileReferences: typeof row.file_references === 'string' ? JSON.parse(row.file_references || '{}') : (row.file_references || {}),
+        componentStructure: typeof row.component_structure === 'string' ? JSON.parse(row.component_structure) : (row.component_structure || {}),
+        dataIntegrity: typeof row.data_integrity === 'string' ? JSON.parse(row.data_integrity) : (row.data_integrity || {}),
       }));
     } catch (error) {
       console.error(`[IntakeController ERROR]: Failed to list intakes for user ${userId}:`, error);
@@ -669,9 +669,9 @@ export class IntakeDataManager {
       encryptionLevel: row.encryption_level,
       hasPhoto: Boolean(row.has_photo),
       hasVoice: Boolean(row.has_voice),
-      fileReferences: JSON.parse(row.file_references || '{}'),
-      componentStructure: JSON.parse(row.component_structure),
-      dataIntegrity: JSON.parse(row.data_integrity),
+	  fileReferences: typeof row.file_references === 'string' ? JSON.parse(row.file_references || '{}') : (row.file_references || {}),
+	  componentStructure: typeof row.component_structure === 'string' ? JSON.parse(row.component_structure) : (row.component_structure || {}),
+	  dataIntegrity: typeof row.data_integrity === 'string' ? JSON.parse(row.data_integrity) : (row.data_integrity || {}),
     };
   }
 }

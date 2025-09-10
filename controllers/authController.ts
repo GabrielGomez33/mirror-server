@@ -144,12 +144,12 @@ class TokenManager {
 // Security monitoring utilities
 class SecurityMonitor {
   // Log security events to activity_logs and tier3 storage
-  static async logSecurityEvent(userId: number | null, event: string, details: any, risk: 'low' | 'medium' | 'high', requestUrl:string='NULL'): Promise<void> {
+  static async logSecurityEvent(userId: number | null, event: string, details: any, risk: 'low' | 'medium' | 'high', requestUrl?: string): Promise<void> {
     // Database logging
     await DB.query(`
       INSERT INTO activity_logs (user_id, action, metadata, risk_level, page_url, created_at)
       VALUES (?, ?, ?, ?, ?, NOW())
-    `, [userId, event, JSON.stringify(details), risk, requestUrl ]); // Changed 'details' to 'metadata'
+    `, [userId, event, JSON.stringify(details), risk, requestUrl || 'placeholder' ]); // Changed 'details' to 'metadata'
 
     // Tier3 encrypted storage for high-risk events
     if (risk === 'high') {
@@ -246,7 +246,7 @@ export const registerUser: RequestHandler = async (req, res) => {
       ipAddress,
       userAgent,
       registrationTime: Date.now() - startTime
-    }, 'low', req.url);
+    }, 'low', req.originalUrl || req.url);
 
     // Get user info with username
     const userInfo = await fetchUserInfo(email);
