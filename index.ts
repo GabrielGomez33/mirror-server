@@ -14,6 +14,7 @@ import storageRoutes from './routes/storage';
 import debugRoutes from './routes/debug';
 import intakeRoutes from './routes/intake';
 import dashboardRoutes from './routes/dashboard';
+import journalRoutes from './routes/journal';
 
 // WEBSOCKET
 import { SetupWebSocket } from './wss/setupWSS';
@@ -57,6 +58,7 @@ APP.use('/mirror/api/storage', storageRoutes);
 APP.use('/mirror/api/debug', debugRoutes);
 APP.use('/mirror/api/intake', intakeRoutes);
 APP.use('/mirror/api/dashboard', dashboardRoutes);
+APP.use('/mirror/api/journal', journalRoutes);
 
 // ✅ 5. SSL certificate loading
 const PRIV = fs.readFileSync(process.env.TUGRRPRIV!, 'utf8');
