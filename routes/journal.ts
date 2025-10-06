@@ -1,64 +1,93 @@
 // routes/journal.ts
-// Journal routes following EXACT pattern from routes/intake.ts
+// Journal routes with FIXED JSON parsing & robust TS guards
 
 import express, { RequestHandler } from 'express';
 import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
-import {DB} from '../db';
+import { DB } from '../db';
 
 const router = express.Router();
 
-// ============================================================================
-// TYPES
-// ============================================================================
+/* ============================================================================
+   HELPERS
+============================================================================ */
 
-interface JournalEntry {
-  id: string;
-  userId: string;
-  entryDate: string;
-  timeOfDay: 'morning' | 'afternoon' | 'evening' | 'night';
-  moodRating: number;
-  primaryEmotion: string;
-  emotionIntensity: number;
-  energyLevel: number;
-  promptResponses?: any;
-  freeFormEntry?: string;
-  tags?: string[];
-  category?: string;
+function safeJsonParse<T = any>(value: unknown, fallback: T): T {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value === 'string') {
+    try { return JSON.parse(value) as T; } catch { return fallback; }
+  }
+  return value as T; // assume already parsed
 }
-
-// ============================================================================
-// HELPER: Verify JWT and Get User ID
-// ============================================================================
 
 function getUserFromToken(req: express.Request): string | null {
   try {
     const authHeader = req.headers.authorization;
-    if (!authHeader?.startsWith('Bearer ')) {
+    if (!authHeader?.startsWith('Bearer ')) return null;
+
+    const token = authHeader.slice(7);
+    const secret = process.env.JWT_SECRET;
+    if (!secret) {
+      console.error('❌ JWT_SECRET is not set');
       return null;
     }
-
-    const token = authHeader.substring(7);
-    const decoded = jwt.verify(token, process.env.JWT_KEY!) as any;
-    return String(decoded.id);
-  } catch {
+    const decoded = jwt.verify(token, secret) as any;
+    // normalize to string to avoid type mismatch in DB bindings
+    return decoded?.id != null ? String(decoded.id) : null;
+  } catch (error) {
+    console.error('❌ JWT verification error:', error);
     return null;
   }
 }
 
-// ============================================================================
-// CREATE JOURNAL ENTRY
-// ============================================================================
+function isISODate(dateStr: unknown): dateStr is string {
+  return typeof dateStr === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(dateStr);
+}
+
+function toNumber(value: unknown, fallback: number): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '' && !isNaN(Number(value))) {
+    return Number(value);
+  }
+  return fallback;
+}
+
+function sanitizeLimit(value: unknown, fallback = 50, max = 500): number {
+  const n = Math.max(0, Math.min(max, Math.floor(toNumber(value, fallback))));
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function sanitizeOffset(value: unknown, fallback = 0): number {
+  const n = Math.max(0, Math.floor(toNumber(value, fallback)));
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function calculateSimpleSentiment(text: string): number {
+  if (!text) return 0;
+  const positiveWords = [
+    'happy','great','good','excellent','wonderful','amazing','love',
+    'grateful','blessed','joy','excited','proud','accomplished'
+  ];
+  const negativeWords = [
+    'sad','bad','terrible','awful','hate','angry','frustrated',
+    'anxious','worried','stressed','depressed','lonely','tired'
+  ];
+  const lowercaseText = text.toLowerCase();
+  let score = 0;
+  for (const w of positiveWords) if (lowercaseText.includes(w)) score += 0.1;
+  for (const w of negativeWords) if (lowercaseText.includes(w)) score -= 0.1;
+  return Math.max(-1, Math.min(1, score));
+}
+
+/* ============================================================================
+   CREATE JOURNAL ENTRY
+============================================================================ */
 
 export const createJournalEntryHandler: RequestHandler = async (req, res) => {
   try {
     const userId = getUserFromToken(req);
     if (!userId) {
-      res.status(401).json({
-        success: false,
-        error: 'Unauthorized',
-        code: 'NO_AUTH'
-      });
+      res.status(401).json({ success: false, error: 'Unauthorized', code: 'NO_AUTH' });
       return;
     }
 
@@ -73,39 +102,54 @@ export const createJournalEntryHandler: RequestHandler = async (req, res) => {
       freeFormEntry,
       tags,
       category
-    } = req.body;
+    } = req.body ?? {};
 
-    // Validation
-    if (!entryDate || !timeOfDay || !moodRating || !primaryEmotion) {
+    // Validation (be careful: 0 is valid for numbers)
+    if (!isISODate(entryDate)) {
+      res.status(400).json({ success: false, error: 'Invalid or missing entryDate (YYYY-MM-DD)' });
+      return;
+    }
+    if (typeof timeOfDay !== 'string' || !timeOfDay.trim()) {
+      res.status(400).json({ success: false, error: 'Missing or invalid timeOfDay' });
+      return;
+    }
+    const mood = toNumber(moodRating, NaN);
+    const intensity = toNumber(emotionIntensity, NaN);
+    const energy = toNumber(energyLevel, NaN);
+    if (!Number.isFinite(mood) || !Number.isFinite(intensity) || !Number.isFinite(energy)) {
       res.status(400).json({
         success: false,
-        error: 'Missing required fields',
-        required: ['entryDate', 'timeOfDay', 'moodRating', 'primaryEmotion']
+        error: 'Invalid numeric fields',
+        required: ['moodRating:number', 'emotionIntensity:number', 'energyLevel:number']
       });
       return;
     }
+    if (typeof primaryEmotion !== 'string' || !primaryEmotion.trim()) {
+      res.status(400).json({ success: false, error: 'Missing or invalid primaryEmotion' });
+      return;
+    }
 
-    // Check for existing entry
+    // Check for duplicate (date + timeOfDay)
     const [existing] = await DB.query(
       `SELECT id FROM mirror_journal_entries 
        WHERE user_id = ? AND entry_date = ? AND time_of_day = ? AND deleted_at IS NULL`,
       [userId, entryDate, timeOfDay]
     );
-
-    if ((existing as any[]).length > 0) {
+    const existingRows = existing as Array<{ id: string }>;
+    if (existingRows.length > 0) {
       res.status(409).json({
         success: false,
         error: 'Entry already exists for this date/time',
-        existingEntryId: (existing as any[])[0].id
+        existingEntryId: existingRows[0].id
       });
       return;
     }
 
-    // Calculate word count and sentiment
-    const wordCount = freeFormEntry ? freeFormEntry.split(/\s+/).length : 0;
-    const sentimentScore = 0; // TODO: Implement sentiment analysis
+    const freeText = typeof freeFormEntry === 'string' ? freeFormEntry : '';
+    const wordCount =
+      freeText.trim() === '' ? 0 : freeText.trim().split(/\s+/).length;
+    const sentimentScore = calculateSimpleSentiment(freeText);
 
-    // Create entry
     const entryId = uuidv4();
     await DB.query(
       `INSERT INTO mirror_journal_entries (
@@ -116,11 +160,11 @@ export const createJournalEntryHandler: RequestHandler = async (req, res) => {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?, ?, NOW())`,
       [
         entryId, userId, entryDate, timeOfDay,
-        moodRating, primaryEmotion, emotionIntensity, energyLevel,
-        JSON.stringify(promptResponses || {}),
-        freeFormEntry || null,
-        JSON.stringify(tags || []),
-        category || null,
+        mood, primaryEmotion, intensity, energy,
+        JSON.stringify(promptResponses ?? {}),
+        freeText || null,
+        JSON.stringify(tags ?? []),
+        typeof category === 'string' && category.trim() ? category : null,
         wordCount,
         sentimentScore
       ]
@@ -130,12 +174,8 @@ export const createJournalEntryHandler: RequestHandler = async (req, res) => {
 
     res.status(201).json({
       success: true,
-      data: {
-        entryId,
-        message: 'Journal entry created successfully'
-      }
+      data: { entryId, message: 'Journal entry created successfully' }
     });
-
   } catch (error) {
     console.error('❌ Error creating journal entry:', error);
     res.status(500).json({
@@ -146,34 +186,29 @@ export const createJournalEntryHandler: RequestHandler = async (req, res) => {
   }
 };
 
-// ============================================================================
-// GET ENTRY BY DATE
-// ============================================================================
+/* ============================================================================
+   GET ENTRY BY DATE
+============================================================================ */
 
 export const getEntryByDateHandler: RequestHandler = async (req, res) => {
   try {
     const userId = getUserFromToken(req);
     if (!userId) {
-      res.status(401).json({
-        success: false,
-        error: 'Unauthorized',
-        code: 'NO_AUTH'
-      });
+      res.status(401).json({ success: false, error: 'Unauthorized', code: 'NO_AUTH' });
       return;
     }
 
     const { date } = req.params;
-    const { timeOfDay } = req.query;
+    const timeOfDayRaw = (req.query?.timeOfDay ?? null);
+    const timeOfDay =
+      Array.isArray(timeOfDayRaw) ? timeOfDayRaw[0] : timeOfDayRaw;
 
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid date format. Use YYYY-MM-DD'
-      });
+    if (!isISODate(date)) {
+      res.status(400).json({ success: false, error: 'Invalid date format. Use YYYY-MM-DD' });
       return;
     }
 
-    let query = `
+    let sql = `
       SELECT 
         id, entry_date, time_of_day, mood_rating, primary_emotion,
         emotion_intensity, energy_level, prompt_responses, free_form_entry,
@@ -181,42 +216,51 @@ export const getEntryByDateHandler: RequestHandler = async (req, res) => {
       FROM mirror_journal_entries
       WHERE user_id = ? AND entry_date = ? AND deleted_at IS NULL
     `;
-
     const params: any[] = [userId, date];
 
-    if (timeOfDay) {
-      query += ` AND time_of_day = ?`;
+    if (typeof timeOfDay === 'string' && timeOfDay.trim()) {
+      sql += ` AND time_of_day = ?`;
       params.push(timeOfDay);
     }
+    sql += ` ORDER BY time_of_day ASC`;
 
-    query += ` ORDER BY time_of_day ASC`;
+    const [rows] = await DB.query(sql, params);
+    const entries = rows as any[];
 
-    const [entries] = await DB.query(query, params);
-
-    if ((entries as any[]).length === 0) {
+    if (entries.length === 0) {
       res.status(404).json({
         success: false,
-        error: 'No journal entries found for this date'
+        error: 'No journal entries found for this date',
+        date,
+        timeOfDay: typeof timeOfDay === 'string' ? timeOfDay : 'any'
       });
       return;
     }
 
-    // Parse JSON fields
-    const parsedEntries = (entries as any[]).map((entry: any) => ({
-      ...entry,
-      promptResponses: JSON.parse(entry.prompt_responses || '{}'),
-      tags: JSON.parse(entry.tags || '[]')
+    const parsedEntries = entries.map((e) => ({
+      id: e.id,
+      entryDate: e.entry_date,
+      timeOfDay: e.time_of_day,
+      moodRating: e.mood_rating,
+      primaryEmotion: e.primary_emotion,
+      emotionIntensity: e.emotion_intensity,
+      energyLevel: e.energy_level,
+      promptResponses: safeJsonParse(e.prompt_responses, {}),
+      freeFormEntry: e.free_form_entry,
+      tags: safeJsonParse<string[]>(e.tags, []),
+      category: e.category,
+      wordCount: e.word_count,
+      sentimentScore: e.sentiment_score,
+      createdAt: e.created_at,
+      updatedAt: e.updated_at
     }));
+
+    console.log(`✅ Retrieved ${parsedEntries.length} entry(ies) for date ${date}`);
 
     res.json({
       success: true,
-      data: {
-        date,
-        entries: parsedEntries,
-        count: parsedEntries.length
-      }
+      data: { date, entries: parsedEntries, count: parsedEntries.length }
     });
-
   } catch (error) {
     console.error('❌ Error retrieving entry by date:', error);
     res.status(500).json({
@@ -227,63 +271,59 @@ export const getEntryByDateHandler: RequestHandler = async (req, res) => {
   }
 };
 
-// ============================================================================
-// GET ALL ENTRIES (with filters)
-// ============================================================================
+/* ============================================================================
+   GET ALL ENTRIES
+============================================================================ */
 
 export const getAllEntriesHandler: RequestHandler = async (req, res) => {
   try {
     const userId = getUserFromToken(req);
     if (!userId) {
-      res.status(401).json({
-        success: false,
-        error: 'Unauthorized',
-        code: 'NO_AUTH'
-      });
+      res.status(401).json({ success: false, error: 'Unauthorized', code: 'NO_AUTH' });
       return;
     }
 
-    const {
-      startDate,
-      endDate,
-      limit = '50',
-      offset = '0'
-    } = req.query;
+    const { startDate, endDate } = req.query;
+    const limit = sanitizeLimit(req.query.limit, 50, 500);
+    const offset = sanitizeOffset(req.query.offset, 0);
 
-    let query = `
+    let sql = `
       SELECT 
         id, entry_date, time_of_day, mood_rating, primary_emotion,
         emotion_intensity, energy_level, word_count, sentiment_score,
-        created_at
+        tags, created_at
       FROM mirror_journal_entries
       WHERE user_id = ? AND deleted_at IS NULL
     `;
-
     const params: any[] = [userId];
 
-    if (startDate) {
-      query += ` AND entry_date >= ?`;
-      params.push(startDate);
-    }
+    if (isISODate(startDate)) { sql += ` AND entry_date >= ?`; params.push(startDate); }
+    if (isISODate(endDate))   { sql += ` AND entry_date <= ?`; params.push(endDate); }
 
-    if (endDate) {
-      query += ` AND entry_date <= ?`;
-      params.push(endDate);
-    }
+    sql += ` ORDER BY entry_date DESC, time_of_day ASC LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
 
-    query += ` ORDER BY entry_date DESC, time_of_day ASC LIMIT ? OFFSET ?`;
-    params.push(parseInt(limit as string), parseInt(offset as string));
+    const [rows] = await DB.query(sql, params);
+    const entries = rows as any[];
 
-    const [entries] = await DB.query(query, params);
+    const parsedEntries = entries.map((e) => ({
+      id: e.id,
+      entryDate: e.entry_date,
+      timeOfDay: e.time_of_day,
+      moodRating: e.mood_rating,
+      primaryEmotion: e.primary_emotion,
+      emotionIntensity: e.emotion_intensity,
+      energyLevel: e.energy_level,
+      wordCount: e.word_count,
+      sentimentScore: e.sentiment_score,
+      tags: safeJsonParse<string[]>(e.tags, []),
+      createdAt: e.created_at
+    }));
 
     res.json({
       success: true,
-      data: {
-        entries,
-        count: (entries as any[]).length
-      }
+      data: { entries: parsedEntries, count: parsedEntries.length }
     });
-
   } catch (error) {
     console.error('❌ Error retrieving journal entries:', error);
     res.status(500).json({
@@ -294,61 +334,61 @@ export const getAllEntriesHandler: RequestHandler = async (req, res) => {
   }
 };
 
-// ============================================================================
-// GET MOOD TREND
-// ============================================================================
+/* ============================================================================
+   GET MOOD TREND
+============================================================================ */
 
 export const getMoodTrendHandler: RequestHandler = async (req, res) => {
   try {
     const userId = getUserFromToken(req);
     if (!userId) {
-      res.status(401).json({
-        success: false,
-        error: 'Unauthorized',
-        code: 'NO_AUTH'
-      });
+      res.status(401).json({ success: false, error: 'Unauthorized', code: 'NO_AUTH' });
       return;
     }
 
-    const { startDate, endDate } = req.query;
+    const startDefault = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+      .toISOString().split('T')[0];
+    const endDefault = new Date().toISOString().split('T')[0];
 
-    // Default to last 30 days
-    const start = startDate || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-    const end = endDate || new Date().toISOString().split('T')[0];
+    const start = isISODate(req.query.startDate) ? (req.query.startDate as string) : startDefault;
+    const end   = isISODate(req.query.endDate)   ? (req.query.endDate as string)   : endDefault;
 
-    const [results] = await DB.query(
+    const [rows] = await DB.query(
       `SELECT 
         entry_date,
-        AVG(mood_rating) as avg_mood,
-        AVG(energy_level) as avg_energy,
-        AVG(emotion_intensity) as avg_intensity,
-        COUNT(*) as entry_count
-      FROM mirror_journal_entries
-      WHERE user_id = ? 
-        AND entry_date BETWEEN ? AND ?
-        AND deleted_at IS NULL
-      GROUP BY entry_date
-      ORDER BY entry_date ASC`,
+        AVG(mood_rating)         AS avg_mood,
+        AVG(energy_level)        AS avg_energy,
+        AVG(emotion_intensity)   AS avg_intensity,
+        COUNT(*)                 AS entry_count
+       FROM mirror_journal_entries
+       WHERE user_id = ?
+         AND entry_date BETWEEN ? AND ?
+         AND deleted_at IS NULL
+       GROUP BY entry_date
+       ORDER BY entry_date ASC`,
       [userId, start, end]
     );
 
-    const trendData = (results as any[]).map((row: any) => ({
-      date: row.entry_date,
-      avgMood: parseFloat(row.avg_mood).toFixed(2),
-      avgEnergy: parseFloat(row.avg_energy).toFixed(2),
-      avgIntensity: parseFloat(row.avg_intensity).toFixed(2),
-      entryCount: row.entry_count
+    const results = rows as Array<{
+      entry_date: string;
+      avg_mood: number | string;
+      avg_energy: number | string;
+      avg_intensity: number | string;
+      entry_count: number;
+    }>;
+
+    const trendData = results.map(r => ({
+      date: r.entry_date,
+      avgMood: Number.parseFloat(String(r.avg_mood)),
+      avgEnergy: Number.parseFloat(String(r.avg_energy)),
+      avgIntensity: Number.parseFloat(String(r.avg_intensity)),
+      entryCount: r.entry_count
     }));
 
     res.json({
       success: true,
-      data: {
-        trend: trendData,
-        period: { start, end },
-        dataPoints: trendData.length
-      }
+      data: { trend: trendData, period: { start, end }, dataPoints: trendData.length }
     });
-
   } catch (error) {
     console.error('❌ Error getting mood trend:', error);
     res.status(500).json({
@@ -359,9 +399,9 @@ export const getMoodTrendHandler: RequestHandler = async (req, res) => {
   }
 };
 
-// ============================================================================
-// ROUTE REGISTRATION (No middleware, following existing pattern)
-// ============================================================================
+/* ============================================================================
+   ROUTE REGISTRATION
+============================================================================ */
 
 router.post('/entry', createJournalEntryHandler);
 router.get('/entry/date/:date', getEntryByDateHandler);
