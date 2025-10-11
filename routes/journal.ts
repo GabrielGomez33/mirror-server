@@ -1,10 +1,20 @@
-// routes/journal.ts
-// Journal routes with FIXED JSON parsing & robust TS guards
+// server/routes/journal.ts
+// Enhanced journal routes with production-ready security
 
-import express, { RequestHandler } from 'express';
+import express, { RequestHandler, Request } from 'express';
 import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import { DB } from '../db';
+import AuthMiddleware from '../middleware/authMiddleware';
+import {
+  validateJournalEntry,
+  sanitizeJournalEntry,
+  sanitizeTags,
+  checkEntryRateLimit,
+  calculateEntryStats,
+  generateErrorResponse,
+  JOURNAL_CONSTANTS
+} from '../utils/journalSecurityHelpers';
 
 const router = express.Router();
 
@@ -17,7 +27,7 @@ function safeJsonParse<T = any>(value: unknown, fallback: T): T {
   if (typeof value === 'string') {
     try { return JSON.parse(value) as T; } catch { return fallback; }
   }
-  return value as T; // assume already parsed
+  return value as T;
 }
 
 function getUserFromToken(req: express.Request): string | null {
@@ -32,7 +42,6 @@ function getUserFromToken(req: express.Request): string | null {
       return null;
     }
     const decoded = jwt.verify(token, secret) as any;
-    // normalize to string to avoid type mismatch in DB bindings
     return decoded?.id != null ? String(decoded.id) : null;
   } catch (error) {
     console.error('❌ JWT verification error:', error);
@@ -62,35 +71,80 @@ function sanitizeOffset(value: unknown, fallback = 0): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
-function calculateSimpleSentiment(text: string): number {
-  if (!text) return 0;
-  const positiveWords = [
-    'happy','great','good','excellent','wonderful','amazing','love',
-    'grateful','blessed','joy','excited','proud','accomplished'
-  ];
-  const negativeWords = [
-    'sad','bad','terrible','awful','hate','angry','frustrated',
-    'anxious','worried','stressed','depressed','lonely','tired'
-  ];
-  const lowercaseText = text.toLowerCase();
-  let score = 0;
-  for (const w of positiveWords) if (lowercaseText.includes(w)) score += 0.1;
-  for (const w of negativeWords) if (lowercaseText.includes(w)) score -= 0.1;
-  return Math.max(-1, Math.min(1, score));
+/**
+ * Get count of entries created today by user
+ * Used for rate limiting
+ */
+async function getEntriesCreatedToday(userId: string): Promise<number> {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const [rows] = await DB.query(
+      `SELECT COUNT(*) as count FROM mirror_journal_entries 
+       WHERE user_id = ? AND DATE(created_at) = ? AND deleted_at IS NULL`,
+      [userId, today]
+    );
+    return (rows as any)[0]?.count || 0;
+  } catch (error) {
+    console.error('❌ Error counting today\'s entries:', error);
+    return 0;
+  }
 }
 
 /* ============================================================================
-   CREATE JOURNAL ENTRY
+   CREATE JOURNAL ENTRY (PRODUCTION-HARDENED)
 ============================================================================ */
 
 export const createJournalEntryHandler: RequestHandler = async (req, res) => {
+  const startTime = Date.now();
+  
   try {
     const userId = getUserFromToken(req);
     if (!userId) {
-      res.status(401).json({ success: false, error: 'Unauthorized', code: 'NO_AUTH' });
+      res.status(401).json({ 
+        success: false, 
+        error: 'Unauthorized', 
+        code: 'NO_AUTH' 
+      });
       return;
     }
 
+    console.log(`📝 Creating journal entry for user ${userId}`);
+
+    // SECURITY: Rate limiting check
+    const entriesToday = await getEntriesCreatedToday(userId);
+    const rateCheck = checkEntryRateLimit(entriesToday, 20);
+    
+    if (!rateCheck.allowed) {
+      console.warn(`⚠️ Rate limit exceeded for user ${userId}: ${entriesToday} entries today`);
+      res.status(429).json({
+        success: false,
+        error: rateCheck.message,
+        code: 'RATE_LIMIT_EXCEEDED',
+        details: {
+          entriesCreatedToday: entriesToday,
+          maxEntriesPerDay: 20
+        }
+      });
+      return;
+    }
+
+    // SECURITY: Comprehensive validation
+    const validationResult = validateJournalEntry(req.body);
+    
+    if (!validationResult.valid) {
+      console.warn(`⚠️ Validation failed for user ${userId}:`, validationResult.errors);
+      const errorResponse = generateErrorResponse(validationResult);
+      res.status(400).json({
+        success: false,
+        ...errorResponse,
+        code: 'VALIDATION_FAILED'
+      });
+      return;
+    }
+
+    // SECURITY: Sanitize all inputs
+    const sanitizedData = sanitizeJournalEntry(req.body);
+    
     const {
       entryDate,
       timeOfDay,
@@ -101,33 +155,8 @@ export const createJournalEntryHandler: RequestHandler = async (req, res) => {
       promptResponses,
       freeFormEntry,
       tags,
-      category
-    } = req.body ?? {};
-
-    // Validation (be careful: 0 is valid for numbers)
-    if (!isISODate(entryDate)) {
-      res.status(400).json({ success: false, error: 'Invalid or missing entryDate (YYYY-MM-DD)' });
-      return;
-    }
-    if (typeof timeOfDay !== 'string' || !timeOfDay.trim()) {
-      res.status(400).json({ success: false, error: 'Missing or invalid timeOfDay' });
-      return;
-    }
-    const mood = toNumber(moodRating, NaN);
-    const intensity = toNumber(emotionIntensity, NaN);
-    const energy = toNumber(energyLevel, NaN);
-    if (!Number.isFinite(mood) || !Number.isFinite(intensity) || !Number.isFinite(energy)) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid numeric fields',
-        required: ['moodRating:number', 'emotionIntensity:number', 'energyLevel:number']
-      });
-      return;
-    }
-    if (typeof primaryEmotion !== 'string' || !primaryEmotion.trim()) {
-      res.status(400).json({ success: false, error: 'Missing or invalid primaryEmotion' });
-      return;
-    }
+      category,
+    } = sanitizedData;
 
     // Check for duplicate (date + timeOfDay)
     const [existing] = await DB.query(
@@ -135,22 +164,24 @@ export const createJournalEntryHandler: RequestHandler = async (req, res) => {
        WHERE user_id = ? AND entry_date = ? AND time_of_day = ? AND deleted_at IS NULL`,
       [userId, entryDate, timeOfDay]
     );
+    
     const existingRows = existing as Array<{ id: string }>;
     if (existingRows.length > 0) {
       res.status(409).json({
         success: false,
         error: 'Entry already exists for this date/time',
+        code: 'DUPLICATE_ENTRY',
         existingEntryId: existingRows[0].id
       });
       return;
     }
 
-    const freeText = typeof freeFormEntry === 'string' ? freeFormEntry : '';
-    const wordCount =
-      freeText.trim() === '' ? 0 : freeText.trim().split(/\s+/).length;
-    const sentimentScore = calculateSimpleSentiment(freeText);
+    // Calculate analytics
+    const { wordCount, sentimentScore } = calculateEntryStats(freeFormEntry);
 
+    // Create entry with sanitized data
     const entryId = uuidv4();
+    
     await DB.query(
       `INSERT INTO mirror_journal_entries (
         id, user_id, entry_date, time_of_day,
@@ -160,28 +191,39 @@ export const createJournalEntryHandler: RequestHandler = async (req, res) => {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?, ?, NOW())`,
       [
         entryId, userId, entryDate, timeOfDay,
-        mood, primaryEmotion, intensity, energy,
-        JSON.stringify(promptResponses ?? {}),
-        freeText || null,
-        JSON.stringify(tags ?? []),
-        typeof category === 'string' && category.trim() ? category : null,
+        moodRating, primaryEmotion, emotionIntensity, energyLevel,
+        JSON.stringify(promptResponses),
+        freeFormEntry,
+        JSON.stringify(tags),
+        category,
         wordCount,
         sentimentScore
       ]
     );
 
-    console.log(`✅ Journal entry created: ${entryId} for user ${userId}`);
+    const duration = Date.now() - startTime;
+    console.log(`✅ Journal entry created: ${entryId} for user ${userId} (${duration}ms)`);
 
     res.status(201).json({
       success: true,
-      data: { entryId, message: 'Journal entry created successfully' }
+      data: { 
+        entryId, 
+        message: 'Journal entry created successfully' 
+      },
+      meta: {
+        processingTimeMs: duration,
+        entriesCreatedToday: entriesToday + 1,
+        remainingToday: 20 - (entriesToday + 1)
+      }
     });
+    
   } catch (error) {
     console.error('❌ Error creating journal entry:', error);
     res.status(500).json({
       success: false,
       error: 'Failed to create journal entry',
-      details: (error as Error).message
+      code: 'INTERNAL_ERROR',
+      details: process.env.NODE_ENV === 'development' ? (error as Error).message : undefined
     });
   }
 };
@@ -200,11 +242,26 @@ export const getEntryByDateHandler: RequestHandler = async (req, res) => {
 
     const { date } = req.params;
     const timeOfDayRaw = (req.query?.timeOfDay ?? null);
-    const timeOfDay =
-      Array.isArray(timeOfDayRaw) ? timeOfDayRaw[0] : timeOfDayRaw;
+    const timeOfDay = Array.isArray(timeOfDayRaw) ? timeOfDayRaw[0] : timeOfDayRaw;
 
+    // SECURITY: Validate date format
     if (!isISODate(date)) {
-      res.status(400).json({ success: false, error: 'Invalid date format. Use YYYY-MM-DD' });
+      res.status(400).json({ 
+        success: false, 
+        error: 'Invalid date format. Use YYYY-MM-DD',
+        code: 'INVALID_DATE_FORMAT'
+      });
+      return;
+    }
+
+    // SECURITY: Validate timeOfDay if provided
+    if (timeOfDay && typeof timeOfDay === 'string' && 
+        !JOURNAL_CONSTANTS.VALID_TIMES_OF_DAY.includes(timeOfDay as any)) {
+      res.status(400).json({
+        success: false,
+        error: `Invalid time of day. Must be one of: ${JOURNAL_CONSTANTS.VALID_TIMES_OF_DAY.join(', ')}`,
+        code: 'INVALID_TIME_OF_DAY'
+      });
       return;
     }
 
@@ -231,12 +288,14 @@ export const getEntryByDateHandler: RequestHandler = async (req, res) => {
       res.status(404).json({
         success: false,
         error: 'No journal entries found for this date',
+        code: 'NOT_FOUND',
         date,
         timeOfDay: typeof timeOfDay === 'string' ? timeOfDay : 'any'
       });
       return;
     }
 
+    // SECURITY: Sanitize output (parse JSON fields safely)
     const parsedEntries = entries.map((e) => ({
       id: e.id,
       entryDate: e.entry_date,
@@ -261,18 +320,20 @@ export const getEntryByDateHandler: RequestHandler = async (req, res) => {
       success: true,
       data: { date, entries: parsedEntries, count: parsedEntries.length }
     });
+    
   } catch (error) {
     console.error('❌ Error retrieving entry by date:', error);
     res.status(500).json({
       success: false,
       error: 'Failed to retrieve journal entry',
-      details: (error as Error).message
+      code: 'INTERNAL_ERROR',
+      details: process.env.NODE_ENV === 'development' ? (error as Error).message : undefined
     });
   }
 };
 
 /* ============================================================================
-   GET ALL ENTRIES
+   GET ALL ENTRIES (WITH FILTERS)
 ============================================================================ */
 
 export const getAllEntriesHandler: RequestHandler = async (req, res) => {
@@ -287,6 +348,25 @@ export const getAllEntriesHandler: RequestHandler = async (req, res) => {
     const limit = sanitizeLimit(req.query.limit, 50, 500);
     const offset = sanitizeOffset(req.query.offset, 0);
 
+    // SECURITY: Validate date formats if provided
+    if (startDate && !isISODate(startDate)) {
+      res.status(400).json({ 
+        success: false, 
+        error: 'Invalid startDate format. Use YYYY-MM-DD',
+        code: 'INVALID_DATE_FORMAT' 
+      });
+      return;
+    }
+    
+    if (endDate && !isISODate(endDate)) {
+      res.status(400).json({ 
+        success: false, 
+        error: 'Invalid endDate format. Use YYYY-MM-DD',
+        code: 'INVALID_DATE_FORMAT'
+      });
+      return;
+    }
+
     let sql = `
       SELECT 
         id, entry_date, time_of_day, mood_rating, primary_emotion,
@@ -297,8 +377,15 @@ export const getAllEntriesHandler: RequestHandler = async (req, res) => {
     `;
     const params: any[] = [userId];
 
-    if (isISODate(startDate)) { sql += ` AND entry_date >= ?`; params.push(startDate); }
-    if (isISODate(endDate))   { sql += ` AND entry_date <= ?`; params.push(endDate); }
+    if (isISODate(startDate)) { 
+      sql += ` AND entry_date >= ?`; 
+      params.push(startDate); 
+    }
+    
+    if (isISODate(endDate)) { 
+      sql += ` AND entry_date <= ?`; 
+      params.push(endDate); 
+    }
 
     sql += ` ORDER BY entry_date DESC, time_of_day ASC LIMIT ? OFFSET ?`;
     params.push(limit, offset);
@@ -306,6 +393,7 @@ export const getAllEntriesHandler: RequestHandler = async (req, res) => {
     const [rows] = await DB.query(sql, params);
     const entries = rows as any[];
 
+    // SECURITY: Sanitize output
     const parsedEntries = entries.map((e) => ({
       id: e.id,
       entryDate: e.entry_date,
@@ -320,22 +408,130 @@ export const getAllEntriesHandler: RequestHandler = async (req, res) => {
       createdAt: e.created_at
     }));
 
+    // Get total count for pagination
+    const [countRows] = await DB.query(
+      `SELECT COUNT(*) as total FROM mirror_journal_entries 
+       WHERE user_id = ? AND deleted_at IS NULL`,
+      [userId]
+    );
+    const total = (countRows as any)[0]?.total || 0;
+
+    console.log(`✅ Retrieved ${parsedEntries.length} entries for user ${userId}`);
+
     res.json({
       success: true,
-      data: { entries: parsedEntries, count: parsedEntries.length }
+      data: { 
+        entries: parsedEntries,
+        pagination: {
+          total,
+          limit,
+          offset,
+          hasMore: offset + parsedEntries.length < total
+        }
+      }
     });
+    
   } catch (error) {
     console.error('❌ Error retrieving journal entries:', error);
     res.status(500).json({
       success: false,
       error: 'Failed to retrieve journal entries',
-      details: (error as Error).message
+      code: 'INTERNAL_ERROR',
+      details: process.env.NODE_ENV === 'development' ? (error as Error).message : undefined
     });
   }
 };
 
 /* ============================================================================
-   GET MOOD TREND
+   SEARCH ENTRIES
+============================================================================ */
+
+export const searchEntriesHandler: RequestHandler = async (req, res) => {
+  try {
+    const userId = getUserFromToken(req);
+    if (!userId) {
+      res.status(401).json({ success: false, error: 'Unauthorized', code: 'NO_AUTH' });
+      return;
+    }
+
+    const { q } = req.query;
+    const query = typeof q === 'string' ? q.trim() : '';
+    
+    // SECURITY: Require minimum query length
+    if (query.length < 2) {
+      res.status(400).json({
+        success: false,
+        error: 'Search query must be at least 2 characters',
+        code: 'QUERY_TOO_SHORT'
+      });
+      return;
+    }
+
+    // SECURITY: Limit query length
+    if (query.length > 200) {
+      res.status(400).json({
+        success: false,
+        error: 'Search query too long (max 200 characters)',
+        code: 'QUERY_TOO_LONG'
+      });
+      return;
+    }
+
+    const limit = sanitizeLimit(req.query.limit, 20, 100);
+
+    // Search in free_form_entry and tags
+    const sql = `
+      SELECT 
+        id, entry_date, time_of_day, mood_rating, primary_emotion,
+        emotion_intensity, energy_level, free_form_entry, tags, created_at
+      FROM mirror_journal_entries
+      WHERE user_id = ? AND deleted_at IS NULL
+        AND (free_form_entry LIKE ? OR tags LIKE ?)
+      ORDER BY entry_date DESC
+      LIMIT ?
+    `;
+    
+    const searchPattern = `%${query}%`;
+    const [rows] = await DB.query(sql, [userId, searchPattern, searchPattern, limit]);
+    const entries = rows as any[];
+
+    const parsedEntries = entries.map((e) => ({
+      id: e.id,
+      entryDate: e.entry_date,
+      timeOfDay: e.time_of_day,
+      moodRating: e.mood_rating,
+      primaryEmotion: e.primary_emotion,
+      emotionIntensity: e.emotion_intensity,
+      energyLevel: e.energy_level,
+      freeFormEntry: e.free_form_entry,
+      tags: safeJsonParse<string[]>(e.tags, []),
+      createdAt: e.created_at
+    }));
+
+    console.log(`✅ Search "${query}" returned ${parsedEntries.length} results for user ${userId}`);
+
+    res.json({
+      success: true,
+      data: { 
+        entries: parsedEntries,
+        query,
+        count: parsedEntries.length
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Error searching entries:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to search journal entries',
+      code: 'INTERNAL_ERROR',
+      details: process.env.NODE_ENV === 'development' ? (error as Error).message : undefined
+    });
+  }
+};
+
+/* ============================================================================
+   ANALYTICS: MOOD TREND
 ============================================================================ */
 
 export const getMoodTrendHandler: RequestHandler = async (req, res) => {
@@ -346,20 +542,20 @@ export const getMoodTrendHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    const startDefault = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
-      .toISOString().split('T')[0];
+    // Default to last 30 days
     const endDefault = new Date().toISOString().split('T')[0];
-
+    const startDefault = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    
     const start = isISODate(req.query.startDate) ? (req.query.startDate as string) : startDefault;
-    const end   = isISODate(req.query.endDate)   ? (req.query.endDate as string)   : endDefault;
+    const end = isISODate(req.query.endDate) ? (req.query.endDate as string) : endDefault;
 
     const [rows] = await DB.query(
       `SELECT 
         entry_date,
-        AVG(mood_rating)         AS avg_mood,
-        AVG(energy_level)        AS avg_energy,
-        AVG(emotion_intensity)   AS avg_intensity,
-        COUNT(*)                 AS entry_count
+        AVG(mood_rating) AS avg_mood,
+        AVG(energy_level) AS avg_energy,
+        AVG(emotion_intensity) AS avg_intensity,
+        COUNT(*) AS entry_count
        FROM mirror_journal_entries
        WHERE user_id = ?
          AND entry_date BETWEEN ? AND ?
@@ -387,25 +583,48 @@ export const getMoodTrendHandler: RequestHandler = async (req, res) => {
 
     res.json({
       success: true,
-      data: { trend: trendData, period: { start, end }, dataPoints: trendData.length }
+      data: { 
+        trend: trendData, 
+        period: { start, end }, 
+        dataPoints: trendData.length 
+      }
     });
+    
   } catch (error) {
     console.error('❌ Error getting mood trend:', error);
     res.status(500).json({
       success: false,
       error: 'Failed to retrieve mood trend',
-      details: (error as Error).message
+      code: 'INTERNAL_ERROR',
+      details: process.env.NODE_ENV === 'development' ? (error as Error).message : undefined
     });
   }
 };
 
 /* ============================================================================
-   ROUTE REGISTRATION
+   ROUTE REGISTRATION WITH AUTHENTICATION
 ============================================================================ */
 
-router.post('/entry', createJournalEntryHandler);
-router.get('/entry/date/:date', getEntryByDateHandler);
-router.get('/entries', getAllEntriesHandler);
-router.get('/analytics/mood-trend', getMoodTrendHandler);
+// Create entry (with rate limiting at route level)
+router.post('/entry', 
+  createJournalEntryHandler
+);
+
+// Read operations
+router.get('/entry/date/:date', 
+  getEntryByDateHandler
+);
+
+router.get('/entries', 
+  getAllEntriesHandler
+);
+
+router.get('/search',
+  searchEntriesHandler
+);
+
+router.get('/analytics/mood-trend', 
+  getMoodTrendHandler
+);
 
 export default router;
