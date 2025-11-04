@@ -1,7 +1,7 @@
 // middleware/authMiddleware.ts
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
-import { DB } from '../config/database';
+import { DB } from '../db';
 import { TokenManager, SecurityMonitor } from '../controllers/authController';
 
 // Extend Express Request interface to include user data
@@ -75,7 +75,7 @@ class AuthMiddleware {
       }
 
       // Check if user account is locked
-      const [userRows] = await DB.query(
+      /*const [userRows] = await DB.query(
         'SELECT account_locked, locked_until, email_verified FROM users WHERE id = ?',
         [decoded.id]
       );
@@ -105,7 +105,7 @@ class AuthMiddleware {
             [decoded.id]
           );
         }
-      }
+      }*/
 
       // Set user context
       req.user = {
@@ -451,4 +451,4 @@ setInterval(() => {
 }, 60000); // Clean up every minute
 
 export default AuthMiddleware;
-export { SecurityLevel };
+//export { SecurityLevel };
