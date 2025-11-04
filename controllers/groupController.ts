@@ -85,21 +85,21 @@ export const createGroupHandler: RequestHandler = async (req, res) => {
     // Validate inputs
     const nameValidation = validateGroupName(name);
     if (!nameValidation.valid) {
-      return res.status(400).json({ error: nameValidation.error });
+      res.status(400).json({ error: nameValidation.error });
     }
 
     const typeValidation = validateGroupType(type);
     if (!typeValidation.valid) {
-      return res.status(400).json({ error: typeValidation.error });
+      res.status(400).json({ error: typeValidation.error });
     }
 
     const privacyValidation = validatePrivacy(privacy);
     if (!privacyValidation.valid) {
-      return res.status(400).json({ error: privacyValidation.error });
+      res.status(400).json({ error: privacyValidation.error });
     }
 
     if (max_members < 2 || max_members > 100) {
-      return res.status(400).json({ error: 'max_members must be between 2 and 100' });
+      res.status(400).json({ error: 'max_members must be between 2 and 100' });
     }
 
     console.log(`📝 Creating group: ${name} (type: ${type}, privacy: ${privacy}) for user ${userId}`);
@@ -257,7 +257,7 @@ export const getGroupDetailsHandler: RequestHandler = async (req, res) => {
     );
 
     if ((memberRows as any[]).length === 0) {
-      return res.status(403).json({ error: 'You are not a member of this group' });
+      res.status(403).json({ error: 'You are not a member of this group' });
     }
 
     const userRole = (memberRows as any[])[0].role;
@@ -269,7 +269,7 @@ export const getGroupDetailsHandler: RequestHandler = async (req, res) => {
     );
 
     if ((groupRows as any[]).length === 0) {
-      return res.status(404).json({ error: 'Group not found' });
+      res.status(404).json({ error: 'Group not found' });
     }
 
     const group = (groupRows as any[])[0];
@@ -349,7 +349,7 @@ export const inviteMemberHandler: RequestHandler = async (req, res) => {
     const { email, userId: inviteeUserId, message } = req.body as InviteMemberRequest;
 
     if (!email && !inviteeUserId) {
-      return res.status(400).json({ error: 'Either email or userId must be provided' });
+      res.status(400).json({ error: 'Either email or userId must be provided' });
     }
 
     console.log(`📨 Inviting member to group ${groupId} by user ${userId}`);
@@ -362,12 +362,12 @@ export const inviteMemberHandler: RequestHandler = async (req, res) => {
     );
 
     if ((memberRows as any[]).length === 0) {
-      return res.status(403).json({ error: 'You are not a member of this group' });
+      res.status(403).json({ error: 'You are not a member of this group' });
     }
 
     const userRole = (memberRows as any[])[0].role;
     if (!['owner', 'admin'].includes(userRole)) {
-      return res.status(403).json({ error: 'Only owners and admins can invite members' });
+      res.status(403).json({ error: 'Only owners and admins can invite members' });
     }
 
     // Check group member limit
@@ -378,7 +378,7 @@ export const inviteMemberHandler: RequestHandler = async (req, res) => {
     const { max_members, current_member_count } = (groupRows as any[])[0];
 
     if (current_member_count >= max_members) {
-      return res.status(400).json({ error: 'Group has reached maximum member limit' });
+      res.status(400).json({ error: 'Group has reached maximum member limit' });
     }
 
     // Find user by email or userId
@@ -389,7 +389,7 @@ export const inviteMemberHandler: RequestHandler = async (req, res) => {
         [email]
       );
       if ((userRows as any[]).length === 0) {
-        return res.status(404).json({ error: 'User not found with this email' });
+        res.status(404).json({ error: 'User not found with this email' });
       }
       targetUserId = (userRows as any[])[0].id;
     } else {
@@ -406,10 +406,10 @@ export const inviteMemberHandler: RequestHandler = async (req, res) => {
     if ((existingRows as any[]).length > 0) {
       const status = (existingRows as any[])[0].status;
       if (status === 'active') {
-        return res.status(400).json({ error: 'User is already an active member of this group' });
+        res.status(400).json({ error: 'User is already an active member of this group' });
       }
       if (status === 'invited') {
-        return res.status(400).json({ error: 'User already has a pending invitation' });
+        res.status(400).json({ error: 'User already has a pending invitation' });
       }
     }
 
@@ -470,7 +470,7 @@ export const joinGroupHandler: RequestHandler = async (req, res) => {
     );
 
     if ((requestRows as any[]).length === 0) {
-      return res.status(404).json({ error: 'Invalid or expired invitation' });
+      res.status(404).json({ error: 'Invalid or expired invitation' });
     }
 
     // Start transaction
@@ -553,11 +553,11 @@ export const leaveGroupHandler: RequestHandler = async (req, res) => {
     );
 
     if ((groupRows as any[]).length === 0) {
-      return res.status(404).json({ error: 'Group not found' });
+      res.status(404).json({ error: 'Group not found' });
     }
 
     if ((groupRows as any[])[0].owner_user_id === userId) {
-      return res.status(400).json({ 
+      res.status(400).json({ 
         error: 'Owner cannot leave group. Delete the group or transfer ownership first.' 
       });
     }
