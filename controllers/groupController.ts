@@ -628,3 +628,59 @@ export const updateActivityHandler: RequestHandler = async (req, res) => {
     });
   }
 };
+
+/**
+*Individual assessment aggregator
+*
+*/
+
+const shareDataHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    const { groupId } = req.params;
+    const { dataTypes = ['personality', 'behavioral'] } = req.body;
+
+    // Verify membership
+    const [memberCheck] = await DB.query(
+      `SELECT role FROM mirror_group_members 
+       WHERE group_id = ? AND user_id = ? AND status = 'active'`,
+      [groupId, user.id]
+    );
+
+    if ((memberCheck as any[]).length === 0) {
+      res.status(403).json({ error: 'Not a member of this group' });
+      return;
+    }
+
+    // Aggregate assessments
+    const aggregator = require('../managers/PublicAssessmentAggregator');
+    const assessments = await aggregator.aggregateForUser(user.id);
+
+    // Encrypt for group
+    const encryptedData = await groupEncryptionManager.encryptForGroup(
+      groupId,
+      JSON.stringify(assessments.data)
+    );
+
+    // Store in database
+    const shareId = uuidv4();
+    await DB.query(
+      `INSERT INTO mirror_group_shared_data 
+       (id, group_id, user_id, data_type, encrypted_data, shared_at)
+       VALUES (?, ?, ?, ?, ?, NOW())`,
+      [shareId, groupId, user.id, 'aggregated_assessment', encryptedData]
+    );
+
+    res.json({
+      success: true,
+      message: 'Data shared with group successfully',
+      shareId
+    });
+
+  } catch (error) {
+    console.error('❌ Error sharing data:', error);
+    res.status(500).json({ error: 'Failed to share data' });
+  }
+};
+
+router.post('/:groupId/share-data', verified, shareDataHandler);
