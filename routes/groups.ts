@@ -1,10 +1,10 @@
 // ============================================================================
-// MIRRORGROUPS API ROUTES - PRODUCTION READY (PHASE 1 + 2)
+// MIRRORGROUPS API ROUTES - PRODUCTION READY (PHASE 1 + 2 COMPLETE)
 // ============================================================================
 // File: server/routes/groups.ts
 // ----------------------------------------------------------------------------
 // - Secure group management endpoints (create, join, leave, list)
-// - Data sharing endpoints for assessment aggregation
+// - Data sharing endpoints with real Mirror assessment extraction
 // - JWT validation via AuthMiddleware
 // - Strict input sanitization and permission checks
 // - Type-safe with Express 5 + TypeScript 5
@@ -17,6 +17,7 @@ import { DB } from '../db';
 import AuthMiddleware, { SecurityLevel } from '../middleware/authMiddleware';
 import { groupEncryptionManager } from '../systems/GroupEncryptionManager';
 import { publicAssessmentAggregator } from '../managers/PublicAssessmentAggregator';
+import { groupDataExtractor, ShareableDataType } from '../services/GroupDataExtractor';
 
 const router = express.Router();
 
@@ -33,7 +34,7 @@ function safeJsonParse<T = any>(value: unknown, fallback: T): T {
 }
 
 /* ============================================================================
-   CREATE GROUP (WITH GOAL SUPPORT)
+   CREATE GROUP (WITH GOAL SUPPORT) - FIXED DUPLICATE MEMBER BUG
 ============================================================================ */
 
 const createGroupHandler: RequestHandler = async (req, res) => {
@@ -53,35 +54,39 @@ const createGroupHandler: RequestHandler = async (req, res) => {
     // Validate goal if provided
     const validGoals = ['therapy', 'conflict_resolution', 'mutual_understanding', 'team_building', 'personal_growth'];
     if (goal && !validGoals.includes(goal)) {
-      res.status(400).json({ 
-        success: false, 
-        error: 'Invalid goal. Must be one of: ' + validGoals.join(', ') 
+      res.status(400).json({
+        success: false,
+        error: 'Invalid goal. Must be one of: ' + validGoals.join(', ')
       });
       return;
     }
 
     const groupId = uuidv4();
-    
+
     // Create group with goal field
     await DB.query(
       `INSERT INTO mirror_groups (
         id, owner_user_id, name, description, goal, goal_metadata, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, NOW())`,
       [
-        groupId, 
-        user.id, 
-        name.trim(), 
+        groupId,
+        user.id,
+        name.trim(),
         description ?? null,
         goal ?? 'mutual_understanding', // Default goal
         goalMetadata ? JSON.stringify(goalMetadata) : null
       ]
     );
 
-    // Create owner membership
+    // Create owner membership - FIXED: Use ON DUPLICATE KEY UPDATE to handle duplicates
     const memberId = uuidv4();
     await DB.query(
       `INSERT INTO mirror_group_members (id, group_id, user_id, role, status, joined_at)
-       VALUES (?, ?, ?, 'owner', 'active', NOW())`,
+       VALUES (?, ?, ?, 'owner', 'active', NOW())
+       ON DUPLICATE KEY UPDATE
+         status = 'active',
+         role = 'owner',
+         joined_at = NOW()`,
       [memberId, groupId, user.id]
     );
 
@@ -93,19 +98,19 @@ const createGroupHandler: RequestHandler = async (req, res) => {
     } catch (encError) {
       console.error('❌ Encryption key generation failed:', encError);
       // Group created but encryption failed - consider cleanup
-    }	
+    }
 
-    res.status(201).json({ 
-      success: true, 
-      data: { 
-        id: groupId, 
-        name, 
+    res.status(201).json({
+      success: true,
+      data: {
+        id: groupId,
+        name,
         description,
         goal: goal || 'mutual_understanding'
       },
-      message: 'Group created successfully' 
+      message: 'Group created successfully'
     });
-      
+
   } catch (error) {
     console.error('❌ Error creating group:', error);
     res.status(500).json({ success: false, error: 'Failed to create group' });
@@ -129,7 +134,7 @@ const listGroupsHandler: RequestHandler = async (req, res) => {
               CASE WHEN g.owner_user_id = ? THEN 'owner' ELSE 'member' END AS role
          FROM mirror_groups g
          LEFT JOIN mirror_group_members m ON m.group_id = g.id
-        WHERE (g.owner_user_id = ? OR m.user_id = ?) 
+        WHERE (g.owner_user_id = ? OR m.user_id = ?)
           AND (m.status = 'active' OR m.status IS NULL)
           AND g.status = 'active'
         GROUP BY g.id
@@ -204,7 +209,7 @@ const getGroupDetailsHandler: RequestHandler = async (req, res) => {
 
     // Verify user is a member
     const [memberCheck] = await DB.query(
-      `SELECT role FROM mirror_group_members 
+      `SELECT role FROM mirror_group_members
        WHERE group_id = ? AND user_id = ? AND status = 'active'`,
       [groupId, user.id]
     );
@@ -229,17 +234,17 @@ const getGroupDetailsHandler: RequestHandler = async (req, res) => {
 
     // Get all active members
     const [membersRows] = await DB.query(
-      `SELECT 
+      `SELECT
         gm.id, gm.user_id, gm.role, gm.status, gm.joined_at,
         u.username, u.email
       FROM mirror_group_members gm
       INNER JOIN users u ON gm.user_id = u.id
       WHERE gm.group_id = ? AND gm.status = 'active'
-      ORDER BY 
-        CASE gm.role 
-          WHEN 'owner' THEN 1 
-          WHEN 'admin' THEN 2 
-          ELSE 3 
+      ORDER BY
+        CASE gm.role
+          WHEN 'owner' THEN 1
+          WHEN 'admin' THEN 2
+          ELSE 3
         END,
         gm.joined_at ASC`,
       [groupId]
@@ -295,7 +300,7 @@ const inviteMemberHandler: RequestHandler = async (req, res) => {
 
     // Verify user is owner or admin
     const [memberCheck] = await DB.query(
-      `SELECT role FROM mirror_group_members 
+      `SELECT role FROM mirror_group_members
        WHERE group_id = ? AND user_id = ? AND status = 'active'`,
       [groupId, user.id]
     );
@@ -326,7 +331,7 @@ const inviteMemberHandler: RequestHandler = async (req, res) => {
 
     // Check if already a member
     const [existingMember] = await DB.query(
-      `SELECT status FROM mirror_group_members 
+      `SELECT status FROM mirror_group_members
        WHERE group_id = ? AND user_id = ?`,
       [groupId, targetUserId]
     );
@@ -397,7 +402,7 @@ const acceptInvitationHandler: RequestHandler = async (req, res) => {
 
     // Verify invitation exists
     const [requestRows] = await DB.query(
-      `SELECT * FROM mirror_group_join_requests 
+      `SELECT * FROM mirror_group_join_requests
        WHERE id = ? AND group_id = ? AND user_id = ? AND status = 'pending'`,
       [requestId, groupId, user.id]
     );
@@ -409,16 +414,16 @@ const acceptInvitationHandler: RequestHandler = async (req, res) => {
 
     // Update member status to 'active'
     await DB.query(
-      `UPDATE mirror_group_members 
-       SET status = 'active', joined_at = NOW() 
+      `UPDATE mirror_group_members
+       SET status = 'active', joined_at = NOW()
        WHERE group_id = ? AND user_id = ? AND status = 'invited'`,
       [groupId, user.id]
     );
 
     // Update join request
     await DB.query(
-      `UPDATE mirror_group_join_requests 
-       SET status = 'approved', processed_at = NOW() 
+      `UPDATE mirror_group_join_requests
+       SET status = 'approved', processed_at = NOW()
        WHERE id = ?`,
       [requestId]
     );
@@ -427,8 +432,8 @@ const acceptInvitationHandler: RequestHandler = async (req, res) => {
     try {
       // Get active group key
       const [keyRows] = await DB.query(
-        `SELECT id, key_version FROM mirror_group_encryption_keys 
-         WHERE group_id = ? AND status = 'active' 
+        `SELECT id, key_version FROM mirror_group_encryption_keys
+         WHERE group_id = ? AND status = 'active'
          ORDER BY key_version DESC LIMIT 1`,
         [groupId]
       );
@@ -444,8 +449,8 @@ const acceptInvitationHandler: RequestHandler = async (req, res) => {
 
     // Increment member count
     await DB.query(
-      `UPDATE mirror_groups 
-       SET current_member_count = current_member_count + 1 
+      `UPDATE mirror_groups
+       SET current_member_count = current_member_count + 1
        WHERE id = ?`,
       [groupId]
     );
@@ -488,17 +493,17 @@ const leaveGroupHandler: RequestHandler = async (req, res) => {
     }
 
     if ((groupRows as any[])[0].owner_user_id === user.id) {
-      res.status(400).json({ 
-        success: false, 
-        error: 'Owner cannot leave group. Delete the group or transfer ownership first.' 
+      res.status(400).json({
+        success: false,
+        error: 'Owner cannot leave group. Delete the group or transfer ownership first.'
       });
       return;
     }
 
     // Update member status to 'left'
     await DB.query(
-      `UPDATE mirror_group_members 
-       SET status = 'left', left_at = NOW() 
+      `UPDATE mirror_group_members
+       SET status = 'left', left_at = NOW()
        WHERE group_id = ? AND user_id = ?`,
       [groupId, user.id]
     );
@@ -513,8 +518,8 @@ const leaveGroupHandler: RequestHandler = async (req, res) => {
 
     // Decrement member count
     await DB.query(
-      `UPDATE mirror_groups 
-       SET current_member_count = current_member_count - 1 
+      `UPDATE mirror_groups
+       SET current_member_count = current_member_count - 1
        WHERE id = ?`,
       [groupId]
     );
@@ -532,7 +537,7 @@ const leaveGroupHandler: RequestHandler = async (req, res) => {
 };
 
 /* ============================================================================
-   SHARE DATA TO GROUP (PHASE 2) - FIXED ENCRYPTION
+   SHARE DATA TO GROUP (PHASE 2 COMPLETE) - ENHANCED WITH MULTIPLE DATA TYPES
 ============================================================================ */
 
 const shareDataHandler: RequestHandler = async (req, res) => {
@@ -544,40 +549,60 @@ const shareDataHandler: RequestHandler = async (req, res) => {
     }
 
     const { groupId } = req.params;
-    const { 
-      dataType = 'full_profile',  // Must be one of the enum values
+    const {
+      dataTypes,  // NEW: Support array of data types
+      dataType,   // LEGACY: Support single data type for backward compatibility
       consentText = 'I consent to share my assessment data with this group'
     } = req.body;
 
-    console.log(`📤 User ${user.id} sharing data with group ${groupId}`);
+    // Handle both single dataType and multiple dataTypes
+    const typesToShare: ShareableDataType[] = Array.isArray(dataTypes)
+      ? dataTypes
+      : (dataType ? [dataType] : ['full_profile']);
+
+    // Validate data types
+    const validDataTypes: ShareableDataType[] = [
+      'personality', 'cognitive', 'facial', 'voice', 'astrological', 'full_profile'
+    ];
+
+    const invalidTypes = typesToShare.filter(t => !validDataTypes.includes(t as ShareableDataType));
+    if (invalidTypes.length > 0) {
+      res.status(400).json({
+        success: false,
+        error: `Invalid data type(s): ${invalidTypes.join(', ')}. Valid types: ${validDataTypes.join(', ')}`
+      });
+      return;
+    }
+
+    console.log(`📤 User ${user.id} sharing data with group ${groupId}: ${typesToShare.join(', ')}`);
 
     // 1. Verify user is an active member
     const [memberCheck] = await DB.query(
-      `SELECT role, status FROM mirror_group_members 
+      `SELECT role, status FROM mirror_group_members
        WHERE group_id = ? AND user_id = ? AND status = 'active'`,
       [groupId, user.id]
     );
 
     if ((memberCheck as any[]).length === 0) {
-      res.status(403).json({ 
-        success: false, 
-        error: 'Not an active member of this group' 
+      res.status(403).json({
+        success: false,
+        error: 'Not an active member of this group'
       });
       return;
     }
 
-    // 2. Get the active group encryption key - using ACTUAL columns
+    // 2. Get the active group encryption key
     const [keyRows] = await DB.query(
-      `SELECT id, key_version FROM mirror_group_encryption_keys 
-       WHERE group_id = ? AND status = 'active' 
+      `SELECT id, key_version FROM mirror_group_encryption_keys
+       WHERE group_id = ? AND status = 'active'
        ORDER BY key_version DESC LIMIT 1`,
       [groupId]
     );
 
     if ((keyRows as any[]).length === 0) {
-      res.status(500).json({ 
-        success: false, 
-        error: 'No active encryption key for this group' 
+      res.status(500).json({
+        success: false,
+        error: 'No active encryption key for this group'
       });
       return;
     }
@@ -585,130 +610,150 @@ const shareDataHandler: RequestHandler = async (req, res) => {
     const keyId = (keyRows as any[])[0].id;
     const keyVersion = (keyRows as any[])[0].key_version;
 
-    // 3. Check if user already shared this data type
-    const [existingShare] = await DB.query(
-      `SELECT id, shared_at FROM mirror_group_shared_data 
-       WHERE group_id = ? AND user_id = ? AND data_type = ?
-       ORDER BY shared_at DESC LIMIT 1`,
-      [groupId, user.id, dataType]
-    );
+    // 3. Extract Mirror assessment data using GroupDataExtractor
+    const extractionResult = await groupDataExtractor.extractData({
+      userId: user.id,
+      dataTypes: typesToShare as ShareableDataType[]
+    });
 
-    const alreadyShared = (existingShare as any[]).length > 0;
-
-    // 4. Aggregate user's assessments
-    const aggregationResult = await publicAssessmentAggregator.aggregateForUser(user.id);
-    
-    if (!aggregationResult.success || !aggregationResult.data) {
-      res.status(400).json({ 
-        success: false, 
-        error: 'No assessment data available to share. Please complete your Mirror assessments first.' 
+    if (!extractionResult.success || !extractionResult.data || extractionResult.data.length === 0) {
+      res.status(400).json({
+        success: false,
+        error: extractionResult.error || 'No assessment data available to share. Please complete your Mirror assessments first.'
       });
       return;
     }
 
-    // 5. Prepare data based on dataType
-    let dataToShare: any;
-    
-    switch (dataType) {
-      case 'personality':
-        dataToShare = aggregationResult.data.personality;
-        break;
-      case 'cognitive':
-        dataToShare = aggregationResult.data.cognitive;
-        break;
-      case 'facial':
-        dataToShare = aggregationResult.data.emotional;
-        break;
-      case 'astrological':
-        dataToShare = aggregationResult.data.astrology;
-        break;
-      case 'voice':
-        dataToShare = aggregationResult.data.communication;
-        break;
-      case 'full_profile':
-      default:
-        dataToShare = aggregationResult.data;
-        break;
+    // 4. Process each data type
+    const shareResults: any[] = [];
+    const shareErrors: any[] = [];
+
+    for (const extractedData of extractionResult.data) {
+      try {
+        // Check if user already shared this data type
+        const [existingShare] = await DB.query(
+          `SELECT id, shared_at FROM mirror_group_shared_data
+           WHERE group_id = ? AND user_id = ? AND data_type = ?
+           ORDER BY shared_at DESC LIMIT 1`,
+          [groupId, user.id, extractedData.dataType]
+        );
+
+        const alreadyShared = (existingShare as any[]).length > 0;
+
+        // Encrypt data for the group
+        const dataBuffer = Buffer.from(JSON.stringify(extractedData.data));
+        const encryptedPackage = await groupEncryptionManager.encryptForGroup(dataBuffer, keyId);
+
+        // Generate consent signature
+        const consentSignature = crypto
+          .createHash('sha256')
+          .update(`${user.id}-${groupId}-${extractedData.dataType}-${consentText}-${Date.now()}`)
+          .digest('hex');
+
+        // Prepare encryption metadata JSON
+        const encryptionMetadata = {
+          keyId,
+          keyVersion,
+          algorithm: encryptedPackage.algorithm,
+          encryptedAt: new Date().toISOString()
+        };
+
+        // Store or update
+        if (alreadyShared) {
+          // Update existing share
+          await DB.query(
+            `UPDATE mirror_group_shared_data
+             SET encrypted_data = ?,
+                 encryption_metadata = ?,
+                 consent_signature = ?,
+                 data_version = ?,
+                 shared_at = NOW()
+             WHERE group_id = ? AND user_id = ? AND data_type = ?`,
+            [
+              encryptedPackage.encrypted,
+              JSON.stringify(encryptionMetadata),
+              consentSignature,
+              extractedData.dataVersion,
+              groupId,
+              user.id,
+              extractedData.dataType
+            ]
+          );
+          console.log(`📝 Updated ${extractedData.dataType} share for user ${user.id}`);
+        } else {
+          // Create new share
+          await DB.query(
+            `INSERT INTO mirror_group_shared_data
+             (group_id, user_id, data_type, encrypted_data, encryption_metadata, consent_signature, data_version)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [
+              groupId,
+              user.id,
+              extractedData.dataType,
+              encryptedPackage.encrypted,
+              JSON.stringify(encryptionMetadata),
+              consentSignature,
+              extractedData.dataVersion
+            ]
+          );
+          console.log(`✅ New ${extractedData.dataType} share created for user ${user.id}`);
+        }
+
+        shareResults.push({
+          dataType: extractedData.dataType,
+          status: alreadyShared ? 'updated' : 'created',
+          consentSignature: consentSignature.substring(0, 8) + '...'
+        });
+
+      } catch (error) {
+        console.error(`❌ Error sharing ${extractedData.dataType}:`, error);
+        shareErrors.push({
+          dataType: extractedData.dataType,
+          error: (error as Error).message
+        });
+      }
     }
 
-    if (!dataToShare) {
-      res.status(400).json({ 
-        success: false, 
-        error: `No ${dataType} data available to share` 
-      });
-      return;
-    }
-
-    // 6. Encrypt data for the group
-    const dataBuffer = Buffer.from(JSON.stringify(dataToShare));
-    const encryptedPackage = await groupEncryptionManager.encryptForGroup(dataBuffer, keyId);
-
-    // 7. Generate consent signature
-    const consentSignature = crypto
-      .createHash('sha256')
-      .update(`${user.id}-${groupId}-${dataType}-${consentText}-${Date.now()}`)
-      .digest('hex');
-
-    // 8. Prepare encryption metadata JSON
-    const encryptionMetadata = {
-      keyId,
-      keyVersion,
-      algorithm: encryptedPackage.algorithm,
-      encryptedAt: new Date().toISOString()
-    };
-
-    // 9. Store or update - using ONLY existing columns
-    if (alreadyShared) {
-      // Update existing share
+    // 5. Trigger group analysis queue
+    try {
+      const analysisJobId = uuidv4();
       await DB.query(
-        `UPDATE mirror_group_shared_data 
-         SET encrypted_data = ?, 
-             encryption_metadata = ?,
-             consent_signature = ?,
-             data_version = ?,
-             shared_at = NOW()
-         WHERE group_id = ? AND user_id = ? AND data_type = ?`,
+        `INSERT INTO mirror_group_analysis_queue
+         (id, group_id, analysis_type, priority, status, trigger_event, parameters, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NOW())`,
         [
-          encryptedPackage.encrypted,
-          JSON.stringify(encryptionMetadata),
-          consentSignature,
-          '2.0',
+          analysisJobId,
           groupId,
-          user.id,
-          dataType
+          'data_update',
+          7, // Higher priority for new data
+          'pending',
+          'new_data_share',
+          JSON.stringify({
+            userId: user.id,
+            dataTypes: typesToShare,
+            timestamp: new Date().toISOString()
+          })
         ]
       );
-      console.log(`📝 Updated ${dataType} share for user ${user.id}`);
-    } else {
-      // Create new share - id will auto-generate with uuid()
-      await DB.query(
-        `INSERT INTO mirror_group_shared_data 
-         (group_id, user_id, data_type, encrypted_data, encryption_metadata, consent_signature, data_version)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [
-          groupId,
-          user.id,
-          dataType,
-          encryptedPackage.encrypted,
-          JSON.stringify(encryptionMetadata),
-          consentSignature,
-          '2.0'
-        ]
-      );
-      console.log(`✅ New ${dataType} share created for user ${user.id}`);
+      console.log(`📊 Analysis queued: ${analysisJobId} for group ${groupId}`);
+    } catch (queueError) {
+      console.error('❌ Failed to queue analysis:', queueError);
+      // Non-fatal - don't block the response
     }
 
+    // 6. Response
     res.json({
       success: true,
-      message: alreadyShared ? 'Data share updated successfully' : 'Data shared with group successfully',
-      dataType,
-      consentSignature: consentSignature.substring(0, 8) + '...'
+      message: `Successfully shared ${shareResults.length} data type(s) with group`,
+      shares: shareResults,
+      errors: shareErrors.length > 0 ? shareErrors : undefined,
+      cached: extractionResult.cached
     });
 
   } catch (error) {
     console.error('❌ Error sharing data with group:', error);
-    res.status(500).json({ 
-      success: false, 
+    res.status(500).json({
+      success: false,
       error: 'Failed to share data with group',
       details: (error as Error).message
     });
@@ -716,7 +761,7 @@ const shareDataHandler: RequestHandler = async (req, res) => {
 };
 
 /* ============================================================================
-   GET SHARED DATA (PHASE 2) - FIXED DECRYPTION
+   GET SHARED DATA (PHASE 2) - DECRYPTION
 ============================================================================ */
 
 const getSharedDataHandler: RequestHandler = async (req, res) => {
@@ -731,22 +776,22 @@ const getSharedDataHandler: RequestHandler = async (req, res) => {
 
     // 1. Verify user is a member
     const [memberCheck] = await DB.query(
-      `SELECT role FROM mirror_group_members 
+      `SELECT role FROM mirror_group_members
        WHERE group_id = ? AND user_id = ? AND status = 'active'`,
       [groupId, user.id]
     );
 
     if ((memberCheck as any[]).length === 0) {
-      res.status(403).json({ 
-        success: false, 
-        error: 'Not a member of this group' 
+      res.status(403).json({
+        success: false,
+        error: 'Not a member of this group'
       });
       return;
     }
 
-    // 2. Get all shared data - using ACTUAL columns
+    // 2. Get all shared data
     const [sharedData] = await DB.query(
-      `SELECT 
+      `SELECT
         sd.id,
         sd.user_id,
         sd.data_type,
@@ -782,8 +827,8 @@ const getSharedDataHandler: RequestHandler = async (req, res) => {
           const decryptedData = JSON.parse(decryptedString);
 
           // Parse encryption metadata
-          const encryptionMeta = typeof share.encryption_metadata === 'string' 
-            ? JSON.parse(share.encryption_metadata) 
+          const encryptionMeta = typeof share.encryption_metadata === 'string'
+            ? JSON.parse(share.encryption_metadata)
             : share.encryption_metadata;
 
           return {
@@ -838,13 +883,47 @@ const getSharedDataHandler: RequestHandler = async (req, res) => {
 
   } catch (error) {
     console.error('❌ Error retrieving shared data:', error);
-    res.status(500).json({ 
-      success: false, 
+    res.status(500).json({
+      success: false,
       error: 'Failed to retrieve shared data',
       details: (error as Error).message
     });
   }
 };
+
+/* ============================================================================
+   GET DATA SUMMARY - NEW: Check what data user can share
+============================================================================ */
+
+const getDataSummaryHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    if (!user?.id) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const summary = await groupDataExtractor.getDataSummary(user.id);
+
+    res.json({
+      success: summary.success,
+      data: {
+        userId: user.id,
+        available: summary.available,
+        unavailable: summary.unavailable,
+        details: summary.details
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error getting data summary:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get data summary',
+      details: (error as Error).message
+    });
+  }
+};
+
 /* ============================================================================
    ROUTE REGISTRATION
 ============================================================================ */
@@ -862,8 +941,9 @@ router.post('/:groupId/accept', verified, acceptInvitationHandler);
 router.post('/:groupId/leave', verified, leaveGroupHandler);
 router.post('/join', verified, joinGroupHandler);
 
-// Phase 2 routes
+// Phase 2 routes - ENHANCED
 router.post('/:groupId/share-data', verified, basicSecurity, shareDataHandler);
 router.get('/:groupId/shared-data', verified, getSharedDataHandler);
+router.get('/data-summary', verified, getDataSummaryHandler); // NEW: Check available data
 
 export default router;
