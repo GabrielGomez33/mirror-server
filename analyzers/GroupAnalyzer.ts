@@ -22,7 +22,11 @@ import { publicAssessmentAggregator } from '../managers/PublicAssessmentAggregat
 import { dinaLLMConnector } from '../integrations/DINALLMConnector';
 import { groupEncryptionManager } from '../systems/GroupEncryptionManager';
 import { DB } from '../db';
+<<<<<<< HEAD
 import { redis } from '../config/redis';
+=======
+import { mirrorRedis } from '../config/redis';
+>>>>>>> ffc3cee932b33b6878a446e70a2d5f231eeab21f
 import { Logger } from '../utils/logger';
 
 /**
@@ -814,7 +818,11 @@ export class GroupAnalyzer {
       const key = `mirror:group:analysis:${result.groupId}`;
       const ttl = 3600; // 1 hour
 
+<<<<<<< HEAD
       await redis.setex(key, ttl, JSON.stringify(result));
+=======
+      await mirrorRedis.setex(key, ttl, JSON.stringify(result));
+>>>>>>> ffc3cee932b33b6878a446e70a2d5f231eeab21f
       this.logger.debug('Analysis cached', { groupId: result.groupId, ttl });
     } catch (error) {
       this.logger.error('Failed to cache analysis', error);
@@ -829,7 +837,11 @@ export class GroupAnalyzer {
   ): Promise<GroupAnalysisResult | null> {
     try {
       const key = `mirror:group:analysis:${groupId}`;
+<<<<<<< HEAD
       const cached = await redis.get(key);
+=======
+      const cached = await mirrorRedis.get(key);
+>>>>>>> ffc3cee932b33b6878a446e70a2d5f231eeab21f
 
       return cached ? JSON.parse(cached) : null;
     } catch (error) {
@@ -857,7 +869,11 @@ export class GroupAnalyzer {
   ): Promise<void> {
     try {
       // Publish to Redis for notification system
+<<<<<<< HEAD
       await redis.publish(
+=======
+      await mirrorRedis.publish(
+>>>>>>> ffc3cee932b33b6878a446e70a2d5f231eeab21f
         'mirror:notifications',
         JSON.stringify({
           type: 'group_analysis_complete',
@@ -908,7 +924,11 @@ export class GroupAnalyzer {
     `, [queueId, groupId, 'full_analysis', priority, trigger]);
 
     // Notify worker
+<<<<<<< HEAD
     await redis.publish('mirror:analysis:queue', JSON.stringify({
+=======
+    await mirrorRedis.publish('mirror:analysis:queue', JSON.stringify({
+>>>>>>> ffc3cee932b33b6878a446e70a2d5f231eeab21f
       queueId,
       groupId,
       priority

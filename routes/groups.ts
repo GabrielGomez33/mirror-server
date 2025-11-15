@@ -17,7 +17,11 @@ import { DB } from '../db';
 import AuthMiddleware, { SecurityLevel } from '../middleware/authMiddleware';
 import { groupEncryptionManager } from '../systems/GroupEncryptionManager';
 import { publicAssessmentAggregator } from '../managers/PublicAssessmentAggregator';
+<<<<<<< HEAD
 import { groupDataExtractor, ShareableDataType } from '../systems/GroupDataExtractor';
+=======
+import { groupDataExtractor, ShareableDataType } from '../services/GroupDataExtractor';
+>>>>>>> ffc3cee932b33b6878a446e70a2d5f231eeab21f
 
 const router = express.Router();
 

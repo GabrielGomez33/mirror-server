@@ -515,9 +515,80 @@ export class MirrorRedisManager extends EventEmitter {
     }
   }
 
+  // ============================================================================
+  // PHASE 3: ANALYSIS QUEUE SUPPORT
+  // ============================================================================
+
+  /**
+   * Set a key with expiration (for caching)
+   */
+  async setex(key: string, ttl: number, value: string): Promise<void> {
+    try {
+      await this.client.setex(key, ttl, value);
+    } catch (error) {
+      console.error(`❌ Redis setex failed for key ${key}:`, getErrorMessage(error));
+      throw error;
+    }
+  }
+
+  /**
+   * Publish a message to any channel (generic pub/sub)
+   */
+  async publish(channel: string, message: string): Promise<number> {
+    try {
+      return await this.publisher.publish(channel, message);
+    } catch (error) {
+      console.error(`❌ Redis publish failed for channel ${channel}:`, getErrorMessage(error));
+      throw error;
+    }
+  }
+
+  /**
+   * Subscribe to any channel with callback
+   */
+  async subscribe(channel: string, callback: (message: string) => void): Promise<void> {
+    try {
+      await this.subscriber.subscribe(channel);
+      this.subscriber.on('message', (ch: string, msg: string) => {
+        if (ch === channel) {
+          callback(msg);
+        }
+      });
+    } catch (error) {
+      console.error(`❌ Redis subscribe failed for channel ${channel}:`, getErrorMessage(error));
+      throw error;
+    }
+  }
+
+  /**
+   * Unsubscribe from a channel
+   */
+  async unsubscribe(channel: string): Promise<void> {
+    try {
+      await this.subscriber.unsubscribe(channel);
+    } catch (error) {
+      console.error(`❌ Redis unsubscribe failed for channel ${channel}:`, getErrorMessage(error));
+      throw error;
+    }
+  }
+
+  /**
+   * Get the underlying Redis client for advanced operations
+   */
+  getClient(): Redis {
+    return this.client;
+  }
+
+  /**
+   * Duplicate the client for dedicated subscribers
+   */
+  duplicate(): Redis {
+    return this.client.duplicate();
+  }
+
   async shutdown(): Promise<void> {
     console.log('🔌 Shutting down Mirror Redis Manager...');
-    
+
     try {
       await Promise.all([
         this.client.quit(),
