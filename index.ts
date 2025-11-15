@@ -30,10 +30,11 @@ import { mirrorRedis } from './config/redis';
 import { mirrorGroupNotifications } from './systems/mirrorGroupNotifications';
 
 // ============================================================================
-// MIRRORGROUPS PHASE 1 (NEW)
+// MIRRORGROUPS PHASE 1 + PHASE 3 (NEW)
 // ============================================================================
 import { groupEncryptionManager } from './systems/GroupEncryptionManager';
 import groupRoutes from './routes/groups';
+import groupInsightsRoutes from './routes/groupInsights';
 
 // ============================================================================
 // ERROR HANDLING UTILITIES
@@ -131,11 +132,14 @@ APP.use('/mirror/api/dashboard', dashboardRoutes);
 APP.use('/mirror/api/journal', journalRoutes);
 
 // ============================================================================
-// MOUNT MIRRORGROUPS ROUTES (PHASE 1)
+// MOUNT MIRRORGROUPS ROUTES (PHASE 1 + PHASE 3)
 // ============================================================================
 
 APP.use('/mirror/api/groups', groupRoutes);
 console.log('📍 MirrorGroups routes mounted at /mirror/api/groups');
+
+APP.use('/mirror/api', groupInsightsRoutes);
+console.log('📍 MirrorGroups Insights routes mounted at /mirror/api/groups/:groupId/insights');
 
 // ============================================================================
 // HEALTH CHECK ENDPOINT

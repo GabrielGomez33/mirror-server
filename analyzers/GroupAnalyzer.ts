@@ -1,0 +1,934 @@
+/**
+ * GroupAnalyzer - Core Analysis Engine for MirrorGroups Phase 3
+ * 
+ * This class orchestrates all group analysis operations including:
+ * - Compatibility matrix generation
+ * - Collective strength detection
+ * - Conflict risk prediction
+ * - Goal alignment scoring
+ * - LLM synthesis coordination
+ * 
+ * @module analyzers/GroupAnalyzer
+ * @requires Node.js 18+, TypeScript 5+
+ */
+
+import { v4 as uuidv4 } from 'uuid';
+import { CompatibilityCalculator } from './CompatibilityCalculator';
+import { CollectiveStrengthDetector } from './CollectiveStrengthDetector';
+import { ConflictRiskPredictor } from './ConflictRiskPredictor';
+import { GroupInsightManager } from '../managers/GroupInsightManager';
+import { PublicAssessmentAggregator } from '../aggregators/PublicAssessmentAggregator';
+import { DINALLMConnector } from '../integrations/DINALLMConnector';
+import { Database } from '../config/database';
+import { RedisManager } from '../config/redis';
+import { Logger } from '../utils/logger';
+
+/**
+ * Types and Interfaces
+ */
+export interface MemberData {
+  userId: string;
+  personality?: {
+    embedding: number[];
+    traits: Record<string, number>;
+    interpersonalStyle?: string;
+    communicationStyle?: string;
+    conflictResolutionStyle?: string;
+  };
+  behavioral?: {
+    tendencies: Array<{
+      behavior: string;
+      likelihood: number;
+      contexts: string[];
+    }>;
+    socialEnergy?: number;
+    empathyLevel?: number;
+  };
+  cognitive?: {
+    problemSolvingStyle?: string;
+    decisionMakingStyle?: string;
+    learningStyle?: string;
+  };
+  values?: {
+    core: string[];
+    motivationDrivers: Array<{
+      driver: string;
+      strength: number;
+    }>;
+  };
+  sharedAt: Date;
+  dataTypes: string[];
+}
+
+export interface GroupAnalysisOptions {
+  includeCompatibility?: boolean;
+  includeStrengths?: boolean;
+  includeConflicts?: boolean;
+  includeGoalAlignment?: boolean;
+  includeLLMSynthesis?: boolean;
+  forceRefresh?: boolean;
+  confidenceThreshold?: number;
+}
+
+export interface GroupAnalysisResult {
+  groupId: string;
+  analysisId: string;
+  timestamp: Date;
+  memberCount: number;
+  dataCompleteness: number;
+  insights: {
+    compatibilityMatrix?: CompatibilityMatrix;
+    collectiveStrengths?: CollectiveStrength[];
+    conflictRisks?: ConflictRisk[];
+    goalAlignment?: GoalAlignment;
+    llmSynthesis?: LLMSynthesis;
+  };
+  metadata: {
+    processingTime: number;
+    dataVersion: string;
+    algorithmsUsed: string[];
+    overallConfidence: number;
+  };
+}
+
+export interface CompatibilityMatrix {
+  matrix: number[][];
+  memberIds: string[];
+  pairwiseDetails: Map<string, CompatibilityDetail>;
+  averageCompatibility: number;
+  visualization: {
+    heatmapData: any;
+    clusterGroups?: string[][];
+  };
+}
+
+export interface CompatibilityDetail {
+  memberA: string;
+  memberB: string;
+  score: number;
+  confidence: number;
+  factors: {
+    personality: number;
+    communication: number;
+    conflict: number;
+    energy: number;
+  };
+  strengths: string[];
+  challenges: string[];
+  recommendations: string[];
+}
+
+export interface CollectiveStrength {
+  id: string;
+  name: string;
+  type: 'behavioral' | 'cognitive' | 'value' | 'skill';
+  prevalence: number;
+  strength: number;
+  description: string;
+  memberCount: number;
+  applications: string[];
+  confidence: number;
+}
+
+export interface ConflictRisk {
+  id: string;
+  type: string;
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  affectedMembers: string[];
+  description: string;
+  triggers: string[];
+  mitigationStrategies: string[];
+  probability: number;
+  impact: number;
+  riskScore: number;
+}
+
+export interface GoalAlignment {
+  overallAlignment: number;
+  sharedGoals: string[];
+  divergentGoals: string[];
+  alignmentClusters: Array<{
+    members: string[];
+    goals: string[];
+    strength: number;
+  }>;
+}
+
+export interface LLMSynthesis {
+  overview: string;
+  keyInsights: string[];
+  recommendations: string[];
+  narratives: {
+    compatibility?: string;
+    strengths?: string;
+    challenges?: string;
+    opportunities?: string;
+  };
+}
+
+/**
+ * Main GroupAnalyzer Class
+ */
+export class GroupAnalyzer {
+  private compatibilityCalculator: CompatibilityCalculator;
+  private strengthDetector: CollectiveStrengthDetector;
+  private conflictPredictor: ConflictRiskPredictor;
+  private insightManager: GroupInsightManager;
+  private assessmentAggregator: PublicAssessmentAggregator;
+  private llmConnector: DINALLMConnector;
+  private db: Database;
+  private redis: RedisManager;
+  private logger: Logger;
+
+  constructor() {
+    this.logger = new Logger('GroupAnalyzer');
+    this.db = Database.getInstance();
+    this.redis = RedisManager.getInstance();
+    
+    // Initialize sub-analyzers
+    this.compatibilityCalculator = new CompatibilityCalculator();
+    this.strengthDetector = new CollectiveStrengthDetector();
+    this.conflictPredictor = new ConflictRiskPredictor();
+    
+    // Initialize managers
+    this.insightManager = new GroupInsightManager();
+    this.assessmentAggregator = new PublicAssessmentAggregator();
+    this.llmConnector = new DINALLMConnector();
+    
+    this.logger.info('GroupAnalyzer initialized');
+  }
+
+  /**
+   * Main analysis entry point
+   */
+  public async analyzeGroup(
+    groupId: string,
+    options: GroupAnalysisOptions = {}
+  ): Promise<GroupAnalysisResult> {
+    const startTime = Date.now();
+    const analysisId = uuidv4();
+    
+    this.logger.info(`Starting analysis for group ${groupId}`, { analysisId, options });
+
+    try {
+      // Set default options
+      const analysisOptions: GroupAnalysisOptions = {
+        includeCompatibility: true,
+        includeStrengths: true,
+        includeConflicts: true,
+        includeGoalAlignment: true,
+        includeLLMSynthesis: true,
+        forceRefresh: false,
+        confidenceThreshold: 0.7,
+        ...options
+      };
+
+      // Check cache if not forcing refresh
+      if (!analysisOptions.forceRefresh) {
+        const cachedResult = await this.getCachedAnalysis(groupId);
+        if (cachedResult && this.isCacheValid(cachedResult)) {
+          this.logger.info(`Returning cached analysis for group ${groupId}`);
+          return cachedResult;
+        }
+      }
+
+      // Fetch and prepare member data
+      const memberData = await this.fetchMemberData(groupId);
+      
+      if (memberData.length < 2) {
+        throw new Error('Insufficient member data for analysis (minimum 2 members required)');
+      }
+
+      const dataCompleteness = this.calculateDataCompleteness(memberData);
+      
+      // Initialize result structure
+      const result: GroupAnalysisResult = {
+        groupId,
+        analysisId,
+        timestamp: new Date(),
+        memberCount: memberData.length,
+        dataCompleteness,
+        insights: {},
+        metadata: {
+          processingTime: 0,
+          dataVersion: this.generateDataVersion(memberData),
+          algorithmsUsed: [],
+          overallConfidence: 0
+        }
+      };
+
+      // Run analyses in parallel where possible
+      const analysisPromises: Promise<void>[] = [];
+
+      // Compatibility Matrix
+      if (analysisOptions.includeCompatibility) {
+        analysisPromises.push(
+          this.runCompatibilityAnalysis(memberData, result)
+        );
+      }
+
+      // Collective Strengths
+      if (analysisOptions.includeStrengths) {
+        analysisPromises.push(
+          this.runStrengthAnalysis(memberData, result)
+        );
+      }
+
+      // Conflict Risks
+      if (analysisOptions.includeConflicts) {
+        analysisPromises.push(
+          this.runConflictAnalysis(memberData, result)
+        );
+      }
+
+      // Goal Alignment
+      if (analysisOptions.includeGoalAlignment) {
+        analysisPromises.push(
+          this.runGoalAlignmentAnalysis(memberData, result)
+        );
+      }
+
+      // Execute parallel analyses
+      await Promise.all(analysisPromises);
+
+      // LLM Synthesis (requires other analyses to complete first)
+      if (analysisOptions.includeLLMSynthesis && Object.keys(result.insights).length > 0) {
+        await this.runLLMSynthesis(result);
+      }
+
+      // Calculate overall confidence
+      result.metadata.overallConfidence = this.calculateOverallConfidence(result);
+
+      // Filter by confidence threshold
+      if (analysisOptions.confidenceThreshold) {
+        this.filterByConfidence(result, analysisOptions.confidenceThreshold);
+      }
+
+      // Calculate processing time
+      result.metadata.processingTime = Date.now() - startTime;
+
+      // Store results
+      await this.storeAnalysisResults(result);
+
+      // Cache results
+      await this.cacheAnalysis(result);
+
+      // Queue notifications
+      await this.queueNotifications(groupId, result);
+
+      this.logger.info(`Analysis completed for group ${groupId}`, {
+        analysisId,
+        processingTime: result.metadata.processingTime,
+        confidence: result.metadata.overallConfidence
+      });
+
+      return result;
+
+    } catch (error) {
+      this.logger.error(`Analysis failed for group ${groupId}`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Fetch member data from shared group data
+   */
+  private async fetchMemberData(groupId: string): Promise<MemberData[]> {
+    try {
+      // Get all shared data for the group
+      const sharedData = await this.db.query(`
+        SELECT 
+          sd.*,
+          u.id as user_id,
+          u.username,
+          u.email
+        FROM mirror_group_shared_data sd
+        JOIN users u ON sd.member_id = u.id
+        WHERE sd.group_id = ? AND sd.is_active = 1
+        ORDER BY sd.shared_at DESC
+      `, [groupId]);
+
+      // Group by member to get latest data
+      const memberDataMap = new Map<string, MemberData>();
+
+      for (const row of sharedData) {
+        const userId = row.user_id;
+        
+        if (!memberDataMap.has(userId)) {
+          memberDataMap.set(userId, {
+            userId,
+            sharedAt: row.shared_at,
+            dataTypes: []
+          });
+        }
+
+        const memberData = memberDataMap.get(userId)!;
+        
+        // Decrypt and parse data based on type
+        const decryptedData = await this.assessmentAggregator.decryptSharedData(
+          row.encrypted_data,
+          groupId
+        );
+
+        switch (row.data_type) {
+          case 'personality':
+            memberData.personality = decryptedData.personality;
+            memberData.dataTypes.push('personality');
+            break;
+          
+          case 'cognitive':
+            memberData.cognitive = decryptedData.cognitive;
+            memberData.dataTypes.push('cognitive');
+            break;
+            
+          case 'behavioral':
+            memberData.behavioral = decryptedData.behavioral;
+            memberData.dataTypes.push('behavioral');
+            break;
+            
+          case 'full_profile':
+            Object.assign(memberData, decryptedData);
+            memberData.dataTypes.push('full_profile');
+            break;
+        }
+      }
+
+      return Array.from(memberDataMap.values());
+
+    } catch (error) {
+      this.logger.error('Failed to fetch member data', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Run compatibility analysis
+   */
+  private async runCompatibilityAnalysis(
+    memberData: MemberData[],
+    result: GroupAnalysisResult
+  ): Promise<void> {
+    try {
+      const matrix = await this.compatibilityCalculator.calculateMatrix(memberData);
+      
+      result.insights.compatibilityMatrix = matrix;
+      result.metadata.algorithmsUsed.push('compatibility_matrix_v1');
+      
+      // Store individual compatibility scores
+      await this.storeCompatibilityScores(result.groupId, matrix);
+      
+    } catch (error) {
+      this.logger.error('Compatibility analysis failed', error);
+      // Don't throw - allow other analyses to continue
+    }
+  }
+
+  /**
+   * Run collective strength analysis
+   */
+  private async runStrengthAnalysis(
+    memberData: MemberData[],
+    result: GroupAnalysisResult
+  ): Promise<void> {
+    try {
+      const strengths = await this.strengthDetector.detectStrengths(memberData);
+      
+      result.insights.collectiveStrengths = strengths;
+      result.metadata.algorithmsUsed.push('strength_detection_v1');
+      
+      // Store collective patterns
+      await this.storeCollectivePatterns(result.groupId, strengths);
+      
+    } catch (error) {
+      this.logger.error('Strength analysis failed', error);
+    }
+  }
+
+  /**
+   * Run conflict risk analysis
+   */
+  private async runConflictAnalysis(
+    memberData: MemberData[],
+    result: GroupAnalysisResult
+  ): Promise<void> {
+    try {
+      const risks = await this.conflictPredictor.predictRisks(memberData);
+      
+      result.insights.conflictRisks = risks;
+      result.metadata.algorithmsUsed.push('conflict_prediction_v1');
+      
+      // Store conflict risks
+      await this.storeConflictRisks(result.groupId, risks);
+      
+    } catch (error) {
+      this.logger.error('Conflict analysis failed', error);
+    }
+  }
+
+  /**
+   * Run goal alignment analysis
+   */
+  private async runGoalAlignmentAnalysis(
+    memberData: MemberData[],
+    result: GroupAnalysisResult
+  ): Promise<void> {
+    try {
+      const alignment = await this.calculateGoalAlignment(memberData);
+      
+      result.insights.goalAlignment = alignment;
+      result.metadata.algorithmsUsed.push('goal_alignment_v1');
+      
+    } catch (error) {
+      this.logger.error('Goal alignment analysis failed', error);
+    }
+  }
+
+  /**
+   * Run LLM synthesis
+   */
+  private async runLLMSynthesis(result: GroupAnalysisResult): Promise<void> {
+    try {
+      const synthesis = await this.llmConnector.synthesizeInsights(result);
+      
+      result.insights.llmSynthesis = synthesis;
+      result.metadata.algorithmsUsed.push('llm_synthesis_v1');
+      
+      // Store LLM synthesis
+      await this.storeLLMSynthesis(result.groupId, synthesis);
+      
+    } catch (error) {
+      this.logger.error('LLM synthesis failed', error);
+    }
+  }
+
+  /**
+   * Calculate goal alignment between members
+   */
+  private async calculateGoalAlignment(memberData: MemberData[]): Promise<GoalAlignment> {
+    const goalClusters = new Map<string, Set<string>>();
+    const allGoals = new Set<string>();
+    
+    // Extract goals from motivation drivers
+    memberData.forEach(member => {
+      if (member.values?.motivationDrivers) {
+        member.values.motivationDrivers
+          .filter(d => d.strength > 0.6)
+          .forEach(driver => {
+            allGoals.add(driver.driver);
+            
+            if (!goalClusters.has(driver.driver)) {
+              goalClusters.set(driver.driver, new Set());
+            }
+            goalClusters.get(driver.driver)!.add(member.userId);
+          });
+      }
+    });
+
+    // Identify shared vs divergent goals
+    const sharedGoals: string[] = [];
+    const divergentGoals: string[] = [];
+    const threshold = memberData.length * 0.6; // 60% agreement
+    
+    goalClusters.forEach((members, goal) => {
+      if (members.size >= threshold) {
+        sharedGoals.push(goal);
+      } else if (members.size === 1) {
+        divergentGoals.push(goal);
+      }
+    });
+
+    // Create alignment clusters
+    const alignmentClusters = Array.from(goalClusters.entries())
+      .filter(([_, members]) => members.size > 1)
+      .map(([goal, members]) => ({
+        members: Array.from(members),
+        goals: [goal],
+        strength: members.size / memberData.length
+      }));
+
+    // Calculate overall alignment
+    const overallAlignment = sharedGoals.length / Math.max(allGoals.size, 1);
+
+    return {
+      overallAlignment,
+      sharedGoals,
+      divergentGoals,
+      alignmentClusters
+    };
+  }
+
+  /**
+   * Calculate data completeness for the group
+   */
+  private calculateDataCompleteness(memberData: MemberData[]): number {
+    if (memberData.length === 0) return 0;
+    
+    const requiredFields = [
+      'personality.embedding',
+      'personality.traits',
+      'behavioral.tendencies',
+      'values.motivationDrivers'
+    ];
+    
+    let totalFields = 0;
+    let presentFields = 0;
+    
+    memberData.forEach(member => {
+      requiredFields.forEach(field => {
+        totalFields++;
+        if (this.hasNestedProperty(member, field)) {
+          presentFields++;
+        }
+      });
+    });
+    
+    return presentFields / totalFields;
+  }
+
+  /**
+   * Calculate overall confidence score
+   */
+  private calculateOverallConfidence(result: GroupAnalysisResult): number {
+    const confidences: number[] = [];
+    
+    // Collect confidence scores from various analyses
+    if (result.insights.compatibilityMatrix) {
+      const avgConfidence = Array.from(
+        result.insights.compatibilityMatrix.pairwiseDetails.values()
+      ).reduce((sum, detail) => sum + detail.confidence, 0) / 
+        result.insights.compatibilityMatrix.pairwiseDetails.size;
+      confidences.push(avgConfidence);
+    }
+    
+    if (result.insights.collectiveStrengths) {
+      const avgConfidence = result.insights.collectiveStrengths
+        .reduce((sum, s) => sum + s.confidence, 0) / 
+        result.insights.collectiveStrengths.length;
+      confidences.push(avgConfidence);
+    }
+    
+    // Weight by data completeness
+    const baseConfidence = confidences.length > 0 
+      ? confidences.reduce((a, b) => a + b, 0) / confidences.length 
+      : 0.5;
+      
+    return Math.min(baseConfidence * result.dataCompleteness, 1.0);
+  }
+
+  /**
+   * Filter results by confidence threshold
+   */
+  private filterByConfidence(
+    result: GroupAnalysisResult,
+    threshold: number
+  ): void {
+    // Filter collective strengths
+    if (result.insights.collectiveStrengths) {
+      result.insights.collectiveStrengths = result.insights.collectiveStrengths
+        .filter(s => s.confidence >= threshold);
+    }
+    
+    // Filter conflict risks by probability
+    if (result.insights.conflictRisks) {
+      result.insights.conflictRisks = result.insights.conflictRisks
+        .filter(r => r.probability >= threshold);
+    }
+  }
+
+  /**
+   * Store analysis results to database
+   */
+  private async storeAnalysisResults(result: GroupAnalysisResult): Promise<void> {
+    const transaction = await this.db.beginTransaction();
+    
+    try {
+      // Store main insight record
+      await transaction.query(`
+        INSERT INTO mirror_group_insights (
+          id, group_id, insight_type, data, confidence_score, 
+          generated_at, metadata, version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        result.analysisId,
+        result.groupId,
+        'full_analysis',
+        JSON.stringify(result.insights),
+        result.metadata.overallConfidence,
+        result.timestamp,
+        JSON.stringify(result.metadata),
+        1
+      ]);
+      
+      await transaction.commit();
+      
+    } catch (error) {
+      await transaction.rollback();
+      throw error;
+    }
+  }
+
+  /**
+   * Store compatibility scores
+   */
+  private async storeCompatibilityScores(
+    groupId: string,
+    matrix: CompatibilityMatrix
+  ): Promise<void> {
+    const batch = [];
+    
+    matrix.pairwiseDetails.forEach((detail, key) => {
+      batch.push([
+        uuidv4(),
+        groupId,
+        detail.memberA,
+        detail.memberB,
+        detail.score,
+        detail.confidence,
+        detail.factors.personality,
+        detail.factors.communication,
+        detail.factors.conflict,
+        detail.factors.energy,
+        JSON.stringify(detail.factors),
+        JSON.stringify(detail.strengths),
+        JSON.stringify(detail.challenges),
+        JSON.stringify(detail.recommendations),
+        detail.strengths.join('. ') + ' ' + detail.challenges.join('. ')
+      ]);
+    });
+    
+    if (batch.length > 0) {
+      await this.db.query(`
+        INSERT INTO mirror_group_compatibility (
+          id, group_id, member_a_id, member_b_id, compatibility_score,
+          confidence_score, personality_similarity, communication_alignment,
+          conflict_compatibility, energy_balance, factors, strengths,
+          challenges, recommendations, explanation
+        ) VALUES ?
+        ON DUPLICATE KEY UPDATE
+          compatibility_score = VALUES(compatibility_score),
+          confidence_score = VALUES(confidence_score),
+          calculated_at = CURRENT_TIMESTAMP
+      `, [batch]);
+    }
+  }
+
+  /**
+   * Store collective patterns
+   */
+  private async storeCollectivePatterns(
+    groupId: string,
+    strengths: CollectiveStrength[]
+  ): Promise<void> {
+    const batch = strengths.map(strength => [
+      uuidv4(),
+      groupId,
+      'strength',
+      strength.name,
+      strength.prevalence,
+      strength.strength,
+      strength.memberCount,
+      strength.memberCount / strength.prevalence, // total members
+      strength.description,
+      JSON.stringify(strength.applications),
+      JSON.stringify({ impact: 'positive', scope: 'group-wide' }),
+      strength.confidence,
+      true
+    ]);
+    
+    if (batch.length > 0) {
+      await this.db.query(`
+        INSERT INTO mirror_group_collective_patterns (
+          id, group_id, pattern_type, pattern_name, prevalence,
+          average_likelihood, member_count, total_members, description,
+          contexts, implications, confidence, is_significant
+        ) VALUES ?
+      `, [batch]);
+    }
+  }
+
+  /**
+   * Store conflict risks
+   */
+  private async storeConflictRisks(
+    groupId: string,
+    risks: ConflictRisk[]
+  ): Promise<void> {
+    const batch = risks.map(risk => [
+      risk.id,
+      groupId,
+      risk.type,
+      risk.severity,
+      JSON.stringify(risk.affectedMembers),
+      risk.description,
+      JSON.stringify(risk.triggers),
+      JSON.stringify(risk.mitigationStrategies),
+      risk.probability,
+      risk.impact
+    ]);
+    
+    if (batch.length > 0) {
+      await this.db.query(`
+        INSERT INTO mirror_group_conflict_risks (
+          id, group_id, risk_type, severity, affected_members,
+          description, triggers, mitigation_strategies, probability, impact_score
+        ) VALUES ?
+      `, [batch]);
+    }
+  }
+
+  /**
+   * Store LLM synthesis
+   */
+  private async storeLLMSynthesis(
+    groupId: string,
+    synthesis: LLMSynthesis
+  ): Promise<void> {
+    const syntheses = [
+      {
+        type: 'overview',
+        content: synthesis.overview,
+        keyPoints: synthesis.keyInsights
+      },
+      {
+        type: 'compatibility_narrative',
+        content: synthesis.narratives.compatibility || '',
+        keyPoints: []
+      },
+      {
+        type: 'strength_story',
+        content: synthesis.narratives.strengths || '',
+        keyPoints: []
+      }
+    ];
+    
+    for (const syn of syntheses) {
+      if (syn.content) {
+        await this.db.query(`
+          INSERT INTO mirror_group_llm_synthesis (
+            id, group_id, synthesis_type, content, key_points,
+            llm_model, generated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `, [
+          uuidv4(),
+          groupId,
+          syn.type,
+          syn.content,
+          JSON.stringify(syn.keyPoints),
+          'gpt-4',
+          new Date()
+        ]);
+      }
+    }
+  }
+
+  /**
+   * Cache analysis results
+   */
+  private async cacheAnalysis(result: GroupAnalysisResult): Promise<void> {
+    const key = `mirror:group:analysis:${result.groupId}`;
+    const ttl = 3600; // 1 hour
+    
+    await this.redis.setex(key, ttl, JSON.stringify(result));
+  }
+
+  /**
+   * Get cached analysis
+   */
+  private async getCachedAnalysis(
+    groupId: string
+  ): Promise<GroupAnalysisResult | null> {
+    const key = `mirror:group:analysis:${groupId}`;
+    const cached = await this.redis.get(key);
+    
+    return cached ? JSON.parse(cached) : null;
+  }
+
+  /**
+   * Check if cache is valid
+   */
+  private isCacheValid(cached: GroupAnalysisResult): boolean {
+    const age = Date.now() - new Date(cached.timestamp).getTime();
+    const maxAge = 3600000; // 1 hour
+    
+    return age < maxAge;
+  }
+
+  /**
+   * Queue notifications for analysis completion
+   */
+  private async queueNotifications(
+    groupId: string,
+    result: GroupAnalysisResult
+  ): Promise<void> {
+    // Publish to Redis for notification system
+    await this.redis.publish(
+      'mirror:notifications',
+      JSON.stringify({
+        type: 'group_analysis_complete',
+        groupId,
+        analysisId: result.analysisId,
+        timestamp: result.timestamp,
+        memberCount: result.memberCount,
+        confidence: result.metadata.overallConfidence
+      })
+    );
+  }
+
+  /**
+   * Generate data version hash
+   */
+  private generateDataVersion(memberData: MemberData[]): string {
+    const timestamps = memberData.map(m => m.sharedAt.getTime()).sort();
+    const hash = timestamps.reduce((a, b) => a + b, 0).toString(36);
+    return `v1_${hash}`;
+  }
+
+  /**
+   * Helper to check nested properties
+   */
+  private hasNestedProperty(obj: any, path: string): boolean {
+    return path.split('.').reduce((current, prop) => 
+      current?.[prop] !== undefined ? current[prop] : undefined, obj
+    ) !== undefined;
+  }
+
+  /**
+   * Queue analysis for a group
+   */
+  public async queueAnalysis(
+    groupId: string,
+    trigger: string,
+    priority: number = 5
+  ): Promise<string> {
+    const queueId = uuidv4();
+    
+    await this.db.query(`
+      INSERT INTO mirror_group_analysis_queue (
+        id, group_id, analysis_type, priority, trigger_event
+      ) VALUES (?, ?, ?, ?, ?)
+    `, [queueId, groupId, 'full_analysis', priority, trigger]);
+    
+    // Notify worker
+    await this.redis.publish('mirror:analysis:queue', JSON.stringify({
+      queueId,
+      groupId,
+      priority
+    }));
+    
+    return queueId;
+  }
+
+  /**
+   * Get analysis status
+   */
+  public async getAnalysisStatus(queueId: string): Promise<any> {
+    const result = await this.db.query(`
+      SELECT * FROM mirror_group_analysis_queue WHERE id = ?
+    `, [queueId]);
+    
+    return result[0];
+  }
+}
+
+// Export singleton instance
+export default new GroupAnalyzer();
