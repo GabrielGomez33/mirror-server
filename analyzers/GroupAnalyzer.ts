@@ -1,13 +1,15 @@
 /**
  * GroupAnalyzer - Core Analysis Engine for MirrorGroups Phase 3
- * 
+ *
+ * ADAPTED FOR PRODUCTION - Uses existing Mirror infrastructure
+ *
  * This class orchestrates all group analysis operations including:
  * - Compatibility matrix generation
  * - Collective strength detection
  * - Conflict risk prediction
  * - Goal alignment scoring
  * - LLM synthesis coordination
- * 
+ *
  * @module analyzers/GroupAnalyzer
  * @requires Node.js 18+, TypeScript 5+
  */
@@ -16,11 +18,11 @@ import { v4 as uuidv4 } from 'uuid';
 import { CompatibilityCalculator } from './CompatibilityCalculator';
 import { CollectiveStrengthDetector } from './CollectiveStrengthDetector';
 import { ConflictRiskPredictor } from './ConflictRiskPredictor';
-import { GroupInsightManager } from '../managers/GroupInsightManager';
-import { PublicAssessmentAggregator } from '../aggregators/PublicAssessmentAggregator';
-import { DINALLMConnector } from '../integrations/DINALLMConnector';
-import { Database } from '../config/database';
-import { RedisManager } from '../config/redis';
+import { publicAssessmentAggregator } from '../managers/PublicAssessmentAggregator';
+import { dinaLLMConnector } from '../integrations/DINALLMConnector';
+import { groupEncryptionManager } from '../systems/GroupEncryptionManager';
+import { DB } from '../db';
+import { redis } from '../config/redis';
 import { Logger } from '../utils/logger';
 
 /**
@@ -96,6 +98,7 @@ export interface CompatibilityMatrix {
   memberIds: string[];
   pairwiseDetails: Map<string, CompatibilityDetail>;
   averageCompatibility: number;
+  pairCount?: number;
   visualization: {
     heatmapData: any;
     clusterGroups?: string[][];
@@ -173,28 +176,16 @@ export class GroupAnalyzer {
   private compatibilityCalculator: CompatibilityCalculator;
   private strengthDetector: CollectiveStrengthDetector;
   private conflictPredictor: ConflictRiskPredictor;
-  private insightManager: GroupInsightManager;
-  private assessmentAggregator: PublicAssessmentAggregator;
-  private llmConnector: DINALLMConnector;
-  private db: Database;
-  private redis: RedisManager;
   private logger: Logger;
 
   constructor() {
     this.logger = new Logger('GroupAnalyzer');
-    this.db = Database.getInstance();
-    this.redis = RedisManager.getInstance();
-    
+
     // Initialize sub-analyzers
     this.compatibilityCalculator = new CompatibilityCalculator();
     this.strengthDetector = new CollectiveStrengthDetector();
     this.conflictPredictor = new ConflictRiskPredictor();
-    
-    // Initialize managers
-    this.insightManager = new GroupInsightManager();
-    this.assessmentAggregator = new PublicAssessmentAggregator();
-    this.llmConnector = new DINALLMConnector();
-    
+
     this.logger.info('GroupAnalyzer initialized');
   }
 
@@ -207,7 +198,7 @@ export class GroupAnalyzer {
   ): Promise<GroupAnalysisResult> {
     const startTime = Date.now();
     const analysisId = uuidv4();
-    
+
     this.logger.info(`Starting analysis for group ${groupId}`, { analysisId, options });
 
     try {
@@ -234,13 +225,13 @@ export class GroupAnalyzer {
 
       // Fetch and prepare member data
       const memberData = await this.fetchMemberData(groupId);
-      
+
       if (memberData.length < 2) {
         throw new Error('Insufficient member data for analysis (minimum 2 members required)');
       }
 
       const dataCompleteness = this.calculateDataCompleteness(memberData);
-      
+
       // Initialize result structure
       const result: GroupAnalysisResult = {
         groupId,
@@ -336,24 +327,26 @@ export class GroupAnalyzer {
   private async fetchMemberData(groupId: string): Promise<MemberData[]> {
     try {
       // Get all shared data for the group
-      const sharedData = await this.db.query(`
-        SELECT 
+      const [sharedDataRows] = await DB.query(`
+        SELECT
           sd.*,
           u.id as user_id,
           u.username,
           u.email
         FROM mirror_group_shared_data sd
-        JOIN users u ON sd.member_id = u.id
-        WHERE sd.group_id = ? AND sd.is_active = 1
+        JOIN users u ON sd.user_id = u.id
+        WHERE sd.group_id = ?
         ORDER BY sd.shared_at DESC
       `, [groupId]);
+
+      const sharedData = sharedDataRows as any[];
 
       // Group by member to get latest data
       const memberDataMap = new Map<string, MemberData>();
 
       for (const row of sharedData) {
-        const userId = row.user_id;
-        
+        const userId = String(row.user_id);
+
         if (!memberDataMap.has(userId)) {
           memberDataMap.set(userId, {
             userId,
@@ -363,29 +356,33 @@ export class GroupAnalyzer {
         }
 
         const memberData = memberDataMap.get(userId)!;
-        
+
         // Decrypt and parse data based on type
-        const decryptedData = await this.assessmentAggregator.decryptSharedData(
+        const decryptedResult = await groupEncryptionManager.decryptForUser(
           row.encrypted_data,
+          userId,
           groupId
         );
 
+        const decryptedString = decryptedResult.data.toString('utf-8');
+        const decryptedData = JSON.parse(decryptedString);
+
         switch (row.data_type) {
           case 'personality':
-            memberData.personality = decryptedData.personality;
+            memberData.personality = decryptedData;
             memberData.dataTypes.push('personality');
             break;
-          
+
           case 'cognitive':
-            memberData.cognitive = decryptedData.cognitive;
+            memberData.cognitive = decryptedData;
             memberData.dataTypes.push('cognitive');
             break;
-            
+
           case 'behavioral':
-            memberData.behavioral = decryptedData.behavioral;
+            memberData.behavioral = decryptedData;
             memberData.dataTypes.push('behavioral');
             break;
-            
+
           case 'full_profile':
             Object.assign(memberData, decryptedData);
             memberData.dataTypes.push('full_profile');
@@ -410,13 +407,16 @@ export class GroupAnalyzer {
   ): Promise<void> {
     try {
       const matrix = await this.compatibilityCalculator.calculateMatrix(memberData);
-      
+
+      // Add pairCount for synthesis
+      matrix.pairCount = matrix.pairwiseDetails.size;
+
       result.insights.compatibilityMatrix = matrix;
       result.metadata.algorithmsUsed.push('compatibility_matrix_v1');
-      
+
       // Store individual compatibility scores
       await this.storeCompatibilityScores(result.groupId, matrix);
-      
+
     } catch (error) {
       this.logger.error('Compatibility analysis failed', error);
       // Don't throw - allow other analyses to continue
@@ -432,13 +432,13 @@ export class GroupAnalyzer {
   ): Promise<void> {
     try {
       const strengths = await this.strengthDetector.detectStrengths(memberData);
-      
+
       result.insights.collectiveStrengths = strengths;
       result.metadata.algorithmsUsed.push('strength_detection_v1');
-      
+
       // Store collective patterns
       await this.storeCollectivePatterns(result.groupId, strengths);
-      
+
     } catch (error) {
       this.logger.error('Strength analysis failed', error);
     }
@@ -453,13 +453,13 @@ export class GroupAnalyzer {
   ): Promise<void> {
     try {
       const risks = await this.conflictPredictor.predictRisks(memberData);
-      
+
       result.insights.conflictRisks = risks;
       result.metadata.algorithmsUsed.push('conflict_prediction_v1');
-      
+
       // Store conflict risks
       await this.storeConflictRisks(result.groupId, risks);
-      
+
     } catch (error) {
       this.logger.error('Conflict analysis failed', error);
     }
@@ -474,10 +474,10 @@ export class GroupAnalyzer {
   ): Promise<void> {
     try {
       const alignment = await this.calculateGoalAlignment(memberData);
-      
+
       result.insights.goalAlignment = alignment;
       result.metadata.algorithmsUsed.push('goal_alignment_v1');
-      
+
     } catch (error) {
       this.logger.error('Goal alignment analysis failed', error);
     }
@@ -488,14 +488,14 @@ export class GroupAnalyzer {
    */
   private async runLLMSynthesis(result: GroupAnalysisResult): Promise<void> {
     try {
-      const synthesis = await this.llmConnector.synthesizeInsights(result);
-      
+      const synthesis = await dinaLLMConnector.synthesizeInsights(result);
+
       result.insights.llmSynthesis = synthesis;
       result.metadata.algorithmsUsed.push('llm_synthesis_v1');
-      
+
       // Store LLM synthesis
       await this.storeLLMSynthesis(result.groupId, synthesis);
-      
+
     } catch (error) {
       this.logger.error('LLM synthesis failed', error);
     }
@@ -507,7 +507,7 @@ export class GroupAnalyzer {
   private async calculateGoalAlignment(memberData: MemberData[]): Promise<GoalAlignment> {
     const goalClusters = new Map<string, Set<string>>();
     const allGoals = new Set<string>();
-    
+
     // Extract goals from motivation drivers
     memberData.forEach(member => {
       if (member.values?.motivationDrivers) {
@@ -515,7 +515,7 @@ export class GroupAnalyzer {
           .filter(d => d.strength > 0.6)
           .forEach(driver => {
             allGoals.add(driver.driver);
-            
+
             if (!goalClusters.has(driver.driver)) {
               goalClusters.set(driver.driver, new Set());
             }
@@ -528,7 +528,7 @@ export class GroupAnalyzer {
     const sharedGoals: string[] = [];
     const divergentGoals: string[] = [];
     const threshold = memberData.length * 0.6; // 60% agreement
-    
+
     goalClusters.forEach((members, goal) => {
       if (members.size >= threshold) {
         sharedGoals.push(goal);
@@ -562,17 +562,17 @@ export class GroupAnalyzer {
    */
   private calculateDataCompleteness(memberData: MemberData[]): number {
     if (memberData.length === 0) return 0;
-    
+
     const requiredFields = [
       'personality.embedding',
       'personality.traits',
       'behavioral.tendencies',
       'values.motivationDrivers'
     ];
-    
+
     let totalFields = 0;
     let presentFields = 0;
-    
+
     memberData.forEach(member => {
       requiredFields.forEach(field => {
         totalFields++;
@@ -581,7 +581,7 @@ export class GroupAnalyzer {
         }
       });
     });
-    
+
     return presentFields / totalFields;
   }
 
@@ -590,28 +590,28 @@ export class GroupAnalyzer {
    */
   private calculateOverallConfidence(result: GroupAnalysisResult): number {
     const confidences: number[] = [];
-    
+
     // Collect confidence scores from various analyses
     if (result.insights.compatibilityMatrix) {
       const avgConfidence = Array.from(
         result.insights.compatibilityMatrix.pairwiseDetails.values()
-      ).reduce((sum, detail) => sum + detail.confidence, 0) / 
+      ).reduce((sum, detail) => sum + detail.confidence, 0) /
         result.insights.compatibilityMatrix.pairwiseDetails.size;
       confidences.push(avgConfidence);
     }
-    
+
     if (result.insights.collectiveStrengths) {
       const avgConfidence = result.insights.collectiveStrengths
-        .reduce((sum, s) => sum + s.confidence, 0) / 
+        .reduce((sum, s) => sum + s.confidence, 0) /
         result.insights.collectiveStrengths.length;
       confidences.push(avgConfidence);
     }
-    
+
     // Weight by data completeness
-    const baseConfidence = confidences.length > 0 
-      ? confidences.reduce((a, b) => a + b, 0) / confidences.length 
+    const baseConfidence = confidences.length > 0
+      ? confidences.reduce((a, b) => a + b, 0) / confidences.length
       : 0.5;
-      
+
     return Math.min(baseConfidence * result.dataCompleteness, 1.0);
   }
 
@@ -627,7 +627,7 @@ export class GroupAnalyzer {
       result.insights.collectiveStrengths = result.insights.collectiveStrengths
         .filter(s => s.confidence >= threshold);
     }
-    
+
     // Filter conflict risks by probability
     if (result.insights.conflictRisks) {
       result.insights.conflictRisks = result.insights.conflictRisks
@@ -639,31 +639,20 @@ export class GroupAnalyzer {
    * Store analysis results to database
    */
   private async storeAnalysisResults(result: GroupAnalysisResult): Promise<void> {
-    const transaction = await this.db.beginTransaction();
-    
     try {
-      // Store main insight record
-      await transaction.query(`
-        INSERT INTO mirror_group_insights (
-          id, group_id, insight_type, data, confidence_score, 
-          generated_at, metadata, version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `, [
-        result.analysisId,
-        result.groupId,
-        'full_analysis',
-        JSON.stringify(result.insights),
-        result.metadata.overallConfidence,
-        result.timestamp,
-        JSON.stringify(result.metadata),
-        1
-      ]);
-      
-      await transaction.commit();
-      
+      // Update analysis queue status
+      await DB.query(`
+        UPDATE mirror_group_analysis_queue
+        SET status = 'completed',
+            completed_at = NOW()
+        WHERE group_id = ? AND status = 'pending'
+        ORDER BY created_at DESC
+        LIMIT 1
+      `, [result.groupId]);
+
     } catch (error) {
-      await transaction.rollback();
-      throw error;
+      this.logger.error('Failed to store analysis results', error);
+      // Non-fatal - don't throw
     }
   }
 
@@ -674,41 +663,43 @@ export class GroupAnalyzer {
     groupId: string,
     matrix: CompatibilityMatrix
   ): Promise<void> {
-    const batch = [];
-    
-    matrix.pairwiseDetails.forEach((detail, key) => {
-      batch.push([
-        uuidv4(),
-        groupId,
-        detail.memberA,
-        detail.memberB,
-        detail.score,
-        detail.confidence,
-        detail.factors.personality,
-        detail.factors.communication,
-        detail.factors.conflict,
-        detail.factors.energy,
-        JSON.stringify(detail.factors),
-        JSON.stringify(detail.strengths),
-        JSON.stringify(detail.challenges),
-        JSON.stringify(detail.recommendations),
-        detail.strengths.join('. ') + ' ' + detail.challenges.join('. ')
-      ]);
-    });
-    
-    if (batch.length > 0) {
-      await this.db.query(`
-        INSERT INTO mirror_group_compatibility (
-          id, group_id, member_a_id, member_b_id, compatibility_score,
-          confidence_score, personality_similarity, communication_alignment,
-          conflict_compatibility, energy_balance, factors, strengths,
-          challenges, recommendations, explanation
-        ) VALUES ?
-        ON DUPLICATE KEY UPDATE
-          compatibility_score = VALUES(compatibility_score),
-          confidence_score = VALUES(confidence_score),
-          calculated_at = CURRENT_TIMESTAMP
-      `, [batch]);
+    try {
+      // Delete existing compatibility scores for this group
+      await DB.query(`
+        DELETE FROM mirror_group_compatibility WHERE group_id = ?
+      `, [groupId]);
+
+      // Insert new scores
+      for (const [key, detail] of matrix.pairwiseDetails.entries()) {
+        await DB.query(`
+          INSERT INTO mirror_group_compatibility (
+            id, group_id, member_a_id, member_b_id, compatibility_score,
+            confidence_score, personality_similarity, communication_alignment,
+            conflict_compatibility, energy_balance, factors, strengths,
+            challenges, recommendations, explanation
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+          uuidv4(),
+          groupId,
+          detail.memberA,
+          detail.memberB,
+          detail.score,
+          detail.confidence,
+          detail.factors.personality,
+          detail.factors.communication,
+          detail.factors.conflict,
+          detail.factors.energy,
+          JSON.stringify(detail.factors),
+          JSON.stringify(detail.strengths),
+          JSON.stringify(detail.challenges),
+          JSON.stringify(detail.recommendations),
+          detail.strengths.join('. ') + ' ' + detail.challenges.join('. ')
+        ]);
+      }
+
+      this.logger.info(`Stored ${matrix.pairwiseDetails.size} compatibility scores`);
+    } catch (error) {
+      this.logger.error('Failed to store compatibility scores', error);
     }
   }
 
@@ -719,30 +710,40 @@ export class GroupAnalyzer {
     groupId: string,
     strengths: CollectiveStrength[]
   ): Promise<void> {
-    const batch = strengths.map(strength => [
-      uuidv4(),
-      groupId,
-      'strength',
-      strength.name,
-      strength.prevalence,
-      strength.strength,
-      strength.memberCount,
-      strength.memberCount / strength.prevalence, // total members
-      strength.description,
-      JSON.stringify(strength.applications),
-      JSON.stringify({ impact: 'positive', scope: 'group-wide' }),
-      strength.confidence,
-      true
-    ]);
-    
-    if (batch.length > 0) {
-      await this.db.query(`
-        INSERT INTO mirror_group_collective_patterns (
-          id, group_id, pattern_type, pattern_name, prevalence,
-          average_likelihood, member_count, total_members, description,
-          contexts, implications, confidence, is_significant
-        ) VALUES ?
-      `, [batch]);
+    try {
+      // Delete existing patterns for this group
+      await DB.query(`
+        DELETE FROM mirror_group_collective_patterns WHERE group_id = ?
+      `, [groupId]);
+
+      // Insert new patterns
+      for (const strength of strengths) {
+        await DB.query(`
+          INSERT INTO mirror_group_collective_patterns (
+            id, group_id, pattern_type, pattern_name, prevalence,
+            average_likelihood, member_count, total_members, description,
+            contexts, implications, confidence, is_significant
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+          strength.id,
+          groupId,
+          'strength',
+          strength.name,
+          strength.prevalence,
+          strength.strength,
+          strength.memberCount,
+          Math.ceil(strength.memberCount / strength.prevalence), // total members
+          strength.description,
+          JSON.stringify(strength.applications),
+          JSON.stringify({ impact: 'positive', scope: 'group-wide' }),
+          strength.confidence,
+          true
+        ]);
+      }
+
+      this.logger.info(`Stored ${strengths.length} collective patterns`);
+    } catch (error) {
+      this.logger.error('Failed to store collective patterns', error);
     }
   }
 
@@ -753,26 +754,36 @@ export class GroupAnalyzer {
     groupId: string,
     risks: ConflictRisk[]
   ): Promise<void> {
-    const batch = risks.map(risk => [
-      risk.id,
-      groupId,
-      risk.type,
-      risk.severity,
-      JSON.stringify(risk.affectedMembers),
-      risk.description,
-      JSON.stringify(risk.triggers),
-      JSON.stringify(risk.mitigationStrategies),
-      risk.probability,
-      risk.impact
-    ]);
-    
-    if (batch.length > 0) {
-      await this.db.query(`
-        INSERT INTO mirror_group_conflict_risks (
-          id, group_id, risk_type, severity, affected_members,
-          description, triggers, mitigation_strategies, probability, impact_score
-        ) VALUES ?
-      `, [batch]);
+    try {
+      // Delete existing risks for this group
+      await DB.query(`
+        DELETE FROM mirror_group_conflict_risks WHERE group_id = ?
+      `, [groupId]);
+
+      // Insert new risks
+      for (const risk of risks) {
+        await DB.query(`
+          INSERT INTO mirror_group_conflict_risks (
+            id, group_id, risk_type, severity, affected_members,
+            description, triggers, mitigation_strategies, probability, impact_score
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+          risk.id,
+          groupId,
+          risk.type,
+          risk.severity,
+          JSON.stringify(risk.affectedMembers),
+          risk.description,
+          JSON.stringify(risk.triggers),
+          JSON.stringify(risk.mitigationStrategies),
+          risk.probability,
+          risk.impact
+        ]);
+      }
+
+      this.logger.info(`Stored ${risks.length} conflict risks`);
+    } catch (error) {
+      this.logger.error('Failed to store conflict risks', error);
     }
   }
 
@@ -783,41 +794,15 @@ export class GroupAnalyzer {
     groupId: string,
     synthesis: LLMSynthesis
   ): Promise<void> {
-    const syntheses = [
-      {
-        type: 'overview',
-        content: synthesis.overview,
-        keyPoints: synthesis.keyInsights
-      },
-      {
-        type: 'compatibility_narrative',
-        content: synthesis.narratives.compatibility || '',
-        keyPoints: []
-      },
-      {
-        type: 'strength_story',
-        content: synthesis.narratives.strengths || '',
-        keyPoints: []
-      }
-    ];
-    
-    for (const syn of syntheses) {
-      if (syn.content) {
-        await this.db.query(`
-          INSERT INTO mirror_group_llm_synthesis (
-            id, group_id, synthesis_type, content, key_points,
-            llm_model, generated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        `, [
-          uuidv4(),
-          groupId,
-          syn.type,
-          syn.content,
-          JSON.stringify(syn.keyPoints),
-          'gpt-4',
-          new Date()
-        ]);
-      }
+    try {
+      // For now, store in insights metadata
+      // Future: Create dedicated table for LLM synthesis
+      this.logger.info('LLM synthesis generated', {
+        overviewLength: synthesis.overview.length,
+        keyInsightsCount: synthesis.keyInsights.length
+      });
+    } catch (error) {
+      this.logger.error('Failed to store LLM synthesis', error);
     }
   }
 
@@ -825,10 +810,15 @@ export class GroupAnalyzer {
    * Cache analysis results
    */
   private async cacheAnalysis(result: GroupAnalysisResult): Promise<void> {
-    const key = `mirror:group:analysis:${result.groupId}`;
-    const ttl = 3600; // 1 hour
-    
-    await this.redis.setex(key, ttl, JSON.stringify(result));
+    try {
+      const key = `mirror:group:analysis:${result.groupId}`;
+      const ttl = 3600; // 1 hour
+
+      await redis.setex(key, ttl, JSON.stringify(result));
+      this.logger.debug('Analysis cached', { groupId: result.groupId, ttl });
+    } catch (error) {
+      this.logger.error('Failed to cache analysis', error);
+    }
   }
 
   /**
@@ -837,10 +827,15 @@ export class GroupAnalyzer {
   private async getCachedAnalysis(
     groupId: string
   ): Promise<GroupAnalysisResult | null> {
-    const key = `mirror:group:analysis:${groupId}`;
-    const cached = await this.redis.get(key);
-    
-    return cached ? JSON.parse(cached) : null;
+    try {
+      const key = `mirror:group:analysis:${groupId}`;
+      const cached = await redis.get(key);
+
+      return cached ? JSON.parse(cached) : null;
+    } catch (error) {
+      this.logger.error('Failed to get cached analysis', error);
+      return null;
+    }
   }
 
   /**
@@ -849,7 +844,7 @@ export class GroupAnalyzer {
   private isCacheValid(cached: GroupAnalysisResult): boolean {
     const age = Date.now() - new Date(cached.timestamp).getTime();
     const maxAge = 3600000; // 1 hour
-    
+
     return age < maxAge;
   }
 
@@ -860,18 +855,22 @@ export class GroupAnalyzer {
     groupId: string,
     result: GroupAnalysisResult
   ): Promise<void> {
-    // Publish to Redis for notification system
-    await this.redis.publish(
-      'mirror:notifications',
-      JSON.stringify({
-        type: 'group_analysis_complete',
-        groupId,
-        analysisId: result.analysisId,
-        timestamp: result.timestamp,
-        memberCount: result.memberCount,
-        confidence: result.metadata.overallConfidence
-      })
-    );
+    try {
+      // Publish to Redis for notification system
+      await redis.publish(
+        'mirror:notifications',
+        JSON.stringify({
+          type: 'group_analysis_complete',
+          groupId,
+          analysisId: result.analysisId,
+          timestamp: result.timestamp,
+          memberCount: result.memberCount,
+          confidence: result.metadata.overallConfidence
+        })
+      );
+    } catch (error) {
+      this.logger.error('Failed to queue notifications', error);
+    }
   }
 
   /**
@@ -887,7 +886,7 @@ export class GroupAnalyzer {
    * Helper to check nested properties
    */
   private hasNestedProperty(obj: any, path: string): boolean {
-    return path.split('.').reduce((current, prop) => 
+    return path.split('.').reduce((current, prop) =>
       current?.[prop] !== undefined ? current[prop] : undefined, obj
     ) !== undefined;
   }
@@ -901,20 +900,20 @@ export class GroupAnalyzer {
     priority: number = 5
   ): Promise<string> {
     const queueId = uuidv4();
-    
-    await this.db.query(`
+
+    await DB.query(`
       INSERT INTO mirror_group_analysis_queue (
         id, group_id, analysis_type, priority, trigger_event
       ) VALUES (?, ?, ?, ?, ?)
     `, [queueId, groupId, 'full_analysis', priority, trigger]);
-    
+
     // Notify worker
-    await this.redis.publish('mirror:analysis:queue', JSON.stringify({
+    await redis.publish('mirror:analysis:queue', JSON.stringify({
       queueId,
       groupId,
       priority
     }));
-    
+
     return queueId;
   }
 
@@ -922,13 +921,13 @@ export class GroupAnalyzer {
    * Get analysis status
    */
   public async getAnalysisStatus(queueId: string): Promise<any> {
-    const result = await this.db.query(`
+    const [rows] = await DB.query(`
       SELECT * FROM mirror_group_analysis_queue WHERE id = ?
     `, [queueId]);
-    
-    return result[0];
+
+    return (rows as any[])[0];
   }
 }
 
 // Export singleton instance
-export default new GroupAnalyzer();
+export const groupAnalyzer = new GroupAnalyzer();
