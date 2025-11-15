@@ -22,9 +22,7 @@ import { publicAssessmentAggregator } from '../managers/PublicAssessmentAggregat
 import { dinaLLMConnector } from '../integrations/DINALLMConnector';
 import { groupEncryptionManager } from '../systems/GroupEncryptionManager';
 import { DB } from '../db';
-<<<<<<< HEAD
-import { redis } from '../config/redis';
-=======
+import { mirrorRedis } from '../config/redis';
 import { mirrorRedis } from '../config/redis';
 >>>>>>> ffc3cee932b33b6878a446e70a2d5f231eeab21f
 import { Logger } from '../utils/logger';
