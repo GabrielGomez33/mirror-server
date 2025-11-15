@@ -1,10 +1,3 @@
--- ============================================================================
--- Migration: Add Retry Fields to mirror_group_analysis_queue
--- ============================================================================
--- Adds fields needed for Phase 3 worker retry logic and metadata tracking
--- Safe to run multiple times (uses IF NOT EXISTS where possible)
--- ============================================================================
-
 USE mirror;
 
 -- Add retry_count column
