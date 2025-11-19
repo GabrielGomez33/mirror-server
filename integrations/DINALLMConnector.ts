@@ -1,11 +1,10 @@
-\// ============================================================================
-// DINA LLM CONNECTOR - STUB IMPLEMENTATION (DUMP Protocol Ready)
+// ============================================================================
+// DINA LLM CONNECTOR - Production Implementation
 // ============================================================================
 // File: integrations/DINALLMConnector.ts
 // ----------------------------------------------------------------------------
-// Stub implementation for Phase 3 initial deployment
-// Ready for DINA Universal Messaging Protocol (DUMP) integration
-// Returns synthesized insights (currently mock, will connect to DINA server)
+// Production-ready DINA integration with robust error handling, security,
+// retry logic, and intelligent fallback to stub synthesis
 // ============================================================================
 
 import { Logger } from '../utils/logger';
@@ -73,16 +72,93 @@ export class DINALLMConnector {
   private isConnected: boolean = false;
   private useStubData: boolean;
 
+  // Circuit breaker state
+  private failureCount: number = 0;
+  private lastFailureTime: number = 0;
+  private circuitBreakerThreshold: number = 5;
+  private circuitBreakerResetTime: number = 60000; // 60 seconds
+
   constructor() {
     this.logger = new Logger('DINALLMConnector');
     this.dinaEndpoint = process.env.DINA_ENDPOINT || 'http://localhost:7777';
     this.useStubData = process.env.USE_DINA_STUB === 'true' || !process.env.DINA_ENDPOINT;
 
+    // Validate and sanitize endpoint
+    this.validateEndpoint();
+
     if (this.useStubData) {
       this.logger.warn('DINA connector running in STUB mode - using mock synthesis');
     } else {
-      this.logger.info('DINA connector initialized', { endpoint: this.dinaEndpoint });
+      this.logger.info('DINA connector initialized', {
+        endpoint: this.dinaEndpoint,
+        endpointSanitized: this.sanitizeEndpointForLogging(this.dinaEndpoint)
+      });
     }
+  }
+
+  /**
+   * Validate endpoint URL for security
+   */
+  private validateEndpoint(): void {
+    try {
+      const url = new URL(this.dinaEndpoint);
+
+      // Security: Only allow http and https protocols
+      if (!['http:', 'https:'].includes(url.protocol)) {
+        throw new Error(`Invalid protocol: ${url.protocol}. Only http and https are allowed.`);
+      }
+
+      // Security: Warn if using localhost in production
+      if (process.env.NODE_ENV === 'production' &&
+          (url.hostname === 'localhost' || url.hostname === '127.0.0.1')) {
+        this.logger.warn('Using localhost endpoint in production environment', {
+          hostname: url.hostname
+        });
+      }
+
+      // Security: Validate hostname is not empty
+      if (!url.hostname) {
+        throw new Error('Endpoint hostname cannot be empty');
+      }
+
+    } catch (error: any) {
+      this.logger.error('Invalid DINA_ENDPOINT URL', {
+        endpoint: this.sanitizeEndpointForLogging(this.dinaEndpoint),
+        error: error.message
+      });
+      throw new Error(`Invalid DINA_ENDPOINT configuration: ${error.message}`);
+    }
+  }
+
+  /**
+   * Sanitize endpoint for logging (remove sensitive info)
+   */
+  private sanitizeEndpointForLogging(endpoint: string): string {
+    try {
+      const url = new URL(endpoint);
+      // Remove any auth credentials from URL before logging
+      return `${url.protocol}//${url.host}${url.pathname}`;
+    } catch {
+      return '[invalid-url]';
+    }
+  }
+
+  /**
+   * Initialize (stub for compatibility with server startup)
+   */
+  async initialize(): Promise<void> {
+    this.logger.info('DINA connector initialized');
+    return Promise.resolve();
+  }
+
+  /**
+   * Shutdown (stub for compatibility with server shutdown)
+   */
+  async shutdown(): Promise<void> {
+    this.logger.info('DINA connector shutdown', {
+      totalFailures: this.failureCount
+    });
+    return Promise.resolve();
   }
 
   /**
@@ -92,74 +168,504 @@ export class DINALLMConnector {
   async synthesizeInsights(
     analysisResult: GroupAnalysisResult
   ): Promise<LLMSynthesis> {
+    // Input validation
+    this.validateAnalysisInput(analysisResult);
+
     this.logger.info('Synthesizing insights', {
       groupId: analysisResult.groupId,
       analysisId: analysisResult.analysisId,
-      mode: this.useStubData ? 'stub' : 'live'
+      mode: this.useStubData ? 'stub' : 'live',
+      memberCount: analysisResult.memberCount
     });
+
+    // Check circuit breaker
+    if (this.isCircuitOpen()) {
+      this.logger.warn('Circuit breaker OPEN - using fallback synthesis', {
+        failureCount: this.failureCount,
+        timeSinceLastFailure: Date.now() - this.lastFailureTime
+      });
+      return await this.generateStubSynthesis(analysisResult);
+    }
 
     try {
       if (this.useStubData) {
         return await this.generateStubSynthesis(analysisResult);
       } else {
-        return await this.synthesizeWithDINA(analysisResult);
+        const synthesis = await this.synthesizeWithDINA(analysisResult);
+        this.onSuccess();
+        return synthesis;
       }
-    } catch (error) {
-      this.logger.error('Synthesis failed, falling back to stub', error);
+    } catch (error: any) {
+      this.onFailure(error);
+
+      this.logger.error('DINA synthesis failed', {
+        error: error.message,
+        errorType: error.name,
+        groupId: analysisResult.groupId
+      });
+
+      this.logger.warn('CircuitBreaker:DINA - Executing fallback due to failure', {
+        error: error.message,
+        failureCount: this.failureCount
+      });
+
+      this.logger.debug('Generating stub synthesis', {
+        groupId: analysisResult.groupId,
+        mode: 'fallback'
+      });
+
       return await this.generateStubSynthesis(analysisResult);
     }
   }
 
   /**
-   * Synthesize insights by calling DINA server (DUMP protocol)
-   * TODO: Implement when DINA server is ready
+   * Validate analysis input
+   */
+  private validateAnalysisInput(result: GroupAnalysisResult): void {
+    if (!result) {
+      throw new Error('Analysis result is required');
+    }
+    if (!result.groupId || typeof result.groupId !== 'string') {
+      throw new Error('Valid groupId is required');
+    }
+    if (!result.analysisId || typeof result.analysisId !== 'string') {
+      throw new Error('Valid analysisId is required');
+    }
+    if (!result.memberCount || result.memberCount < 1) {
+      throw new Error('Valid memberCount is required (must be >= 1)');
+    }
+    if (result.dataCompleteness < 0 || result.dataCompleteness > 1) {
+      throw new Error('dataCompleteness must be between 0 and 1');
+    }
+  }
+
+  /**
+   * Circuit breaker: check if circuit is open
+   */
+  private isCircuitOpen(): boolean {
+    if (this.failureCount < this.circuitBreakerThreshold) {
+      return false;
+    }
+
+    const timeSinceFailure = Date.now() - this.lastFailureTime;
+    if (timeSinceFailure >= this.circuitBreakerResetTime) {
+      this.logger.info('Circuit breaker reset time elapsed - attempting recovery');
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Circuit breaker: handle successful request
+   */
+  private onSuccess(): void {
+    if (this.failureCount > 0) {
+      this.logger.info('DINA service recovered', {
+        previousFailures: this.failureCount
+      });
+      this.failureCount = 0;
+    }
+  }
+
+  /**
+   * Circuit breaker: handle failed request
+   */
+  private onFailure(error: any): void {
+    this.failureCount++;
+    this.lastFailureTime = Date.now();
+
+    if (this.failureCount >= this.circuitBreakerThreshold) {
+      this.logger.error('Circuit breaker threshold reached - circuit OPEN', {
+        failureCount: this.failureCount,
+        threshold: this.circuitBreakerThreshold,
+        error: error.message
+      });
+    }
+  }
+
+  /**
+   * Synthesize insights by calling DINA server
+   * Uses DINA's native API format (query + options)
    */
   private async synthesizeWithDINA(
     analysisResult: GroupAnalysisResult
   ): Promise<LLMSynthesis> {
-    this.logger.debug('Connecting to DINA server', { endpoint: this.dinaEndpoint });
+    this.logger.info('Requesting synthesis from DINA', {
+      groupId: analysisResult.groupId,
+      analysisId: analysisResult.analysisId,
+      protocol: 'DINA-API'
+    });
 
-    // Prepare DUMP message
-    const dumpMessage: DUMPMessage = {
-      version: '1.0',
-      type: 'request',
-      id: `synthesis_${analysisResult.analysisId}`,
-      timestamp: new Date().toISOString(),
-      payload: {
-        action: 'synthesize_group_insights',
-        groupId: analysisResult.groupId,
-        analysis: {
-          memberCount: analysisResult.memberCount,
-          dataCompleteness: analysisResult.dataCompleteness,
-          compatibility: this.summarizeCompatibility(analysisResult),
-          strengths: this.summarizeStrengths(analysisResult),
-          risks: this.summarizeRisks(analysisResult),
-          confidence: analysisResult.metadata.overallConfidence
+    const maxRetries = 3;
+    const retryDelays = [1000, 2000, 4000]; // Exponential backoff: 1s, 2s, 4s
+    let lastError: any = null;
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        // Prepare analysis summary for LLM
+        const analysisContext = this.buildAnalysisContext(analysisResult);
+
+        // Build combined prompt (DINA uses single query field)
+        const systemPrompt = 'You are an expert group dynamics analyst. Provide clear, actionable insights about group compatibility, strengths, challenges, and opportunities. Format all responses as valid JSON.';
+
+        const userPrompt = `Analyze this ${analysisResult.memberCount}-member group and provide insights.
+
+${analysisContext}
+
+Respond with JSON in this exact format:
+{
+  "overview": "2-3 sentence summary",
+  "keyInsights": ["insight 1", "insight 2", "insight 3"],
+  "recommendations": ["recommendation 1", "recommendation 2"],
+  "narratives": {
+    "compatibility": "brief narrative",
+    "strengths": "brief narrative",
+    "challenges": "brief narrative",
+    "opportunities": "brief narrative"
+  }
+}`;
+
+        // DINA API format (from actual server logs)
+        const chatRequest = {
+          query: `${systemPrompt}\n\n${userPrompt}`,
+          options: {
+            max_tokens: 1500,
+            temperature: 0.7
+          }
+        };
+
+        // Construct endpoint with smart path handling
+        const endpoint = this.buildEndpointURL();
+
+        this.logger.debug('DINA request', {
+          attempt: attempt + 1,
+          maxRetries,
+          baseUrl: this.sanitizeEndpointForLogging(this.dinaEndpoint),
+          endpoint: this.sanitizeEndpointForLogging(endpoint),
+          queryLength: chatRequest.query.length
+        });
+
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': 'MirrorGroups/3.0',
+            'X-Group-ID': analysisResult.groupId,
+            'X-Analysis-ID': analysisResult.analysisId,
+            'X-Request-Attempt': String(attempt + 1)
+          },
+          body: JSON.stringify(chatRequest),
+          signal: AbortSignal.timeout(120000) // 120 second timeout
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text().catch(() => 'Unknown error');
+
+          this.logger.error('DINA API error response', {
+            status: response.status,
+            statusText: response.statusText,
+            errorPreview: errorText.substring(0, 500),
+            endpoint: this.sanitizeEndpointForLogging(endpoint),
+            attempt: attempt + 1
+          });
+
+          throw new Error(`DINA server error: ${response.status} ${response.statusText}`);
         }
-      },
-      metadata: {
-        sender: 'mirror_groups',
-        recipient: 'dina_llm',
-        priority: 5
+
+        const result = await response.json();
+
+        this.logger.debug('DINA response received', {
+          hasResponse: !!result.response,
+          hasContent: !!result.content,
+          hasChoices: !!result.choices,
+          resultKeys: Object.keys(result).join(', ')
+        });
+
+        // Extract content from DINA response format (response field is primary)
+        let content = result.response                         // DINA format (primary)
+          || result.choices?.[0]?.message?.content            // OpenAI format (fallback)
+          || result.content                                   // Direct content (fallback)
+          || result.message?.content;                         // Another variant (fallback)
+
+        if (!content) {
+          this.logger.warn('No standard content field found, using full result', {
+            resultStructure: JSON.stringify(result).substring(0, 200)
+          });
+          throw new Error('No content field found in DINA response');
+        }
+
+        // Parse JSON response
+        const synthesis = this.parseDINAResponse(content);
+
+        this.logger.info('DINA synthesis successful', {
+          overviewLength: synthesis.overview?.length || 0,
+          insightsCount: synthesis.keyInsights?.length || 0,
+          recommendationsCount: synthesis.recommendations?.length || 0,
+          attempt: attempt + 1
+        });
+
+        return synthesis;
+
+      } catch (error: any) {
+        lastError = error;
+
+        const isLastAttempt = attempt === maxRetries - 1;
+        const isRetryable = this.isRetryableError(error);
+
+        if (!isLastAttempt && isRetryable) {
+          const delay = retryDelays[attempt];
+
+          this.logger.warn(`Retry attempt ${attempt + 1}/${maxRetries} after ${delay}ms`, {
+            error: error.message,
+            errorType: error.name,
+            isRetryable
+          });
+
+          await this.sleep(delay);
+        } else {
+          if (!isRetryable) {
+            this.logger.error('Non-retryable error - aborting retries', {
+              error: error.message,
+              errorType: error.name
+            });
+          }
+          break;
+        }
       }
-    };
+    }
 
-    // TODO: Send to DINA server via HTTP/WebSocket
-    // const response = await fetch(this.dinaEndpoint, {
-    //   method: 'POST',
-    //   headers: {
-    //     'Content-Type': 'application/json',
-    //     'X-DUMP-Version': '1.0'
-    //   },
-    //   body: JSON.stringify(dumpMessage)
-    // });
-    //
-    // const dumpResponse: DUMPMessage = await response.json();
-    // return this.parseDINAResponse(dumpResponse);
+    // All retries failed
+    this.logger.error(`All ${maxRetries} retry attempts failed`, {
+      lastError: lastError?.message
+    });
 
-    // For now, fallback to stub
-    this.logger.warn('DINA server not implemented yet, using stub');
-    return await this.generateStubSynthesis(analysisResult);
+    throw lastError;
+  }
+
+  /**
+   * Build complete endpoint URL with robust path handling
+   * Handles various endpoint formats without duplicating paths
+   */
+  private buildEndpointURL(): string {
+    const baseUrl = this.dinaEndpoint.replace(/\/$/, ''); // Remove trailing slash
+
+    let endpoint: string;
+
+    // Parse URL to safely extract components
+    try {
+      const url = new URL(baseUrl);
+      const pathname = url.pathname;
+
+      // Case 1: Already a complete chat endpoint
+      // e.g., https://example.com/dina/api/v1/models/mistral:7b/chat
+      if (pathname.endsWith('/chat')) {
+        endpoint = baseUrl;
+        this.logger.debug('Endpoint already complete (ends with /chat)', {
+          endpoint: this.sanitizeEndpointForLogging(endpoint)
+        });
+      }
+      // Case 2: Contains model specification without /chat
+      // e.g., https://example.com/dina/api/v1/models/mistral:7b
+      else if (pathname.match(/\/models\/[^\/]+$/)) {
+        endpoint = `${baseUrl}/chat`;
+        this.logger.debug('Appending /chat to model endpoint', {
+          endpoint: this.sanitizeEndpointForLogging(endpoint)
+        });
+      }
+      // Case 3: Ends with /api/v1 (user's case)
+      // e.g., https://www.theundergroundrailroad.world/dina/api/v1
+      else if (pathname.endsWith('/api/v1')) {
+        endpoint = `${baseUrl}/models/mistral:7b/chat`;
+        this.logger.debug('Appending model path to API base', {
+          endpoint: this.sanitizeEndpointForLogging(endpoint)
+        });
+      }
+      // Case 4: Ends with /dina or contains /dina/ but not full path
+      // e.g., https://example.com/dina
+      else if (pathname.endsWith('/dina') || pathname.includes('/dina')) {
+        endpoint = `${baseUrl}/api/v1/models/mistral:7b/chat`;
+        this.logger.debug('Appending API path to DINA base', {
+          endpoint: this.sanitizeEndpointForLogging(endpoint)
+        });
+      }
+      // Case 5: Base domain only
+      // e.g., https://example.com
+      else if (pathname === '' || pathname === '/') {
+        endpoint = `${baseUrl}/dina/api/v1/models/mistral:7b/chat`;
+        this.logger.debug('Appending full path to base domain', {
+          endpoint: this.sanitizeEndpointForLogging(endpoint)
+        });
+      }
+      // Case 6: Unknown format - append full path but log warning
+      else {
+        endpoint = `${baseUrl}/dina/api/v1/models/mistral:7b/chat`;
+        this.logger.warn('Unknown endpoint format - using default path construction', {
+          originalPath: pathname,
+          endpoint: this.sanitizeEndpointForLogging(endpoint)
+        });
+      }
+
+      // Validate final endpoint
+      new URL(endpoint);
+
+      return endpoint;
+
+    } catch (error: any) {
+      this.logger.error('Failed to construct valid endpoint URL', {
+        baseUrl: this.sanitizeEndpointForLogging(baseUrl),
+        error: error.message
+      });
+      throw new Error(`Invalid endpoint URL construction: ${error.message}`);
+    }
+  }
+
+  /**
+   * Parse DINA response content into LLMSynthesis
+   */
+  private parseDINAResponse(content: any): LLMSynthesis {
+    let synthesis: LLMSynthesis;
+
+    try {
+      if (typeof content === 'string') {
+        // Try to extract JSON from markdown code blocks if present
+        const jsonMatch = content.match(/```json\s*([\s\S]*?)\s*```/) || content.match(/```\s*([\s\S]*?)\s*```/);
+        const jsonString = jsonMatch ? jsonMatch[1] : content;
+
+        synthesis = JSON.parse(jsonString);
+      } else {
+        synthesis = content;
+      }
+
+      // Validate required fields
+      if (!synthesis.overview || !synthesis.keyInsights || !synthesis.recommendations || !synthesis.narratives) {
+        this.logger.warn('Synthesis missing required fields', {
+          hasOverview: !!synthesis.overview,
+          hasInsights: !!synthesis.keyInsights,
+          hasRecommendations: !!synthesis.recommendations,
+          hasNarratives: !!synthesis.narratives
+        });
+        throw new Error('Missing required fields in synthesis');
+      }
+
+      return synthesis;
+
+    } catch (parseError: any) {
+      this.logger.warn('Failed to parse DINA response as JSON, creating fallback', {
+        error: parseError.message,
+        contentType: typeof content,
+        contentPreview: typeof content === 'string' ? content.substring(0, 200) : 'not a string'
+      });
+
+      // Fallback: extract text and structure it
+      const textContent = typeof content === 'string' ? content : JSON.stringify(content);
+      return {
+        overview: textContent.substring(0, 500),
+        keyInsights: ['LLM synthesis provided - see full response'],
+        recommendations: ['Review detailed analysis'],
+        narratives: {
+          compatibility: textContent.substring(0, 200) || 'Analysis available in overview',
+          strengths: '',
+          challenges: '',
+          opportunities: ''
+        }
+      };
+    }
+  }
+
+  /**
+   * Determine if error is retryable
+   */
+  private isRetryableError(error: any): boolean {
+    const message = error.message?.toLowerCase() || '';
+
+    // Network errors are retryable
+    if (error.name === 'TypeError' && message.includes('fetch')) {
+      return true;
+    }
+
+    // Timeout errors are retryable
+    if (message.includes('timeout') || message.includes('aborted')) {
+      return true;
+    }
+
+    // 5xx server errors are retryable
+    if (message.match(/5[0-9][0-9]/)) {
+      return true;
+    }
+
+    // 429 rate limit is retryable
+    if (message.includes('429') || message.includes('rate limit')) {
+      return true;
+    }
+
+    // 503 service unavailable is retryable
+    if (message.includes('503') || message.includes('unavailable')) {
+      return true;
+    }
+
+    // 4xx client errors (except 429) are generally not retryable
+    if (message.match(/4[0-9][0-9]/)) {
+      return false;
+    }
+
+    // Connection errors are retryable
+    if (message.includes('econnrefused') || message.includes('enotfound') ||
+        message.includes('econnreset') || message.includes('etimedout')) {
+      return true;
+    }
+
+    // Unknown errors - retry by default for resilience
+    return true;
+  }
+
+  /**
+   * Build analysis context string for LLM
+   */
+  private buildAnalysisContext(result: GroupAnalysisResult): string {
+    const parts: string[] = [];
+
+    parts.push(`Group Size: ${result.memberCount} members`);
+    parts.push(`Data Completeness: ${Math.round(result.dataCompleteness * 100)}%`);
+
+    // Compatibility
+    if (result.insights.compatibilityMatrix) {
+      const avg = result.insights.compatibilityMatrix.averageCompatibility;
+      const level = avg >= 0.7 ? 'strong' : avg >= 0.5 ? 'moderate' : 'developing';
+      parts.push(`Compatibility: ${Math.round(avg * 100)}% average (${level})`);
+    }
+
+    // Strengths
+    if (result.insights.collectiveStrengths && result.insights.collectiveStrengths.length > 0) {
+      const strengthNames = result.insights.collectiveStrengths
+        .slice(0, 3)
+        .map((s: any) => s.name)
+        .join(', ');
+      parts.push(`Collective Strengths: ${strengthNames}`);
+    }
+
+    // Risks
+    if (result.insights.conflictRisks && result.insights.conflictRisks.length > 0) {
+      const riskSummary = result.insights.conflictRisks
+        .slice(0, 3)
+        .map((r: any) => `${r.type.replace(/_/g, ' ')} (${r.severity})`)
+        .join(', ');
+      parts.push(`Conflict Risks: ${riskSummary}`);
+    }
+
+    // Goal alignment
+    if (result.insights.goalAlignment) {
+      parts.push(`Goal Alignment: ${Math.round((result.insights.goalAlignment.overallAlignment || 0) * 100)}%`);
+    }
+
+    return parts.join('\n');
+  }
+
+  /**
+   * Sleep helper for retries
+   */
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   /**
@@ -170,6 +676,12 @@ export class DINALLMConnector {
     analysisResult: GroupAnalysisResult
   ): Promise<LLMSynthesis> {
     const { memberCount, dataCompleteness, insights } = analysisResult;
+
+    this.logger.debug('Generating intelligent stub synthesis', {
+      groupId: analysisResult.groupId,
+      memberCount,
+      dataCompleteness: Math.round(dataCompleteness * 100)
+    });
 
     // Generate context-aware overview
     const overview = this.generateOverview(analysisResult);
@@ -457,10 +969,19 @@ export class DINALLMConnector {
   /**
    * Health check
    */
-  async healthCheck(): Promise<{ healthy: boolean; mode: string }> {
+  async healthCheck(): Promise<{
+    healthy: boolean;
+    mode: string;
+    failureCount: number;
+    circuitOpen: boolean;
+  }> {
+    const circuitOpen = this.isCircuitOpen();
+
     return {
-      healthy: true,
-      mode: this.useStubData ? 'stub' : 'live'
+      healthy: !circuitOpen,
+      mode: this.useStubData ? 'stub' : 'live',
+      failureCount: this.failureCount,
+      circuitOpen
     };
   }
 }
