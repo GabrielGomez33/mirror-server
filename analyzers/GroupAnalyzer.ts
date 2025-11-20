@@ -390,7 +390,25 @@ export class GroupAnalyzer {
         }
       }
 
-      return Array.from(memberDataMap.values());
+      const memberDataArray = Array.from(memberDataMap.values());
+
+      // Log data completeness for debugging
+      this.logger.info('Member data loaded', {
+        memberCount: memberDataArray.length,
+        dataCompleteness: memberDataArray.map(m => ({
+          userId: m.userId.substring(0, 8),
+          dataTypes: m.dataTypes,
+          hasPersonality: !!m.personality,
+          hasEmbedding: !!m.personality?.embedding,
+          hasCommunicationStyle: !!m.personality?.communicationStyle,
+          hasConflictStyle: !!m.personality?.conflictResolutionStyle,
+          hasCognitive: !!m.cognitive,
+          hasBehavioral: !!m.behavioral,
+          hasSocialEnergy: m.behavioral?.socialEnergy !== undefined
+        }))
+      });
+
+      return memberDataArray;
 
     } catch (error) {
       this.logger.error('Failed to fetch member data', error);

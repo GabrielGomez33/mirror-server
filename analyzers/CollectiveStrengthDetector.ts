@@ -128,10 +128,27 @@ export class CollectiveStrengthDetector {
     );
     
     const processingTime = Date.now() - startTime;
+
+    // Log data availability for debugging
+    const dataAvailability = {
+      behavioral: memberData.filter(m => m.behavioral?.tendencies?.length > 0).length,
+      cognitive: memberData.filter(m => m.cognitive?.learningStyle || m.cognitive?.problemSolvingApproach).length,
+      values: memberData.filter(m => m.personality?.values?.length > 0).length
+    };
+
     this.logger.info('Strength detection completed', {
       members: memberData.length,
       patternsFound: enrichedPatterns.length,
-      processingTime
+      processingTime,
+      dataAvailability,
+      patternTypes: {
+        behavioral: behavioralPatterns.length,
+        cognitive: cognitivePatterns.length,
+        values: valuePatterns.length,
+        emergent: emergentPatterns.length
+      },
+      noPatterns: enrichedPatterns.length === 0 ?
+        `No patterns detected - check if members have behavioral tendencies, cognitive data, or values` : null
     });
     
     return enrichedPatterns;
