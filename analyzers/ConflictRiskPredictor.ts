@@ -90,6 +90,22 @@ export class ConflictRiskPredictor {
   }
 
   /**
+   * Initialize predictor (for server startup)
+   */
+  public async initialize(): Promise<void> {
+    this.logger.info('ConflictRiskPredictor initialized');
+    return Promise.resolve();
+  }
+
+  /**
+   * Shutdown predictor (for server shutdown)
+   */
+  public async shutdown(): Promise<void> {
+    this.logger.info('ConflictRiskPredictor shutdown');
+    return Promise.resolve();
+  }
+
+  /**
    * Predict conflict risks for the group
    */
   public async predictRisks(memberData: MemberData[]): Promise<ConflictRisk[]> {

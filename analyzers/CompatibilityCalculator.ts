@@ -94,6 +94,22 @@ export class CompatibilityCalculator {
   }
 
   /**
+   * Initialize calculator (for server startup)
+   */
+  public async initialize(): Promise<void> {
+    this.logger.info('CompatibilityCalculator initialized');
+    return Promise.resolve();
+  }
+
+  /**
+   * Shutdown calculator (for server shutdown)
+   */
+  public async shutdown(): Promise<void> {
+    this.logger.info('CompatibilityCalculator shutdown');
+    return Promise.resolve();
+  }
+
+  /**
    * Calculate full compatibility matrix for all group members
    */
   public async calculateMatrix(memberData: MemberData[]): Promise<CompatibilityMatrix> {

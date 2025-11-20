@@ -88,6 +88,22 @@ export class CollectiveStrengthDetector {
   }
 
   /**
+   * Initialize detector (for server startup)
+   */
+  public async initialize(): Promise<void> {
+    this.logger.info('CollectiveStrengthDetector initialized');
+    return Promise.resolve();
+  }
+
+  /**
+   * Shutdown detector (for server shutdown)
+   */
+  public async shutdown(): Promise<void> {
+    this.logger.info('CollectiveStrengthDetector shutdown');
+    return Promise.resolve();
+  }
+
+  /**
    * Detect collective strengths in the group
    */
   public async detectStrengths(memberData: MemberData[]): Promise<CollectiveStrength[]> {
