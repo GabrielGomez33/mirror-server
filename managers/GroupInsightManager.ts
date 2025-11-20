@@ -12,7 +12,7 @@
 
 import { v4 as uuidv4 } from 'uuid';
 import { Database } from '../config/database';
-import { RedisManager } from '../config/redis';
+import { mirrorRedis } from '../config/redis';
 import { Logger } from '../utils/logger';
 import { GroupEncryptionManager } from './GroupEncryptionManager';
 import {
@@ -47,7 +47,6 @@ export interface InsightUpdate {
 
 export class GroupInsightManager {
   private db: Database;
-  private redis: RedisManager;
   private logger: Logger;
   private encryptionManager: GroupEncryptionManager;
   private readonly CACHE_TTL = 3600; // 1 hour
@@ -56,7 +55,6 @@ export class GroupInsightManager {
   constructor() {
     this.logger = new Logger('GroupInsightManager');
     this.db = Database.getInstance();
-    this.redis = RedisManager.getInstance();
     this.encryptionManager = new GroupEncryptionManager();
   }
 
@@ -165,7 +163,7 @@ export class GroupInsightManager {
     try {
       // Check cache first
       const cacheKey = this.getCacheKey(groupId, options);
-      const cached = await this.redis.get(cacheKey);
+      const cached = await mirrorRedis.get(cacheKey);
       if (cached) {
         return JSON.parse(cached);
       }
@@ -208,7 +206,7 @@ export class GroupInsightManager {
       }));
 
       // Cache results
-      await this.redis.setex(cacheKey, this.CACHE_TTL, JSON.stringify(insights));
+      await mirrorRedis.set(cacheKey, insights, this.CACHE_TTL);
 
       return insights;
 
@@ -619,7 +617,7 @@ export class GroupInsightManager {
     data: any
   ): Promise<void> {
     const key = `mirror:group:${groupId}:insight:${insightType}`;
-    await this.redis.setex(key, this.CACHE_TTL, JSON.stringify(data));
+    await mirrorRedis.set(key, data, this.CACHE_TTL);
   }
 
   /**
@@ -630,8 +628,8 @@ export class GroupInsightManager {
     insightType: string
   ): Promise<any | null> {
     const key = `mirror:group:${groupId}:insight:${insightType}`;
-    const cached = await this.redis.get(key);
-    return cached ? JSON.parse(cached) : null;
+    const cached = await mirrorRedis.get(key);
+    return cached;
   }
 
   /**
@@ -662,10 +660,11 @@ export class GroupInsightManager {
    */
   private async clearGroupCache(groupId: string): Promise<void> {
     const pattern = `mirror:group:${groupId}:*`;
-    const keys = await this.redis.keys(pattern);
-    
+    const client = (mirrorRedis as any).client;
+    const keys = await client.keys(pattern);
+
     if (keys.length > 0) {
-      await this.redis.del(...keys);
+      await client.del(...keys);
     }
   }
 

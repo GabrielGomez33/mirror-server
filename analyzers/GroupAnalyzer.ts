@@ -23,8 +23,6 @@ import { dinaLLMConnector } from '../integrations/DINALLMConnector';
 import { groupEncryptionManager } from '../systems/GroupEncryptionManager';
 import { DB } from '../db';
 import { mirrorRedis } from '../config/redis';
-import { mirrorRedis } from '../config/redis';
->>>>>>> ffc3cee932b33b6878a446e70a2d5f231eeab21f
 import { Logger } from '../utils/logger';
 
 /**
@@ -189,6 +187,22 @@ export class GroupAnalyzer {
     this.conflictPredictor = new ConflictRiskPredictor();
 
     this.logger.info('GroupAnalyzer initialized');
+  }
+
+  /**
+   * Initialize (stub for compatibility with server startup)
+   */
+  async initialize(): Promise<void> {
+    this.logger.info('GroupAnalyzer ready for analysis');
+    return Promise.resolve();
+  }
+
+  /**
+   * Shutdown (stub for compatibility with server shutdown)
+   */
+  async shutdown(): Promise<void> {
+    this.logger.info('GroupAnalyzer shutdown');
+    return Promise.resolve();
   }
 
   /**
@@ -673,6 +687,11 @@ export class GroupAnalyzer {
 
       // Insert new scores
       for (const [key, detail] of matrix.pairwiseDetails.entries()) {
+        // Ensure consistent ordering (member_a_id < member_b_id) to satisfy chk_member_order constraint
+        const [memberAId, memberBId] = detail.memberA < detail.memberB
+          ? [detail.memberA, detail.memberB]
+          : [detail.memberB, detail.memberA];
+
         await DB.query(`
           INSERT INTO mirror_group_compatibility (
             id, group_id, member_a_id, member_b_id, compatibility_score,
@@ -683,8 +702,8 @@ export class GroupAnalyzer {
         `, [
           uuidv4(),
           groupId,
-          detail.memberA,
-          detail.memberB,
+          memberAId,
+          memberBId,
           detail.score,
           detail.confidence,
           detail.factors.personality,
@@ -816,11 +835,7 @@ export class GroupAnalyzer {
       const key = `mirror:group:analysis:${result.groupId}`;
       const ttl = 3600; // 1 hour
 
-<<<<<<< HEAD
-      await redis.setex(key, ttl, JSON.stringify(result));
-=======
-      await mirrorRedis.setex(key, ttl, JSON.stringify(result));
->>>>>>> ffc3cee932b33b6878a446e70a2d5f231eeab21f
+      await mirrorRedis.set(key, result, ttl);
       this.logger.debug('Analysis cached', { groupId: result.groupId, ttl });
     } catch (error) {
       this.logger.error('Failed to cache analysis', error);
@@ -835,13 +850,9 @@ export class GroupAnalyzer {
   ): Promise<GroupAnalysisResult | null> {
     try {
       const key = `mirror:group:analysis:${groupId}`;
-<<<<<<< HEAD
-      const cached = await redis.get(key);
-=======
       const cached = await mirrorRedis.get(key);
->>>>>>> ffc3cee932b33b6878a446e70a2d5f231eeab21f
 
-      return cached ? JSON.parse(cached) : null;
+      return cached;
     } catch (error) {
       this.logger.error('Failed to get cached analysis', error);
       return null;
@@ -867,11 +878,8 @@ export class GroupAnalyzer {
   ): Promise<void> {
     try {
       // Publish to Redis for notification system
-<<<<<<< HEAD
-      await redis.publish(
-=======
-      await mirrorRedis.publish(
->>>>>>> ffc3cee932b33b6878a446e70a2d5f231eeab21f
+      const publisher = (mirrorRedis as any).publisher;
+      await publisher.publish(
         'mirror:notifications',
         JSON.stringify({
           type: 'group_analysis_complete',
@@ -922,11 +930,8 @@ export class GroupAnalyzer {
     `, [queueId, groupId, 'full_analysis', priority, trigger]);
 
     // Notify worker
-<<<<<<< HEAD
-    await redis.publish('mirror:analysis:queue', JSON.stringify({
-=======
-    await mirrorRedis.publish('mirror:analysis:queue', JSON.stringify({
->>>>>>> ffc3cee932b33b6878a446e70a2d5f231eeab21f
+    const publisher = (mirrorRedis as any).publisher;
+    await publisher.publish('mirror:analysis:queue', JSON.stringify({
       queueId,
       groupId,
       priority

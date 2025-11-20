@@ -482,20 +482,37 @@ export class CompatibilityCalculator {
   public calculateGroupCohesion(matrix: CompatibilityMatrix): number {
     const scores = Array.from(matrix.pairwiseDetails.values())
       .map(d => d.score);
-    
+
     if (scores.length === 0) return 0;
-    
+
     // Calculate standard deviation to measure variance
     const avg = matrix.averageCompatibility;
-    const variance = scores.reduce((sum, score) => 
+    const variance = scores.reduce((sum, score) =>
       sum + Math.pow(score - avg, 2), 0
     ) / scores.length;
     const stdDev = Math.sqrt(variance);
-    
+
     // High average + low variance = high cohesion
     // Scale standard deviation (0-0.5 range typically)
     const cohesion = avg * (1 - Math.min(stdDev * 2, 1));
-    
+
     return Math.max(0, Math.min(1, cohesion));
   }
+
+  /**
+   * Initialize calculator (no-op, for consistency with other components)
+   */
+  public async initialize(): Promise<void> {
+    this.logger.info('Compatibility Calculator initialized');
+  }
+
+  /**
+   * Shutdown calculator (no-op, for consistency with other components)
+   */
+  public async shutdown(): Promise<void> {
+    this.logger.info('Compatibility Calculator shutdown');
+  }
 }
+
+// Export singleton instance
+export const compatibilityCalculator = new CompatibilityCalculator();

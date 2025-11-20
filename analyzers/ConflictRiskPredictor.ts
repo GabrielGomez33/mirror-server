@@ -739,7 +739,7 @@ export class ConflictRiskPredictor {
     const high = risks.filter(r => r.severity === 'high');
     const medium = risks.filter(r => r.severity === 'medium');
     const low = risks.filter(r => r.severity === 'low');
-    
+
     let overallRiskLevel: string;
     if (critical.length > 0) {
       overallRiskLevel = 'Critical attention needed';
@@ -750,9 +750,9 @@ export class ConflictRiskPredictor {
     } else {
       overallRiskLevel = 'Low risk - healthy dynamics';
     }
-    
+
     const recommendations: string[] = [];
-    
+
     if (critical.length > 0) {
       recommendations.push('Address critical risks immediately with group discussion');
     }
@@ -765,7 +765,7 @@ export class ConflictRiskPredictor {
     if (risks.some(r => r.type === 'value_misalignment')) {
       recommendations.push('Facilitate values alignment workshop');
     }
-    
+
     return {
       criticalCount: critical.length,
       highCount: high.length,
@@ -776,4 +776,21 @@ export class ConflictRiskPredictor {
       recommendations
     };
   }
+
+  /**
+   * Initialize predictor (no-op, for consistency with other components)
+   */
+  public async initialize(): Promise<void> {
+    this.logger.info('Conflict Risk Predictor initialized');
+  }
+
+  /**
+   * Shutdown predictor (no-op, for consistency with other components)
+   */
+  public async shutdown(): Promise<void> {
+    this.logger.info('Conflict Risk Predictor shutdown');
+  }
 }
+
+// Export singleton instance
+export const conflictRiskPredictor = new ConflictRiskPredictor();

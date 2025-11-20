@@ -637,4 +637,21 @@ export class CollectiveStrengthDetector {
       false
     );
   }
+
+  /**
+   * Initialize detector (no-op, for consistency with other components)
+   */
+  public async initialize(): Promise<void> {
+    this.logger.info('Collective Strength Detector initialized');
+  }
+
+  /**
+   * Shutdown detector (no-op, for consistency with other components)
+   */
+  public async shutdown(): Promise<void> {
+    this.logger.info('Collective Strength Detector shutdown');
+  }
 }
+
+// Export singleton instance
+export const collectiveStrengthDetector = new CollectiveStrengthDetector();

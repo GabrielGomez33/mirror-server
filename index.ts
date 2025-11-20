@@ -1,5 +1,5 @@
-// index.ts - Mirror Server with MirrorGroups Phase 1 Integration
-// Includes: Existing routes, Redis, Notifications, Encryption, Group APIs, WebSocket signaling
+// index.ts - Mirror Server with MirrorGroups Phase 3.5 Integration
+// Includes: Existing routes, Redis, Notifications, Encryption, Group APIs, WebSocket signaling, Group Analysis, DINA LLM
 
 import https from 'https';
 import fs from 'fs';
@@ -30,11 +30,24 @@ import { mirrorRedis } from './config/redis';
 import { mirrorGroupNotifications } from './systems/mirrorGroupNotifications';
 
 // ============================================================================
-// MIRRORGROUPS PHASE 1 + PHASE 3 (NEW)
+// MIRRORGROUPS PHASE 1 (Encryption + APIs)
 // ============================================================================
 import { groupEncryptionManager } from './systems/GroupEncryptionManager';
 import groupRoutes from './routes/groups';
 import groupInsightsRoutes from './routes/groupInsights';
+
+// ============================================================================
+// MIRRORGROUPS PHASE 3 (Group Analysis System)
+// ============================================================================
+import { groupAnalyzer } from './analyzers/GroupAnalyzer';
+import { compatibilityCalculator } from './analyzers/CompatibilityCalculator';
+import { collectiveStrengthDetector } from './analyzers/CollectiveStrengthDetector';
+import { conflictRiskPredictor } from './analyzers/ConflictRiskPredictor';
+
+// ============================================================================
+// MIRRORGROUPS PHASE 3.5 (DINA LLM Integration)
+// ============================================================================
+import { dinaLLMConnector } from './integrations/DINALLMConnector';
 
 // ============================================================================
 // ERROR HANDLING UTILITIES
@@ -147,19 +160,52 @@ console.log('📍 MirrorGroups Insights routes mounted at /mirror/api/groups/:gr
 
 APP.get('/mirror/api/health', (req, res) => {
   const wsHealth = getWebSocketHealth();
-  
+
   res.json({
     status: 'healthy',
     service: 'mirror-server',
     timestamp: new Date().toISOString(),
-    version: '1.0.0',
+    version: '3.5.0',
     features: {
       authentication: 'enabled',
       redis: mirrorRedis.isConnected() ? 'connected' : 'disconnected',
       notifications: 'enabled',
       encryption: 'enabled',
       groups: 'enabled',
+      groupAnalysis: 'enabled',
+      dinaIntegration: 'enabled',
+      llmSynthesis: 'enabled',
       websocket: wsHealth.status
+    },
+    mirrorgroups: {
+      phase0: {
+        name: 'Redis + Notifications',
+        status: 'active',
+        redis: mirrorRedis.isConnected() ? 'connected' : 'disconnected'
+      },
+      phase1: {
+        name: 'Encryption + Group APIs',
+        status: 'active'
+      },
+      phase3: {
+        name: 'Group Analysis System',
+        status: 'active',
+        analyzers: {
+          compatibility: 'active',
+          collectiveStrength: 'active',
+          conflictRisk: 'active',
+          orchestrator: 'active'
+        }
+      },
+      phase3_5: {
+        name: 'DINA LLM Integration',
+        status: 'active',
+        protocol: 'DinaUniversalMessage v2.0',
+        endpoint: process.env.DINA_ENDPOINT || 'configured',
+        authentication: 'auto-registration',
+        circuitBreaker: 'initialized',
+        fallback: 'stub-synthesis'
+      }
     },
     endpoints: {
       auth: '/mirror/api/auth',
@@ -169,6 +215,7 @@ APP.get('/mirror/api/health', (req, res) => {
       dashboard: '/mirror/api/dashboard',
       journal: '/mirror/api/journal',
       groups: '/mirror/api/groups',
+      insights: '/mirror/api/groups/:groupId/insights',
       websocket: 'wss://theundergroundrailroad.world:8444/mirror/groups/ws'
     }
   });
@@ -182,16 +229,18 @@ APP.get('/mirror/api/health', (req, res) => {
  * Initialize all MirrorGroups infrastructure components
  * Phase 0: Redis + Notifications
  * Phase 1: Encryption + Group APIs
+ * Phase 3: Group Analysis System
+ * Phase 3.5: DINA LLM Integration
  */
 async function initializeMirrorGroupsInfrastructure(): Promise<void> {
-  console.log('🚀 Initializing MirrorGroups Infrastructure (Phase 0 + Phase 1)...');
+  console.log('🚀 Initializing MirrorGroups Infrastructure (Phase 0 → Phase 3.5)...');
 
   try {
     // =========================================================================
     // PHASE 0: Redis Connection
     // =========================================================================
     console.log('📡 Phase 0: Connecting to Redis...');
-    
+
     let retries = 10;
     while (!mirrorRedis.isConnected() && retries > 0) {
       console.log(`⏳ Redis connection attempt ${11 - retries}/10...`);
@@ -218,7 +267,58 @@ async function initializeMirrorGroupsInfrastructure(): Promise<void> {
     await groupEncryptionManager.initialize();
     console.log('✅ Phase 1: Group Encryption Manager initialized');
 
-    console.log('🎉 MirrorGroups Infrastructure fully initialized (Phase 0 + Phase 1)');
+    // =========================================================================
+    // PHASE 3: Group Analysis System
+    // =========================================================================
+    console.log('🧠 Phase 3: Initializing Group Analysis System...');
+
+    // Initialize sub-analyzers first
+    console.log('   📊 Initializing Compatibility Calculator...');
+    await compatibilityCalculator.initialize();
+    console.log('   ✅ Compatibility Calculator ready');
+
+    console.log('   💪 Initializing Collective Strength Detector...');
+    await collectiveStrengthDetector.initialize();
+    console.log('   ✅ Collective Strength Detector ready');
+
+    console.log('   ⚠️  Initializing Conflict Risk Predictor...');
+    await conflictRiskPredictor.initialize();
+    console.log('   ✅ Conflict Risk Predictor ready');
+
+    // Initialize main analyzer (orchestrator)
+    console.log('   🎯 Initializing Group Analyzer (orchestrator)...');
+    await groupAnalyzer.initialize();
+    console.log('✅ Phase 3: Group Analysis System initialized (4 analyzers active)');
+
+    // =========================================================================
+    // PHASE 3.5: DINA LLM Integration
+    // =========================================================================
+    console.log('🤖 Phase 3.5: Initializing DINA LLM Integration...');
+
+    const dinaEndpoint = process.env.DINA_ENDPOINT || 'https://www.theundergroundrailroad.world/dina/api/v1/models/llama2:70b/chat';
+    const dinaKey = process.env.DINA_KEY;
+    const userId = process.env.DINA_USER_ID || 'mirror-groups-system';
+
+    console.log(`   🌐 DINA Endpoint: ${dinaEndpoint}`);
+    console.log(`   📋 Protocol: DinaUniversalMessage v2.0`);
+    console.log(`   🔑 Authentication: Auto-registration (no API key required)`);
+    console.log(`   👤 User ID: ${userId}`);
+
+    if (dinaKey) {
+      console.log(`   🎫 DINA Key: ${dinaKey.substring(0, 20)}... (reusing existing registration)`);
+    } else {
+      console.log(`   🎫 DINA Key: Will auto-register on first request`);
+    }
+
+    // Initialize DINA connector (includes circuit breaker)
+    await dinaLLMConnector.initialize();
+
+    console.log('✅ Phase 3.5: DINA LLM Integration initialized');
+    console.log(`   🔌 Circuit Breaker: CLOSED (Threshold: 5 failures, 60s recovery)`);
+    console.log(`   💡 LLM Synthesis: Enabled with graceful fallback to stub mode`);
+    console.log(`   🔄 Resilience: Circuit breaker active, 60s recovery window`);
+
+    console.log('\n🎉 MirrorGroups Infrastructure fully initialized (Phase 0 → Phase 3.5)');
   } catch (error) {
     logError('Failed to initialize MirrorGroups Infrastructure', error);
     throw error;
@@ -242,7 +342,18 @@ function setupGracefulShutdown(server: https.Server): void {
         console.log('✅ HTTP server closed');
       });
 
-      // Shutdown MirrorGroups components in reverse order
+      // Shutdown MirrorGroups components in reverse order (Phase 3.5 → Phase 0)
+      console.log('🤖 Shutting down DINA LLM Integration...');
+      await dinaLLMConnector.shutdown();
+      console.log('✅ DINA LLM Integration shutdown complete');
+
+      console.log('🧠 Shutting down Group Analysis System...');
+      await groupAnalyzer.shutdown();
+      await compatibilityCalculator.shutdown();
+      await collectiveStrengthDetector.shutdown();
+      await conflictRiskPredictor.shutdown();
+      console.log('✅ Group Analysis System shutdown complete');
+
       console.log('🔐 Shutting down Group Encryption Manager...');
       await groupEncryptionManager.shutdown();
       console.log('✅ Group Encryption Manager shutdown complete');
@@ -313,7 +424,7 @@ const httpsServer = https.createServer(credentials, APP);
  */
 async function startServer(): Promise<void> {
   try {
-    console.log('🚀 Starting Mirror Server with MirrorGroups (Phase 0 + Phase 1)...');
+    console.log('🚀 Starting Mirror Server with MirrorGroups (Phase 0 → Phase 3.5)...');
     console.log('📅 Startup time:', new Date().toISOString());
 
     // Initialize all MirrorGroups infrastructure
@@ -348,11 +459,24 @@ async function startServer(): Promise<void> {
       console.log(`   Intake:    /mirror/api/intake/*`);
       console.log(`   Dashboard: /mirror/api/dashboard/*`);
       console.log(`   Journal:   /mirror/api/journal/*`);
-      console.log(`   Groups:    /mirror/api/groups/* (Phase 1)`);
+      console.log(`   Groups:    /mirror/api/groups/* (Phase 1-3)`);
+      console.log(`   Insights:  /mirror/api/groups/:groupId/insights (Phase 3.5)`);
       console.log('\n🎯 MIRRORGROUPS STATUS:');
       console.log(`   ✅ Phase 0: Redis + Notifications`);
       console.log(`   ✅ Phase 1: Encryption + Group APIs + WebRTC Signaling`);
-      console.log(`   🔜 Phase 2: Data Sharing`);
+      console.log(`   ✅ Phase 3: Group Analysis (4 Analyzers) + Worker Queue`);
+      console.log(`   ✅ Phase 3.5: DINA LLM Integration (DinaUniversalMessage v2.0)`);
+      console.log('\n🤖 DINA INTEGRATION:');
+      console.log(`   Endpoint:  ${process.env.DINA_ENDPOINT || 'https://www.theundergroundrailroad.world/dina/api/v1/models/llama2:70b/chat'}`);
+      console.log(`   Protocol:  DinaUniversalMessage v2.0`);
+      console.log(`   Auth:      Auto-registration (${process.env.DINA_KEY ? 'registered' : 'will register on first request'})`);
+      console.log(`   LLM Model: llama2:70b (high-quality synthesis)`);
+      console.log(`   Fallback:  Intelligent stub synthesis (circuit breaker protected)`);
+      console.log('\n📊 ANALYSIS CAPABILITIES:');
+      console.log(`   ✅ Compatibility scoring (pairwise + group average)`);
+      console.log(`   ✅ Collective strength detection (8+ dimensions)`);
+      console.log(`   ✅ Conflict risk prediction (severity + mitigation)`);
+      console.log(`   ✅ LLM-powered narrative synthesis (contextual insights)`);
       console.log('='.repeat(80) + '\n');
     });
 
