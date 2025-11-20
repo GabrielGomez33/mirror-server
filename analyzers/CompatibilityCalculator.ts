@@ -544,7 +544,11 @@ export class CompatibilityCalculator {
     // High average + low variance = high cohesion
     // Scale standard deviation (0-0.5 range typically)
     const cohesion = avg * (1 - Math.min(stdDev * 2, 1));
-    
+
     return Math.max(0, Math.min(1, cohesion));
   }
 }
+
+// Export singleton instance
+export const compatibilityCalculator = new CompatibilityCalculator();
+

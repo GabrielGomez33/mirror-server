@@ -190,6 +190,24 @@ export class GroupAnalyzer {
   }
 
   /**
+   * Initialize analyzer (for server startup)
+   */
+  public async initialize(): Promise<void> {
+    this.logger.info('GroupAnalyzer starting up');
+    // No async initialization needed currently
+    return Promise.resolve();
+  }
+
+  /**
+   * Shutdown analyzer (for server shutdown)
+   */
+  public async shutdown(): Promise<void> {
+    this.logger.info('GroupAnalyzer shutting down');
+    // No cleanup needed currently
+    return Promise.resolve();
+  }
+
+  /**
    * Main analysis entry point
    */
   public async analyzeGroup(

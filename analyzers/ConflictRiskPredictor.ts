@@ -793,3 +793,7 @@ export class ConflictRiskPredictor {
     };
   }
 }
+
+// Export singleton instance
+export const conflictRiskPredictor = new ConflictRiskPredictor();
+

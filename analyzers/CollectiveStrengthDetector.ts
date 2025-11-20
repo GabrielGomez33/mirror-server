@@ -655,3 +655,7 @@ export class CollectiveStrengthDetector {
     );
   }
 }
+
+// Export singleton instance
+export const collectiveStrengthDetector = new CollectiveStrengthDetector();
+
