@@ -707,6 +707,13 @@ export class GroupAnalyzer {
 
       // Insert new scores
       for (const [key, detail] of matrix.pairwiseDetails.entries()) {
+        // Ensure integer ordering for database constraint (member_a_id < member_b_id)
+        const memberAInt = parseInt(detail.memberA);
+        const memberBInt = parseInt(detail.memberB);
+        const [smallerId, largerId] = memberAInt < memberBInt
+          ? [memberAInt, memberBInt]
+          : [memberBInt, memberAInt];
+
         await DB.query(`
           INSERT INTO mirror_group_compatibility (
             id, group_id, member_a_id, member_b_id, compatibility_score,
@@ -717,8 +724,8 @@ export class GroupAnalyzer {
         `, [
           uuidv4(),
           groupId,
-          detail.memberA,
-          detail.memberB,
+          smallerId,
+          largerId,
           detail.score,
           detail.confidence,
           detail.factors.personality,
