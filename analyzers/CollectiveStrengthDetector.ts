@@ -131,9 +131,9 @@ export class CollectiveStrengthDetector {
 
     // Log data availability for debugging
     const dataAvailability = {
-      behavioral: memberData.filter(m => m.behavioral?.tendencies?.length > 0).length,
-      cognitive: memberData.filter(m => m.cognitive?.learningStyle || m.cognitive?.problemSolvingApproach).length,
-      values: memberData.filter(m => m.personality?.values?.length > 0).length
+      behavioral: memberData.filter(m => m.behavioral && m.behavioral.tendencies && m.behavioral.tendencies.length > 0).length,
+      cognitive: memberData.filter(m => m.cognitive && (m.cognitive.learningStyle || m.cognitive.problemSolvingStyle)).length,
+      values: memberData.filter(m => m.values && m.values.core && m.values.core.length > 0).length
     };
 
     this.logger.info('Strength detection completed', {
