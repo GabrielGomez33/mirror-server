@@ -383,7 +383,16 @@ export class GroupAnalyzer {
         );
 
         const decryptedString = decryptedResult.data.toString('utf-8');
-        const decryptedData = JSON.parse(decryptedString);
+        let decryptedData = JSON.parse(decryptedString);
+
+        // BACKWARD COMPATIBILITY: Transform old PublicProfile format to MemberData format
+        // Old format has: { bigFive, mbti } instead of { embedding, communicationStyle }
+        if (row.data_type === 'personality' && decryptedData.bigFive && !decryptedData.embedding) {
+          decryptedData = this.transformLegacyPersonality(decryptedData);
+        }
+        if (row.data_type === 'cognitive' && decryptedData.iqScore && !decryptedData.problemSolvingStyle) {
+          decryptedData = this.transformLegacyCognitive(decryptedData);
+        }
 
         switch (row.data_type) {
           case 'personality':
@@ -402,6 +411,10 @@ export class GroupAnalyzer {
             break;
 
           case 'full_profile':
+            // Check if it's legacy format and transform if needed
+            if (decryptedData.personality?.bigFive && !decryptedData.personality?.embedding) {
+              decryptedData = this.transformLegacyFullProfile(decryptedData);
+            }
             Object.assign(memberData, decryptedData);
             memberData.dataTypes.push('full_profile');
             break;
@@ -969,6 +982,103 @@ export class GroupAnalyzer {
     `, [queueId]);
 
     return (rows as any[])[0];
+  }
+
+  /**
+   * Transform legacy PublicProfile personality format to MemberData format
+   * Handles backward compatibility for existing database records
+   */
+  private transformLegacyPersonality(legacyData: any): any {
+    const bigFive = legacyData.bigFive || {};
+
+    // Generate embedding from Big Five traits (normalized 0-1)
+    const embedding = [
+      (bigFive.openness || 50) / 100,
+      (bigFive.conscientiousness || 50) / 100,
+      (bigFive.extraversion || 50) / 100,
+      (bigFive.agreeableness || 50) / 100,
+      (bigFive.neuroticism || 50) / 100
+    ];
+
+    return {
+      embedding,
+      traits: bigFive,
+      interpersonalStyle: legacyData.mbti || 'unknown',
+      communicationStyle: 'balanced', // Default since not in legacy format
+      conflictResolutionStyle: 'compromising' // Default since not in legacy format
+    };
+  }
+
+  /**
+   * Transform legacy PublicProfile cognitive format to MemberData format
+   */
+  private transformLegacyCognitive(legacyData: any): any {
+    return {
+      iqScore: legacyData.iqScore,
+      category: legacyData.category,
+      strengths: legacyData.strengths || [],
+      problemSolvingStyle: 'practical',
+      decisionMakingStyle: 'balanced',
+      learningStyle: 'structured'
+    };
+  }
+
+  /**
+   * Transform legacy full profile format
+   */
+  private transformLegacyFullProfile(legacyData: any): any {
+    const personality = legacyData.personality || {};
+    const collaboration = legacyData.collaboration || {};
+    const communication = legacyData.communication || {};
+    const bigFive = personality.bigFive || {};
+
+    return {
+      personality: {
+        embedding: [
+          (bigFive.openness || 50) / 100,
+          (bigFive.conscientiousness || 50) / 100,
+          (bigFive.extraversion || 50) / 100,
+          (bigFive.agreeableness || 50) / 100,
+          (bigFive.neuroticism || 50) / 100
+        ],
+        traits: bigFive,
+        interpersonalStyle: personality.mbti || 'unknown',
+        communicationStyle: communication?.style || 'balanced',
+        conflictResolutionStyle: collaboration?.conflictStyle || 'compromising'
+      },
+      cognitive: {
+        ...legacyData.cognitive,
+        problemSolvingStyle: 'practical',
+        decisionMakingStyle: 'balanced',
+        learningStyle: 'structured'
+      },
+      behavioral: {
+        tendencies: [],
+        socialEnergy: (bigFive.extraversion || 50) / 100,
+        empathyLevel: this.parseEmpathyLevel(collaboration?.empathyLevel)
+      },
+      values: {
+        core: personality.dominantTraits || [],
+        motivationDrivers: []
+      }
+    };
+  }
+
+  /**
+   * Parse empathy level string to numeric value
+   */
+  private parseEmpathyLevel(empathyStr: string | undefined): number {
+    if (!empathyStr) return 0.5;
+
+    const levels: Record<string, number> = {
+      'low': 0.3,
+      'moderate': 0.5,
+      'medium': 0.5,
+      'high': 0.7,
+      'very high': 0.9
+    };
+
+    return levels[empathyStr.toLowerCase()] || 0.5;
   }
 }
 
