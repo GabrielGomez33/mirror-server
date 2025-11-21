@@ -167,10 +167,10 @@ const getGroupInsightsHandler: RequestHandler = async (req, res) => {
       [groupId]
     );
 
-    // Get LLM synthesis
+    // Get LLM synthesis (overview type)
     const [synthesisRows] = await DB.query(
       `SELECT * FROM mirror_group_llm_synthesis
-       WHERE group_id = ?
+       WHERE group_id = ? AND synthesis_type = 'overview'
        ORDER BY generated_at DESC
        LIMIT 1`,
       [groupId]
@@ -223,19 +223,22 @@ const getGroupInsightsHandler: RequestHandler = async (req, res) => {
       status: row.resolution_status
     }));
 
-    // Format LLM synthesis
-    const llmSynthesis = (synthesisRows as any[]).length > 0 ? {
-      overview: (synthesisRows as any[])[0].overview,
-      keyInsights: safeJsonParse((synthesisRows as any[])[0].key_insights, []),
-      recommendations: safeJsonParse((synthesisRows as any[])[0].recommendations, []),
-      narrative: {
-        compatibility: (synthesisRows as any[])[0].narrative_compatibility,
-        strengths: (synthesisRows as any[])[0].narrative_strengths,
-        challenges: (synthesisRows as any[])[0].narrative_challenges,
-        opportunities: (synthesisRows as any[])[0].narrative_opportunities
-      },
-      generatedAt: (synthesisRows as any[])[0].generated_at
-    } : null;
+    // Format LLM synthesis - extract from key_points JSON
+    const llmSynthesis = (synthesisRows as any[]).length > 0 ? (() => {
+      const row = (synthesisRows as any[])[0];
+      const keyPoints = safeJsonParse(row.key_points, {});
+
+      return {
+        title: row.title,
+        overview: keyPoints.overview || row.content,
+        keyInsights: keyPoints.keyInsights || [],
+        recommendations: keyPoints.recommendations || [],
+        narrative: keyPoints.narrative || {},
+        llmModel: row.llm_model,
+        qualityScore: row.quality_score ? parseFloat(row.quality_score) : null,
+        generatedAt: row.generated_at
+      };
+    })() : null;
 
     res.json({
       success: true,

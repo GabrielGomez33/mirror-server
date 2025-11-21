@@ -851,33 +851,50 @@ export class GroupAnalyzer {
     synthesis: LLMSynthesis
   ): Promise<void> {
     try {
-      // Delete existing synthesis for this group
+      // Delete existing overview synthesis for this group
       await DB.query(`
-        DELETE FROM mirror_group_llm_synthesis WHERE group_id = ?
+        DELETE FROM mirror_group_llm_synthesis
+        WHERE group_id = ? AND synthesis_type = 'overview'
       `, [groupId]);
+
+      // Build key points from synthesis data
+      const keyPoints = {
+        overview: synthesis.overview,
+        keyInsights: synthesis.keyInsights,
+        recommendations: synthesis.recommendations,
+        narrative: synthesis.narrative || {}
+      };
+
+      // Build data sources metadata
+      const dataSources = {
+        compatibilityCount: 1, // Will be dynamic based on actual data
+        patternsCount: 0,
+        risksCount: 0,
+        analysisVersion: '1.0'
+      };
 
       // Insert new synthesis
       await DB.query(`
         INSERT INTO mirror_group_llm_synthesis (
-          id, group_id, overview, key_insights, recommendations,
-          narrative_compatibility, narrative_strengths, narrative_challenges,
-          narrative_opportunities, synthesis_metadata, generated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+          id, group_id, synthesis_type, title, content, key_points,
+          data_sources, llm_model, prompt_template, generation_params,
+          quality_score, generated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
       `, [
         uuidv4(),
         groupId,
+        'overview',
+        'Group Dynamics Analysis',
         synthesis.overview,
-        JSON.stringify(synthesis.keyInsights),
-        JSON.stringify(synthesis.recommendations),
-        synthesis.narrative?.compatibility || null,
-        synthesis.narrative?.strengths || null,
-        synthesis.narrative?.challenges || null,
-        synthesis.narrative?.opportunities || null,
+        JSON.stringify(keyPoints),
+        JSON.stringify(dataSources),
+        'mistral:7b', // From DINA config
+        'group_dynamics_v1',
         JSON.stringify({
-          insightCount: synthesis.keyInsights.length,
-          recommendationCount: synthesis.recommendations.length,
-          hasNarrative: !!synthesis.narrative
-        })
+          temperature: 0.7,
+          maxTokens: 2000
+        }),
+        0.85 // Default quality score
       ]);
 
       this.logger.info('LLM synthesis stored', {
