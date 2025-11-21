@@ -1,2 +1,0 @@
-# mirror-server
-Mirror Backend

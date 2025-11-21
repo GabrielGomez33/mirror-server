@@ -1,7 +1,7 @@
 // ============================================================================
 // GROUP DATA EXTRACTOR - PHASE 2
 // ============================================================================
-// File: systems/GroupDataExtractor.ts
+// File: /var/www/mirror-server/services/GroupDataExtractor.ts
 // ----------------------------------------------------------------------------
 // Facade/wrapper for extracting and preparing Mirror assessment data for
 // group sharing. Uses PublicAssessmentAggregator under the hood.
@@ -155,13 +155,11 @@ export class GroupDataExtractor {
 
     switch (dataType) {
       case 'personality':
-        // Transform PublicProfile format to MemberData format
-        data = this.transformPersonalityData(fullProfile);
+        data = fullProfile.personality || null;
         break;
 
       case 'cognitive':
-        // Transform PublicProfile format to MemberData format
-        data = this.transformCognitiveData(fullProfile);
+        data = fullProfile.cognitive || null;
         break;
 
       case 'facial':
@@ -177,8 +175,7 @@ export class GroupDataExtractor {
         break;
 
       case 'full_profile':
-        // Transform entire profile with all sections mapped correctly
-        data = this.transformFullProfile(fullProfile);
+        data = fullProfile;
         break;
 
       default:
@@ -193,154 +190,6 @@ export class GroupDataExtractor {
       timestamp,
       dataVersion: '2.0'
     };
-  }
-
-  /**
-   * Transform PublicProfile personality data to MemberData personality format
-   */
-  private transformPersonalityData(fullProfile: any): any {
-    const personality = fullProfile.personality || {};
-    const collaboration = fullProfile.collaboration || {};
-    const communication = fullProfile.communication || {};
-    const bigFive = personality.bigFive || {};
-
-    // Generate embedding from Big Five traits (normalized 0-1)
-    const embedding = [
-      (bigFive.openness || 50) / 100,
-      (bigFive.conscientiousness || 50) / 100,
-      (bigFive.extraversion || 50) / 100,
-      (bigFive.agreeableness || 50) / 100,
-      (bigFive.neuroticism || 50) / 100
-    ];
-
-    return {
-      embedding,
-      traits: bigFive,
-      interpersonalStyle: personality.mbti || 'unknown',
-      communicationStyle: communication.style || 'balanced',
-      conflictResolutionStyle: collaboration.conflictStyle || 'compromising'
-    };
-  }
-
-  /**
-   * Transform PublicProfile cognitive data to MemberData cognitive format
-   */
-  private transformCognitiveData(fullProfile: any): any {
-    const cognitive = fullProfile.cognitive || {};
-    const personality = fullProfile.personality || {};
-    const bigFive = personality.bigFive || {};
-
-    // Infer cognitive styles from Big Five and IQ data
-    const problemSolvingStyle = this.inferProblemSolvingStyle(bigFive, cognitive);
-    const decisionMakingStyle = this.inferDecisionMakingStyle(bigFive);
-    const learningStyle = this.inferLearningStyle(bigFive);
-
-    return {
-      iqScore: cognitive.iqScore,
-      category: cognitive.category,
-      strengths: cognitive.strengths || [],
-      problemSolvingStyle,
-      decisionMakingStyle,
-      learningStyle
-    };
-  }
-
-  /**
-   * Transform full profile with all sections properly mapped
-   */
-  private transformFullProfile(fullProfile: any): any {
-    const personality = fullProfile.personality || {};
-    const collaboration = fullProfile.collaboration || {};
-    const bigFive = personality.bigFive || {};
-
-    return {
-      personality: this.transformPersonalityData(fullProfile),
-      cognitive: this.transformCognitiveData(fullProfile),
-      behavioral: {
-        tendencies: [],
-        socialEnergy: (bigFive.extraversion || 50) / 100,
-        empathyLevel: this.parseEmpathyLevel(collaboration.empathyLevel)
-      },
-      values: {
-        core: personality.dominantTraits || [],
-        motivationDrivers: this.inferMotivationDrivers(bigFive)
-      }
-    };
-  }
-
-  /**
-   * Infer problem-solving style from Big Five traits
-   */
-  private inferProblemSolvingStyle(bigFive: any, cognitive: any): string {
-    const openness = bigFive.openness || 50;
-    const conscientiousness = bigFive.conscientiousness || 50;
-
-    if (openness > 65 && conscientiousness > 65) return 'analytical-creative';
-    if (openness > 65) return 'intuitive';
-    if (conscientiousness > 65) return 'systematic';
-    return 'practical';
-  }
-
-  /**
-   * Infer decision-making style from Big Five traits
-   */
-  private inferDecisionMakingStyle(bigFive: any): string {
-    const neuroticism = bigFive.neuroticism || 50;
-    const conscientiousness = bigFive.conscientiousness || 50;
-
-    if (neuroticism < 40 && conscientiousness > 60) return 'decisive';
-    if (neuroticism > 60) return 'cautious';
-    if (conscientiousness > 60) return 'methodical';
-    return 'balanced';
-  }
-
-  /**
-   * Infer learning style from Big Five traits
-   */
-  private inferLearningStyle(bigFive: any): string {
-    const openness = bigFive.openness || 50;
-    const extraversion = bigFive.extraversion || 50;
-
-    if (openness > 60 && extraversion > 60) return 'experiential';
-    if (openness > 60) return 'theoretical';
-    if (extraversion > 60) return 'collaborative';
-    return 'structured';
-  }
-
-  /**
-   * Parse empathy level to numeric 0-1 scale
-   */
-  private parseEmpathyLevel(empathyStr: string | undefined): number {
-    if (!empathyStr) return 0.5;
-
-    const levels: Record<string, number> = {
-      'low': 0.3,
-      'moderate': 0.5,
-      'medium': 0.5,
-      'high': 0.7,
-      'very high': 0.9
-    };
-
-    return levels[empathyStr.toLowerCase()] || 0.5;
-  }
-
-  /**
-   * Infer motivation drivers from Big Five traits
-   */
-  private inferMotivationDrivers(bigFive: any): Array<{ driver: string; strength: number }> {
-    const drivers: Array<{ driver: string; strength: number }> = [];
-
-    const openness = (bigFive.openness || 50) / 100;
-    const conscientiousness = (bigFive.conscientiousness || 50) / 100;
-    const extraversion = (bigFive.extraversion || 50) / 100;
-    const agreeableness = (bigFive.agreeableness || 50) / 100;
-
-    if (openness > 0.6) drivers.push({ driver: 'growth', strength: openness });
-    if (conscientiousness > 0.6) drivers.push({ driver: 'achievement', strength: conscientiousness });
-    if (extraversion > 0.6) drivers.push({ driver: 'connection', strength: extraversion });
-    if (agreeableness > 0.6) drivers.push({ driver: 'contribution', strength: agreeableness });
-
-    return drivers;
   }
 
   /**

@@ -478,6 +478,20 @@ export class MirrorRedisManager extends EventEmitter {
   }
 
   // ============================================================================
+  // PUB/SUB UTILITY METHODS
+  // ============================================================================
+
+  async publish(channel: string, message: string): Promise<number> {
+    try {
+      const result = await this.publisher.publish(channel, message);
+      return result;
+    } catch (error) {
+      console.error(`❌ Failed to publish to channel ${channel}:`, error);
+      return 0;
+    }
+  }
+
+  // ============================================================================
   // UTILITY METHODS
   // ============================================================================
 

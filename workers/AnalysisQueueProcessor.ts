@@ -138,11 +138,8 @@ export class AnalysisQueueProcessor {
 
     // Unsubscribe from Redis
     try {
-      const subscriber = (mirrorRedis as any).subscriber;
-      if (subscriber) {
-        await subscriber.unsubscribe('mirror:analysis:queue');
-        this.logger.info('Unsubscribed from Redis channel');
-      }
+      await mirrorRedis.unsubscribe('mirror:analysis:queue');
+      this.logger.info('Unsubscribed from Redis channel');
     } catch (error) {
       this.logger.error('Failed to unsubscribe from Redis', error);
     }
@@ -159,22 +156,16 @@ export class AnalysisQueueProcessor {
    */
   private async subscribeToQueue(): Promise<void> {
     try {
-      // Use the internal subscriber from mirrorRedis
-      const subscriber = (mirrorRedis as any).subscriber;
+      // Subscribe using MirrorRedisManager
+      await mirrorRedis.subscribe('mirror:analysis:queue', async (message: string) => {
+        try {
+          const notification = JSON.parse(message);
+          this.logger.debug('Received queue notification', notification);
 
-      await subscriber.subscribe('mirror:analysis:queue');
-
-      subscriber.on('message', async (channel: string, message: string) => {
-        if (channel === 'mirror:analysis:queue') {
-          try {
-            const notification = JSON.parse(message);
-            this.logger.debug('Received queue notification', notification);
-
-            // Process the notified job immediately
-            await this.processJobById(notification.queueId);
-          } catch (error) {
-            this.logger.error('Failed to handle queue notification', error);
-          }
+          // Process the notified job immediately
+          await this.processJobById(notification.queueId);
+        } catch (error) {
+          this.logger.error('Failed to handle queue notification', error);
         }
       });
 
