@@ -90,6 +90,22 @@ export class ConflictRiskPredictor {
   }
 
   /**
+   * Initialize predictor (for server startup)
+   */
+  public async initialize(): Promise<void> {
+    this.logger.info('ConflictRiskPredictor initialized');
+    return Promise.resolve();
+  }
+
+  /**
+   * Shutdown predictor (for server shutdown)
+   */
+  public async shutdown(): Promise<void> {
+    this.logger.info('ConflictRiskPredictor shutdown');
+    return Promise.resolve();
+  }
+
+  /**
    * Predict conflict risks for the group
    */
   public async predictRisks(memberData: MemberData[]): Promise<ConflictRisk[]> {
@@ -122,11 +138,27 @@ export class ConflictRiskPredictor {
     );
     
     const processingTime = Date.now() - startTime;
+
+    // Count risks by type for debugging
+    const risksByType = {
+      resolution: this.detectResolutionMismatch(memberData).length,
+      empathy: this.detectEmpathyGap(memberData).length,
+      energy: this.detectEnergyImbalance(memberData).length,
+      communication: this.detectCommunicationClash(memberData).length,
+      values: this.detectValueMisalignment(memberData).length,
+      expectations: this.detectExpectationDivergence(memberData).length,
+      leadership: this.detectLeadershipConflict(memberData).length,
+      workStyle: this.detectWorkStyleFriction(memberData).length
+    };
+
     this.logger.info('Risk prediction completed', {
       members: memberData.length,
       risksFound: mitigatedRisks.length,
       criticalRisks: mitigatedRisks.filter(r => r.severity === 'critical').length,
-      processingTime
+      processingTime,
+      risksByType,
+      noRisks: mitigatedRisks.length === 0 ?
+        `No risks detected - check if members have conflict styles, empathy, energy levels, communication styles, etc.` : null
     });
     
     return mitigatedRisks;
@@ -739,7 +771,7 @@ export class ConflictRiskPredictor {
     const high = risks.filter(r => r.severity === 'high');
     const medium = risks.filter(r => r.severity === 'medium');
     const low = risks.filter(r => r.severity === 'low');
-
+    
     let overallRiskLevel: string;
     if (critical.length > 0) {
       overallRiskLevel = 'Critical attention needed';
@@ -750,9 +782,9 @@ export class ConflictRiskPredictor {
     } else {
       overallRiskLevel = 'Low risk - healthy dynamics';
     }
-
+    
     const recommendations: string[] = [];
-
+    
     if (critical.length > 0) {
       recommendations.push('Address critical risks immediately with group discussion');
     }
@@ -765,7 +797,7 @@ export class ConflictRiskPredictor {
     if (risks.some(r => r.type === 'value_misalignment')) {
       recommendations.push('Facilitate values alignment workshop');
     }
-
+    
     return {
       criticalCount: critical.length,
       highCount: high.length,
@@ -775,20 +807,6 @@ export class ConflictRiskPredictor {
       overallRiskLevel,
       recommendations
     };
-  }
-
-  /**
-   * Initialize predictor (no-op, for consistency with other components)
-   */
-  public async initialize(): Promise<void> {
-    this.logger.info('Conflict Risk Predictor initialized');
-  }
-
-  /**
-   * Shutdown predictor (no-op, for consistency with other components)
-   */
-  public async shutdown(): Promise<void> {
-    this.logger.info('Conflict Risk Predictor shutdown');
   }
 }
 

@@ -163,7 +163,7 @@ export class DINALLMConnector {
 
   /**
    * Synthesize insights using DINA LLM
-   * Currently returns intelligent mock data, ready for DINA integration
+   * Throws errors on failure - no stub fallback
    */
   async synthesizeInsights(
     analysisResult: GroupAnalysisResult
@@ -180,11 +180,16 @@ export class DINALLMConnector {
 
     // Check circuit breaker
     if (this.isCircuitOpen()) {
-      this.logger.warn('Circuit breaker OPEN - using fallback synthesis', {
+      const error = new Error(
+        `DINA service unavailable: Circuit breaker OPEN after ${this.failureCount} failures. ` +
+        `Will retry in ${Math.ceil((this.circuitBreakerResetTime - (Date.now() - this.lastFailureTime)) / 1000)}s`
+      );
+      this.logger.error('Circuit breaker OPEN - refusing request', {
         failureCount: this.failureCount,
-        timeSinceLastFailure: Date.now() - this.lastFailureTime
+        timeSinceLastFailure: Date.now() - this.lastFailureTime,
+        resetTime: this.circuitBreakerResetTime
       });
-      return await this.generateStubSynthesis(analysisResult);
+      throw error;
     }
 
     try {
@@ -198,23 +203,25 @@ export class DINALLMConnector {
     } catch (error: any) {
       this.onFailure(error);
 
-      this.logger.error('DINA synthesis failed', {
+      this.logger.error('DINA synthesis failed - throwing error', {
         error: error.message,
         errorType: error.name,
-        groupId: analysisResult.groupId
-      });
-
-      this.logger.warn('CircuitBreaker:DINA - Executing fallback due to failure', {
-        error: error.message,
+        errorStack: error.stack?.split('\n').slice(0, 3).join('\n'),
+        groupId: analysisResult.groupId,
+        analysisId: analysisResult.analysisId,
         failureCount: this.failureCount
       });
 
-      this.logger.debug('Generating stub synthesis', {
-        groupId: analysisResult.groupId,
-        mode: 'fallback'
-      });
+      // Rethrow with additional context
+      const enhancedError = new Error(
+        `DINA LLM synthesis failed: ${error.message}. ` +
+        `This is failure ${this.failureCount}/${this.circuitBreakerThreshold}. ` +
+        `Check DINA server connectivity and response format.`
+      );
+      enhancedError.name = 'DINASynthesisError';
+      enhancedError.stack = error.stack;
 
-      return await this.generateStubSynthesis(analysisResult);
+      throw enhancedError;
     }
   }
 
@@ -389,11 +396,27 @@ Respond with JSON in this exact format:
           || result.message?.content;                         // Another variant (fallback)
 
         if (!content) {
-          this.logger.warn('No standard content field found, using full result', {
-            resultStructure: JSON.stringify(result).substring(0, 200)
+          this.logger.error('No content field found in DINA response', {
+            resultKeys: Object.keys(result).join(', '),
+            hasResponse: !!result.response,
+            hasChoices: !!result.choices,
+            hasContent: !!result.content,
+            hasMessage: !!result.message,
+            resultStructure: JSON.stringify(result).substring(0, 500)
           });
-          throw new Error('No content field found in DINA response');
+          throw new Error(
+            `No content field found in DINA response. ` +
+            `Available fields: ${Object.keys(result).join(', ')}. ` +
+            `Check DINA server response format.`
+          );
         }
+
+        this.logger.debug('Extracted content from DINA response', {
+          contentType: typeof content,
+          contentLength: typeof content === 'string' ? content.length : 'N/A',
+          sourceField: result.response ? 'response' : result.choices ? 'choices' : result.content ? 'content' : 'message',
+          contentPreview: typeof content === 'string' ? content.substring(0, 200) : JSON.stringify(content).substring(0, 200)
+        });
 
         // Parse JSON response
         const synthesis = this.parseDINAResponse(content);
@@ -528,48 +551,71 @@ Respond with JSON in this exact format:
 
     try {
       if (typeof content === 'string') {
-        // Try to extract JSON from markdown code blocks if present
-        const jsonMatch = content.match(/```json\s*([\s\S]*?)\s*```/) || content.match(/```\s*([\s\S]*?)\s*```/);
-        const jsonString = jsonMatch ? jsonMatch[1] : content;
+        // Remove leading/trailing whitespace (DINA often adds a leading space)
+        let cleanContent = content.trim();
 
-        synthesis = JSON.parse(jsonString);
+        // Try to extract JSON from markdown code blocks if present
+        const jsonMatch = cleanContent.match(/```json\s*([\s\S]*?)\s*```/) || cleanContent.match(/```\s*([\s\S]*?)\s*```/);
+        if (jsonMatch) {
+          cleanContent = jsonMatch[1].trim();
+        }
+
+        this.logger.debug('Parsing DINA response', {
+          originalLength: content.length,
+          cleanedLength: cleanContent.length,
+          startsWithBrace: cleanContent.startsWith('{'),
+          preview: cleanContent.substring(0, 100)
+        });
+
+        synthesis = JSON.parse(cleanContent);
       } else {
         synthesis = content;
       }
 
       // Validate required fields
-      if (!synthesis.overview || !synthesis.keyInsights || !synthesis.recommendations || !synthesis.narratives) {
-        this.logger.warn('Synthesis missing required fields', {
+      const missingFields: string[] = [];
+      if (!synthesis.overview) missingFields.push('overview');
+      if (!synthesis.keyInsights || !Array.isArray(synthesis.keyInsights)) missingFields.push('keyInsights');
+      if (!synthesis.recommendations || !Array.isArray(synthesis.recommendations)) missingFields.push('recommendations');
+      if (!synthesis.narratives || typeof synthesis.narratives !== 'object') missingFields.push('narratives');
+
+      if (missingFields.length > 0) {
+        this.logger.error('Synthesis missing required fields', {
+          missingFields,
           hasOverview: !!synthesis.overview,
           hasInsights: !!synthesis.keyInsights,
           hasRecommendations: !!synthesis.recommendations,
-          hasNarratives: !!synthesis.narratives
+          hasNarratives: !!synthesis.narratives,
+          synthesisStructure: Object.keys(synthesis || {}).join(', ')
         });
-        throw new Error('Missing required fields in synthesis');
+        throw new Error(`Missing required fields in synthesis: ${missingFields.join(', ')}`);
       }
+
+      this.logger.debug('Synthesis parsed successfully', {
+        overviewLength: synthesis.overview.length,
+        insightsCount: synthesis.keyInsights.length,
+        recommendationsCount: synthesis.recommendations.length,
+        narrativeKeys: Object.keys(synthesis.narratives).join(', ')
+      });
 
       return synthesis;
 
     } catch (parseError: any) {
-      this.logger.warn('Failed to parse DINA response as JSON, creating fallback', {
+      this.logger.error('Failed to parse DINA response as JSON', {
         error: parseError.message,
         contentType: typeof content,
-        contentPreview: typeof content === 'string' ? content.substring(0, 200) : 'not a string'
+        contentLength: typeof content === 'string' ? content.length : 'N/A',
+        contentPreview: typeof content === 'string' ? content.substring(0, 300) : JSON.stringify(content).substring(0, 300),
+        startsWithSpace: typeof content === 'string' && content.startsWith(' '),
+        firstChar: typeof content === 'string' ? `"${content[0]}" (code: ${content.charCodeAt(0)})` : 'N/A'
       });
 
-      // Fallback: extract text and structure it
-      const textContent = typeof content === 'string' ? content : JSON.stringify(content);
-      return {
-        overview: textContent.substring(0, 500),
-        keyInsights: ['LLM synthesis provided - see full response'],
-        recommendations: ['Review detailed analysis'],
-        narratives: {
-          compatibility: textContent.substring(0, 200) || 'Analysis available in overview',
-          strengths: '',
-          challenges: '',
-          opportunities: ''
-        }
-      };
+      // Don't fallback - throw error
+      throw new Error(
+        `Failed to parse DINA response: ${parseError.message}. ` +
+        `Content type: ${typeof content}, Length: ${typeof content === 'string' ? content.length : 'N/A'}. ` +
+        `Preview: ${typeof content === 'string' ? content.substring(0, 100) : JSON.stringify(content).substring(0, 100)}`
+      );
     }
   }
 

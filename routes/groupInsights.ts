@@ -167,6 +167,15 @@ const getGroupInsightsHandler: RequestHandler = async (req, res) => {
       [groupId]
     );
 
+    // Get LLM synthesis (overview type)
+    const [synthesisRows] = await DB.query(
+      `SELECT * FROM mirror_group_llm_synthesis
+       WHERE group_id = ? AND synthesis_type = 'overview'
+       ORDER BY generated_at DESC
+       LIMIT 1`,
+      [groupId]
+    );
+
     // Format compatibility matrix
     const compatibilityMatrix = (compatibilityRows as any[]).map(row => ({
       memberA: row.member_a_id,
@@ -214,6 +223,23 @@ const getGroupInsightsHandler: RequestHandler = async (req, res) => {
       status: row.resolution_status
     }));
 
+    // Format LLM synthesis - extract from key_points JSON
+    const llmSynthesis = (synthesisRows as any[]).length > 0 ? (() => {
+      const row = (synthesisRows as any[])[0];
+      const keyPoints: any = safeJsonParse(row.key_points, {});
+
+      return {
+        title: row.title,
+        overview: (keyPoints.overview as string) || row.content,
+        keyInsights: (keyPoints.keyInsights as string[]) || [],
+        recommendations: (keyPoints.recommendations as string[]) || [],
+        narrative: (keyPoints.narrative as any) || {},
+        llmModel: row.llm_model,
+        qualityScore: row.quality_score ? parseFloat(row.quality_score) : null,
+        generatedAt: row.generated_at
+      };
+    })() : null;
+
     res.json({
       success: true,
       data: {
@@ -245,7 +271,8 @@ const getGroupInsightsHandler: RequestHandler = async (req, res) => {
             high: conflictRisks.filter(r => r.severity === 'high'),
             medium: conflictRisks.filter(r => r.severity === 'medium'),
             low: conflictRisks.filter(r => r.severity === 'low')
-          }
+          },
+          llmSynthesis: llmSynthesis
         },
         meta: {
           hasData: compatibilityMatrix.length > 0 || collectivePatterns.length > 0 || conflictRisks.length > 0,

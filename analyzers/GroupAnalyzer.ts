@@ -190,18 +190,20 @@ export class GroupAnalyzer {
   }
 
   /**
-   * Initialize (stub for compatibility with server startup)
+   * Initialize analyzer (for server startup)
    */
-  async initialize(): Promise<void> {
-    this.logger.info('GroupAnalyzer ready for analysis');
+  public async initialize(): Promise<void> {
+    this.logger.info('GroupAnalyzer starting up');
+    // No async initialization needed currently
     return Promise.resolve();
   }
 
   /**
-   * Shutdown (stub for compatibility with server shutdown)
+   * Shutdown analyzer (for server shutdown)
    */
-  async shutdown(): Promise<void> {
-    this.logger.info('GroupAnalyzer shutdown');
+  public async shutdown(): Promise<void> {
+    this.logger.info('GroupAnalyzer shutting down');
+    // No cleanup needed currently
     return Promise.resolve();
   }
 
@@ -381,7 +383,16 @@ export class GroupAnalyzer {
         );
 
         const decryptedString = decryptedResult.data.toString('utf-8');
-        const decryptedData = JSON.parse(decryptedString);
+        let decryptedData = JSON.parse(decryptedString);
+
+        // BACKWARD COMPATIBILITY: Transform old PublicProfile format to MemberData format
+        // Old format has: { bigFive, mbti } instead of { embedding, communicationStyle }
+        if (row.data_type === 'personality' && decryptedData.bigFive && !decryptedData.embedding) {
+          decryptedData = this.transformLegacyPersonality(decryptedData);
+        }
+        if (row.data_type === 'cognitive' && decryptedData.iqScore && !decryptedData.problemSolvingStyle) {
+          decryptedData = this.transformLegacyCognitive(decryptedData);
+        }
 
         switch (row.data_type) {
           case 'personality':
@@ -400,13 +411,35 @@ export class GroupAnalyzer {
             break;
 
           case 'full_profile':
+            // Check if it's legacy format and transform if needed
+            if (decryptedData.personality?.bigFive && !decryptedData.personality?.embedding) {
+              decryptedData = this.transformLegacyFullProfile(decryptedData);
+            }
             Object.assign(memberData, decryptedData);
             memberData.dataTypes.push('full_profile');
             break;
         }
       }
 
-      return Array.from(memberDataMap.values());
+      const memberDataArray = Array.from(memberDataMap.values());
+
+      // Log data completeness for debugging
+      this.logger.info('Member data loaded', {
+        memberCount: memberDataArray.length,
+        dataCompleteness: memberDataArray.map(m => ({
+          userId: m.userId.substring(0, 8),
+          dataTypes: m.dataTypes,
+          hasPersonality: !!m.personality,
+          hasEmbedding: !!m.personality?.embedding,
+          hasCommunicationStyle: !!m.personality?.communicationStyle,
+          hasConflictStyle: !!m.personality?.conflictResolutionStyle,
+          hasCognitive: !!m.cognitive,
+          hasBehavioral: !!m.behavioral,
+          hasSocialEnergy: m.behavioral?.socialEnergy !== undefined
+        }))
+      });
+
+      return memberDataArray;
 
     } catch (error) {
       this.logger.error('Failed to fetch member data', error);
@@ -687,10 +720,12 @@ export class GroupAnalyzer {
 
       // Insert new scores
       for (const [key, detail] of matrix.pairwiseDetails.entries()) {
-        // Ensure consistent ordering (member_a_id < member_b_id) to satisfy chk_member_order constraint
-        const [memberAId, memberBId] = detail.memberA < detail.memberB
-          ? [detail.memberA, detail.memberB]
-          : [detail.memberB, detail.memberA];
+        // Ensure integer ordering for database constraint (member_a_id < member_b_id)
+        const memberAInt = parseInt(detail.memberA);
+        const memberBInt = parseInt(detail.memberB);
+        const [smallerId, largerId] = memberAInt < memberBInt
+          ? [memberAInt, memberBInt]
+          : [memberBInt, memberAInt];
 
         await DB.query(`
           INSERT INTO mirror_group_compatibility (
@@ -702,8 +737,8 @@ export class GroupAnalyzer {
         `, [
           uuidv4(),
           groupId,
-          memberAId,
-          memberBId,
+          smallerId,
+          largerId,
           detail.score,
           detail.confidence,
           detail.factors.personality,
@@ -816,11 +851,56 @@ export class GroupAnalyzer {
     synthesis: LLMSynthesis
   ): Promise<void> {
     try {
-      // For now, store in insights metadata
-      // Future: Create dedicated table for LLM synthesis
-      this.logger.info('LLM synthesis generated', {
+      // Delete existing overview synthesis for this group
+      await DB.query(`
+        DELETE FROM mirror_group_llm_synthesis
+        WHERE group_id = ? AND synthesis_type = 'overview'
+      `, [groupId]);
+
+      // Build key points from synthesis data
+      const keyPoints = {
+        overview: synthesis.overview,
+        keyInsights: synthesis.keyInsights,
+        recommendations: synthesis.recommendations,
+        narrative: synthesis.narratives || {}
+      };
+
+      // Build data sources metadata
+      const dataSources = {
+        compatibilityCount: 1, // Will be dynamic based on actual data
+        patternsCount: 0,
+        risksCount: 0,
+        analysisVersion: '1.0'
+      };
+
+      // Insert new synthesis
+      await DB.query(`
+        INSERT INTO mirror_group_llm_synthesis (
+          id, group_id, synthesis_type, title, content, key_points,
+          data_sources, llm_model, prompt_template, generation_params,
+          quality_score, generated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+      `, [
+        uuidv4(),
+        groupId,
+        'overview',
+        'Group Dynamics Analysis',
+        synthesis.overview,
+        JSON.stringify(keyPoints),
+        JSON.stringify(dataSources),
+        'mistral:7b', // From DINA config
+        'group_dynamics_v1',
+        JSON.stringify({
+          temperature: 0.7,
+          maxTokens: 2000
+        }),
+        0.85 // Default quality score
+      ]);
+
+      this.logger.info('LLM synthesis stored', {
         overviewLength: synthesis.overview.length,
-        keyInsightsCount: synthesis.keyInsights.length
+        keyInsightsCount: synthesis.keyInsights.length,
+        recommendationsCount: synthesis.recommendations.length
       });
     } catch (error) {
       this.logger.error('Failed to store LLM synthesis', error);
@@ -852,7 +932,7 @@ export class GroupAnalyzer {
       const key = `mirror:group:analysis:${groupId}`;
       const cached = await mirrorRedis.get(key);
 
-      return cached;
+      return cached || null;
     } catch (error) {
       this.logger.error('Failed to get cached analysis', error);
       return null;
@@ -878,8 +958,7 @@ export class GroupAnalyzer {
   ): Promise<void> {
     try {
       // Publish to Redis for notification system
-      const publisher = (mirrorRedis as any).publisher;
-      await publisher.publish(
+      await mirrorRedis.publish(
         'mirror:notifications',
         JSON.stringify({
           type: 'group_analysis_complete',
@@ -930,8 +1009,7 @@ export class GroupAnalyzer {
     `, [queueId, groupId, 'full_analysis', priority, trigger]);
 
     // Notify worker
-    const publisher = (mirrorRedis as any).publisher;
-    await publisher.publish('mirror:analysis:queue', JSON.stringify({
+    await mirrorRedis.publish('mirror:analysis:queue', JSON.stringify({
       queueId,
       groupId,
       priority
@@ -949,6 +1027,103 @@ export class GroupAnalyzer {
     `, [queueId]);
 
     return (rows as any[])[0];
+  }
+
+  /**
+   * Transform legacy PublicProfile personality format to MemberData format
+   * Handles backward compatibility for existing database records
+   */
+  private transformLegacyPersonality(legacyData: any): any {
+    const bigFive = legacyData.bigFive || {};
+
+    // Generate embedding from Big Five traits (normalized 0-1)
+    const embedding = [
+      (bigFive.openness || 50) / 100,
+      (bigFive.conscientiousness || 50) / 100,
+      (bigFive.extraversion || 50) / 100,
+      (bigFive.agreeableness || 50) / 100,
+      (bigFive.neuroticism || 50) / 100
+    ];
+
+    return {
+      embedding,
+      traits: bigFive,
+      interpersonalStyle: legacyData.mbti || 'unknown',
+      communicationStyle: 'balanced', // Default since not in legacy format
+      conflictResolutionStyle: 'compromising' // Default since not in legacy format
+    };
+  }
+
+  /**
+   * Transform legacy PublicProfile cognitive format to MemberData format
+   */
+  private transformLegacyCognitive(legacyData: any): any {
+    return {
+      iqScore: legacyData.iqScore,
+      category: legacyData.category,
+      strengths: legacyData.strengths || [],
+      problemSolvingStyle: 'practical',
+      decisionMakingStyle: 'balanced',
+      learningStyle: 'structured'
+    };
+  }
+
+  /**
+   * Transform legacy full profile format
+   */
+  private transformLegacyFullProfile(legacyData: any): any {
+    const personality = legacyData.personality || {};
+    const collaboration = legacyData.collaboration || {};
+    const communication = legacyData.communication || {};
+    const bigFive = personality.bigFive || {};
+
+    return {
+      personality: {
+        embedding: [
+          (bigFive.openness || 50) / 100,
+          (bigFive.conscientiousness || 50) / 100,
+          (bigFive.extraversion || 50) / 100,
+          (bigFive.agreeableness || 50) / 100,
+          (bigFive.neuroticism || 50) / 100
+        ],
+        traits: bigFive,
+        interpersonalStyle: personality.mbti || 'unknown',
+        communicationStyle: communication?.style || 'balanced',
+        conflictResolutionStyle: collaboration?.conflictStyle || 'compromising'
+      },
+      cognitive: {
+        ...legacyData.cognitive,
+        problemSolvingStyle: 'practical',
+        decisionMakingStyle: 'balanced',
+        learningStyle: 'structured'
+      },
+      behavioral: {
+        tendencies: [],
+        socialEnergy: (bigFive.extraversion || 50) / 100,
+        empathyLevel: this.parseEmpathyLevel(collaboration?.empathyLevel)
+      },
+      values: {
+        core: personality.dominantTraits || [],
+        motivationDrivers: []
+      }
+    };
+  }
+
+  /**
+   * Parse empathy level string to numeric value
+   */
+  private parseEmpathyLevel(empathyStr: string | undefined): number {
+    if (!empathyStr) return 0.5;
+
+    const levels: Record<string, number> = {
+      'low': 0.3,
+      'moderate': 0.5,
+      'medium': 0.5,
+      'high': 0.7,
+      'very high': 0.9
+    };
+
+    return levels[empathyStr.toLowerCase()] || 0.5;
   }
 }
 

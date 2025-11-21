@@ -94,6 +94,22 @@ export class CompatibilityCalculator {
   }
 
   /**
+   * Initialize calculator (for server startup)
+   */
+  public async initialize(): Promise<void> {
+    this.logger.info('CompatibilityCalculator initialized');
+    return Promise.resolve();
+  }
+
+  /**
+   * Shutdown calculator (for server shutdown)
+   */
+  public async shutdown(): Promise<void> {
+    this.logger.info('CompatibilityCalculator shutdown');
+    return Promise.resolve();
+  }
+
+  /**
    * Calculate full compatibility matrix for all group members
    */
   public async calculateMatrix(memberData: MemberData[]): Promise<CompatibilityMatrix> {
@@ -147,11 +163,39 @@ export class CompatibilityCalculator {
     const clusterGroups = this.detectClusters(matrix, memberIds);
     
     const processingTime = Date.now() - startTime;
+
+    // Calculate data completeness statistics
+    const dataStats = {
+      totalPairs: pairCount,
+      avgScore: averageCompatibility.toFixed(2),
+      scoreDistribution: {
+        low: 0,      // < 0.4
+        medium: 0,   // 0.4 - 0.7
+        high: 0,     // > 0.7
+        neutral: 0   // exactly 0.5 (likely missing data)
+      }
+    };
+
+    for (const [key, detail] of pairwiseDetails.entries()) {
+      if (Math.abs(detail.score - 0.5) < 0.001) {
+        dataStats.scoreDistribution.neutral++;
+      } else if (detail.score < 0.4) {
+        dataStats.scoreDistribution.low++;
+      } else if (detail.score <= 0.7) {
+        dataStats.scoreDistribution.medium++;
+      } else {
+        dataStats.scoreDistribution.high++;
+      }
+    }
+
     this.logger.info(`Matrix calculation completed`, {
       members: n,
       pairs: pairCount,
       avgCompatibility: averageCompatibility.toFixed(2),
-      processingTime
+      processingTime,
+      distribution: dataStats.scoreDistribution,
+      potentialDataIssues: dataStats.scoreDistribution.neutral > 0 ?
+        `${dataStats.scoreDistribution.neutral} pairs have neutral score (0.5) - likely missing data` : null
     });
     
     return {
@@ -203,6 +247,27 @@ export class CompatibilityCalculator {
       energy.hasData
     ];
     const confidence = dataPoints.filter(Boolean).length / dataPoints.length;
+
+    // Log low confidence scores for debugging
+    if (confidence < 0.75) {
+      this.logger.warn('Low data completeness for compatibility calculation', {
+        memberPair: `${memberA.userId.substring(0, 8)} - ${memberB.userId.substring(0, 8)}`,
+        confidence: confidence.toFixed(2),
+        score: score.toFixed(2),
+        missingData: {
+          personality: !personality.hasData,
+          communication: !communication.hasData,
+          conflict: !conflict.hasData,
+          energy: !energy.hasData
+        },
+        factors: {
+          personality: personality.score.toFixed(2),
+          communication: communication.score.toFixed(2),
+          conflict: conflict.score.toFixed(2),
+          energy: energy.score.toFixed(2)
+        }
+      });
+    }
     
     // Generate insights
     const strengths: string[] = [];
@@ -482,35 +547,21 @@ export class CompatibilityCalculator {
   public calculateGroupCohesion(matrix: CompatibilityMatrix): number {
     const scores = Array.from(matrix.pairwiseDetails.values())
       .map(d => d.score);
-
+    
     if (scores.length === 0) return 0;
-
+    
     // Calculate standard deviation to measure variance
     const avg = matrix.averageCompatibility;
-    const variance = scores.reduce((sum, score) =>
+    const variance = scores.reduce((sum, score) => 
       sum + Math.pow(score - avg, 2), 0
     ) / scores.length;
     const stdDev = Math.sqrt(variance);
-
+    
     // High average + low variance = high cohesion
     // Scale standard deviation (0-0.5 range typically)
     const cohesion = avg * (1 - Math.min(stdDev * 2, 1));
 
     return Math.max(0, Math.min(1, cohesion));
-  }
-
-  /**
-   * Initialize calculator (no-op, for consistency with other components)
-   */
-  public async initialize(): Promise<void> {
-    this.logger.info('Compatibility Calculator initialized');
-  }
-
-  /**
-   * Shutdown calculator (no-op, for consistency with other components)
-   */
-  public async shutdown(): Promise<void> {
-    this.logger.info('Compatibility Calculator shutdown');
   }
 }
 

@@ -88,6 +88,22 @@ export class CollectiveStrengthDetector {
   }
 
   /**
+   * Initialize detector (for server startup)
+   */
+  public async initialize(): Promise<void> {
+    this.logger.info('CollectiveStrengthDetector initialized');
+    return Promise.resolve();
+  }
+
+  /**
+   * Shutdown detector (for server shutdown)
+   */
+  public async shutdown(): Promise<void> {
+    this.logger.info('CollectiveStrengthDetector shutdown');
+    return Promise.resolve();
+  }
+
+  /**
    * Detect collective strengths in the group
    */
   public async detectStrengths(memberData: MemberData[]): Promise<CollectiveStrength[]> {
@@ -128,10 +144,27 @@ export class CollectiveStrengthDetector {
     );
     
     const processingTime = Date.now() - startTime;
+
+    // Log data availability for debugging
+    const dataAvailability = {
+      behavioral: memberData.filter(m => m.behavioral && m.behavioral.tendencies && m.behavioral.tendencies.length > 0).length,
+      cognitive: memberData.filter(m => m.cognitive && (m.cognitive.learningStyle || m.cognitive.problemSolvingStyle)).length,
+      values: memberData.filter(m => m.values && m.values.core && m.values.core.length > 0).length
+    };
+
     this.logger.info('Strength detection completed', {
       members: memberData.length,
       patternsFound: enrichedPatterns.length,
-      processingTime
+      processingTime,
+      dataAvailability,
+      patternTypes: {
+        behavioral: behavioralPatterns.length,
+        cognitive: cognitivePatterns.length,
+        values: valuePatterns.length,
+        emergent: emergentPatterns.length
+      },
+      noPatterns: enrichedPatterns.length === 0 ?
+        `No patterns detected - check if members have behavioral tendencies, cognitive data, or values` : null
     });
     
     return enrichedPatterns;
@@ -636,20 +669,6 @@ export class CollectiveStrengthDetector {
       member.values?.core?.includes(attribute) ||
       false
     );
-  }
-
-  /**
-   * Initialize detector (no-op, for consistency with other components)
-   */
-  public async initialize(): Promise<void> {
-    this.logger.info('Collective Strength Detector initialized');
-  }
-
-  /**
-   * Shutdown detector (no-op, for consistency with other components)
-   */
-  public async shutdown(): Promise<void> {
-    this.logger.info('Collective Strength Detector shutdown');
   }
 }
 
