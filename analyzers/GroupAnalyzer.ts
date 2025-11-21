@@ -862,7 +862,7 @@ export class GroupAnalyzer {
         overview: synthesis.overview,
         keyInsights: synthesis.keyInsights,
         recommendations: synthesis.recommendations,
-        narrative: synthesis.narrative || {}
+        narrative: synthesis.narratives || {}
       };
 
       // Build data sources metadata

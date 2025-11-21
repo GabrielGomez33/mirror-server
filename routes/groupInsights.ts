@@ -226,14 +226,14 @@ const getGroupInsightsHandler: RequestHandler = async (req, res) => {
     // Format LLM synthesis - extract from key_points JSON
     const llmSynthesis = (synthesisRows as any[]).length > 0 ? (() => {
       const row = (synthesisRows as any[])[0];
-      const keyPoints = safeJsonParse(row.key_points, {});
+      const keyPoints: any = safeJsonParse(row.key_points, {});
 
       return {
         title: row.title,
-        overview: keyPoints.overview || row.content,
-        keyInsights: keyPoints.keyInsights || [],
-        recommendations: keyPoints.recommendations || [],
-        narrative: keyPoints.narrative || {},
+        overview: (keyPoints.overview as string) || row.content,
+        keyInsights: (keyPoints.keyInsights as string[]) || [],
+        recommendations: (keyPoints.recommendations as string[]) || [],
+        narrative: (keyPoints.narrative as any) || {},
         llmModel: row.llm_model,
         qualityScore: row.quality_score ? parseFloat(row.quality_score) : null,
         generatedAt: row.generated_at
