@@ -851,11 +851,39 @@ export class GroupAnalyzer {
     synthesis: LLMSynthesis
   ): Promise<void> {
     try {
-      // For now, store in insights metadata
-      // Future: Create dedicated table for LLM synthesis
-      this.logger.info('LLM synthesis generated', {
+      // Delete existing synthesis for this group
+      await DB.query(`
+        DELETE FROM mirror_group_llm_synthesis WHERE group_id = ?
+      `, [groupId]);
+
+      // Insert new synthesis
+      await DB.query(`
+        INSERT INTO mirror_group_llm_synthesis (
+          id, group_id, overview, key_insights, recommendations,
+          narrative_compatibility, narrative_strengths, narrative_challenges,
+          narrative_opportunities, synthesis_metadata, generated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+      `, [
+        uuidv4(),
+        groupId,
+        synthesis.overview,
+        JSON.stringify(synthesis.keyInsights),
+        JSON.stringify(synthesis.recommendations),
+        synthesis.narrative?.compatibility || null,
+        synthesis.narrative?.strengths || null,
+        synthesis.narrative?.challenges || null,
+        synthesis.narrative?.opportunities || null,
+        JSON.stringify({
+          insightCount: synthesis.keyInsights.length,
+          recommendationCount: synthesis.recommendations.length,
+          hasNarrative: !!synthesis.narrative
+        })
+      ]);
+
+      this.logger.info('LLM synthesis stored', {
         overviewLength: synthesis.overview.length,
-        keyInsightsCount: synthesis.keyInsights.length
+        keyInsightsCount: synthesis.keyInsights.length,
+        recommendationsCount: synthesis.recommendations.length
       });
     } catch (error) {
       this.logger.error('Failed to store LLM synthesis', error);
