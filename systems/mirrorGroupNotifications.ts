@@ -39,14 +39,19 @@ function logError(context: string, error: unknown): void {
 function isValidGroupNotificationType(type: any): type is GroupNotificationType {
   const validTypes: GroupNotificationType[] = [
     'group_invite',
-    'member_joined', 
+    'member_joined',
     'member_left',
     'peer_review_received',
     'compatibility_updated',
     'video_call_started',
     'admin_promoted',
     'admin_demoted',
-    'drawing_session_started'
+    'drawing_session_started',
+    // Phase 4: Voting & Conversation Intelligence
+    'vote_proposed',
+    'vote_completed',
+    'conversation_insight',
+    'conversation_summary'
   ];
   return typeof type === 'string' && validTypes.includes(type as GroupNotificationType);
 }
@@ -82,7 +87,7 @@ interface NotificationDelivery {
   expiresAt?: Date;
 }
 
-export type GroupNotificationType = 
+export type GroupNotificationType =
   | 'group_invite'
   | 'member_joined'
   | 'member_left'
@@ -91,7 +96,12 @@ export type GroupNotificationType =
   | 'video_call_started'
   | 'admin_promoted'
   | 'admin_demoted'
-  | 'drawing_session_started';
+  | 'drawing_session_started'
+  // Phase 4: Voting & Conversation Intelligence
+  | 'vote_proposed'
+  | 'vote_completed'
+  | 'conversation_insight'
+  | 'conversation_summary';
 
 // ============================================================================
 // TYPE ALIASES
@@ -166,6 +176,31 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
     drawing_session_started: {
       title: (data) => `Drawing Session: ${data.groupName}`,
       message: (data) => `${data.initiatorName} started a drawing session in "${data.groupName}"`,
+      priority: 'normal',
+      channels: ['websocket', 'push']
+    },
+    // Phase 4: Voting & Conversation Intelligence
+    vote_proposed: {
+      title: (data) => `New Vote: ${data.topic || 'Group Vote'}`,
+      message: (data) => `${data.proposer?.username || 'Someone'} started a vote: "${data.topic}"`,
+      priority: 'immediate',
+      channels: ['websocket', 'push']
+    },
+    vote_completed: {
+      title: (data) => `Vote Completed: ${data.topic || 'Group Vote'}`,
+      message: (data) => `The vote "${data.topic}" has ended. View the results!`,
+      priority: 'normal',
+      channels: ['websocket', 'push']
+    },
+    conversation_insight: {
+      title: (data) => `AI Insight Available`,
+      message: (data) => `New conversation analysis ready for your session`,
+      priority: 'normal',
+      channels: ['websocket']
+    },
+    conversation_summary: {
+      title: (data) => `Session Summary Ready`,
+      message: (data) => `Your session summary has been generated`,
       priority: 'normal',
       channels: ['websocket', 'push']
     }
@@ -432,6 +467,70 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
     }
     
     return results;
+  }
+
+  // ============================================================================
+  // GENERIC NOTIFICATION METHOD (Phase 4)
+  // ============================================================================
+
+  /**
+   * Generic notification method for Phase 4 features (voting, conversation insights)
+   * Accepts notification type with colon format (e.g., 'vote:proposed') and converts
+   * to underscore format used internally (e.g., 'vote_proposed')
+   */
+  async notify(userId: string | number, notification: {
+    type: string;
+    payload: Record<string, any>;
+  }): Promise<boolean> {
+    try {
+      // Convert colon format to underscore format (e.g., 'vote:proposed' -> 'vote_proposed')
+      const internalType = notification.type.replace(':', '_') as GroupNotificationType;
+
+      // Validate notification type
+      if (!isValidGroupNotificationType(internalType)) {
+        console.warn(`⚠️ Unknown notification type: ${notification.type}, delivering as raw WebSocket message`);
+        // Fallback: deliver as raw WebSocket message if type not in templates
+        return this.deliverRawWebSocketNotification(String(userId), notification);
+      }
+
+      // Use the existing sendNotification infrastructure
+      return await this.sendNotification(internalType, String(userId), notification.payload);
+    } catch (error) {
+      logError(`Error in generic notify for user ${userId}`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Fallback method for delivering raw WebSocket notifications
+   * Used when notification type doesn't match any template
+   */
+  private async deliverRawWebSocketNotification(userId: string, notification: {
+    type: string;
+    payload: Record<string, any>;
+  }): Promise<boolean> {
+    try {
+      const ws = this.activeConnections.get(userId);
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return false;
+      }
+
+      const message = JSON.stringify({
+        type: 'group_notification',
+        data: {
+          notificationType: notification.type,
+          ...notification.payload,
+          timestamp: new Date().toISOString(),
+        },
+      });
+
+      ws.send(message);
+      console.log(`✅ Raw WebSocket notification delivered to user ${userId}`);
+      return true;
+    } catch (error) {
+      logError(`Raw WebSocket delivery failed for user ${userId}`, error);
+      return false;
+    }
   }
 
   // ============================================================================
