@@ -205,7 +205,7 @@ async function completeVote(voteId: string, groupId: string): Promise<void> {
         winner: (results['yes'] || 0) > (results['no'] || 0) ? 'yes' : 'no'
       };
     } else if (vote.vote_type === 'multiple_choice') {
-      const options = safeJsonParse(vote.options, []);
+      const options = safeJsonParse<string[]>(vote.options, []);
       finalResults = {
         options: options.map((opt: string) => ({
           option: opt,
@@ -511,7 +511,7 @@ const castVoteHandler: RequestHandler = async (req, res) => {
         return;
       }
     } else if (vote.vote_type === 'multiple_choice') {
-      const options = safeJsonParse(vote.options, []);
+      const options = safeJsonParse<string[]>(vote.options, []);
       if (!options.includes(response)) {
         res.status(400).json({
           success: false,
