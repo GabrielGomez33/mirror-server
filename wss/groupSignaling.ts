@@ -1,5 +1,5 @@
 // wss/groupSignaling.ts
-// MirrorGroups Phase 1: WebRTC signaling integrated with existing setupWSS.ts
+// MirrorGroups Phase 1-4: WebRTC signaling + Voting + Conversation Intelligence
 // Uses native WebSocket (ws library) - NO Socket.IO to avoid conflicts
 
 import { WebSocket } from 'ws';
@@ -17,9 +17,39 @@ interface AuthenticatedWebSocket extends WebSocket {
   isAlive?: boolean;
 }
 
+// Extended message types for Phase 4
+type MessageType =
+  // Phase 1 - WebRTC
+  | 'join-session'
+  | 'leave-session'
+  | 'webrtc-offer'
+  | 'webrtc-answer'
+  | 'webrtc-ice-candidate'
+  | 'drawing-action'
+  | 'ping'
+  // Phase 4 - Voting
+  | 'vote:cast-response'
+  | 'vote:subscribe'
+  | 'vote:unsubscribe'
+  // Phase 4 - Conversation Intelligence
+  | 'insight:subscribe'
+  | 'insight:unsubscribe'
+  | 'insight:acknowledge';
+
 interface WebRTCMessage {
-  type: 'join-session' | 'leave-session' | 'webrtc-offer' | 'webrtc-answer' | 
-        'webrtc-ice-candidate' | 'drawing-action' | 'ping';
+  type: MessageType;
+  payload: any;
+}
+
+// Vote event types for broadcasting
+export interface VoteEvent {
+  type: 'vote:proposed' | 'vote:cast' | 'vote:completed' | 'vote:cancelled';
+  payload: any;
+}
+
+// Insight event types for broadcasting
+export interface InsightEvent {
+  type: 'conversation:insight' | 'conversation:summary';
   payload: any;
 }
 
@@ -30,6 +60,7 @@ interface WebRTCMessage {
 export class GroupSignalingManager {
   private connections: Map<number, AuthenticatedWebSocket> = new Map();  // userId -> WebSocket
   private sessions: Map<string, Set<number>> = new Map();  // sessionId -> Set of userIds
+  private groupSubscriptions: Map<string, Set<number>> = new Map();  // groupId -> Set of userIds (for votes/insights)
 
   /**
    * Register an authenticated WebSocket connection
@@ -96,14 +127,15 @@ export class GroupSignalingManager {
    * Handle incoming WebSocket message
    */
   private async handleMessage(
-    userId: number, 
-    data: Buffer, 
+    userId: number,
+    data: Buffer,
     ws: AuthenticatedWebSocket
   ): Promise<void> {
     try {
       const message: WebRTCMessage = JSON.parse(data.toString());
 
       switch (message.type) {
+        // Phase 1 - Session Management
         case 'join-session':
           await this.handleJoinSession(userId, message.payload, ws);
           break;
@@ -112,6 +144,7 @@ export class GroupSignalingManager {
           await this.handleLeaveSession(userId, ws);
           break;
 
+        // Phase 1 - WebRTC Signaling
         case 'webrtc-offer':
           await this.handleWebRTCOffer(userId, message.payload, ws);
           break;
@@ -124,10 +157,34 @@ export class GroupSignalingManager {
           await this.handleICECandidate(userId, message.payload, ws);
           break;
 
+        // Phase 6 - Drawing
         case 'drawing-action':
           await this.handleDrawingAction(userId, message.payload, ws);
           break;
 
+        // Phase 4 - Voting subscriptions
+        case 'vote:subscribe':
+          await this.handleVoteSubscribe(userId, message.payload, ws);
+          break;
+
+        case 'vote:unsubscribe':
+          await this.handleVoteUnsubscribe(userId, message.payload, ws);
+          break;
+
+        // Phase 4 - Insight subscriptions
+        case 'insight:subscribe':
+          await this.handleInsightSubscribe(userId, message.payload, ws);
+          break;
+
+        case 'insight:unsubscribe':
+          await this.handleInsightUnsubscribe(userId, message.payload, ws);
+          break;
+
+        case 'insight:acknowledge':
+          await this.handleInsightAcknowledge(userId, message.payload, ws);
+          break;
+
+        // Heartbeat
         case 'ping':
           this.sendMessage(ws, { type: 'pong', payload: { timestamp: Date.now() } });
           break;
@@ -471,12 +528,252 @@ export class GroupSignalingManager {
     };
   }
 
+  // ========================================================================
+  // PHASE 4 - VOTING HANDLERS
+  // ========================================================================
+
+  /**
+   * Subscribe user to vote events for a group
+   */
+  private async handleVoteSubscribe(
+    userId: number,
+    payload: { groupId: string },
+    ws: AuthenticatedWebSocket
+  ): Promise<void> {
+    const { groupId } = payload;
+
+    // Verify membership
+    const [memberRows] = await DB.query(
+      `SELECT role FROM mirror_group_members
+       WHERE group_id = ? AND user_id = ? AND status = 'active'`,
+      [groupId, userId]
+    );
+
+    if ((memberRows as any[]).length === 0) {
+      this.sendError(ws, 'NOT_MEMBER', 'You are not a member of this group');
+      return;
+    }
+
+    // Add to group subscriptions
+    if (!this.groupSubscriptions.has(groupId)) {
+      this.groupSubscriptions.set(groupId, new Set());
+    }
+    this.groupSubscriptions.get(groupId)!.add(userId);
+
+    console.log(`📨 User ${userId} subscribed to vote events for group ${groupId}`);
+
+    this.sendMessage(ws, {
+      type: 'vote:subscribed',
+      payload: { groupId, message: 'Subscribed to vote events' }
+    });
+  }
+
+  /**
+   * Unsubscribe user from vote events
+   */
+  private async handleVoteUnsubscribe(
+    userId: number,
+    payload: { groupId: string },
+    ws: AuthenticatedWebSocket
+  ): Promise<void> {
+    const { groupId } = payload;
+
+    const subscribers = this.groupSubscriptions.get(groupId);
+    if (subscribers) {
+      subscribers.delete(userId);
+      if (subscribers.size === 0) {
+        this.groupSubscriptions.delete(groupId);
+      }
+    }
+
+    console.log(`📨 User ${userId} unsubscribed from vote events for group ${groupId}`);
+
+    this.sendMessage(ws, {
+      type: 'vote:unsubscribed',
+      payload: { groupId, message: 'Unsubscribed from vote events' }
+    });
+  }
+
+  /**
+   * Broadcast vote event to all subscribed group members
+   * Called from routes/groupVotes.ts
+   */
+  broadcastVoteEvent(groupId: string, event: VoteEvent): void {
+    const subscribers = this.groupSubscriptions.get(groupId);
+    if (!subscribers || subscribers.size === 0) {
+      console.log(`📨 No subscribers for vote event in group ${groupId}`);
+      return;
+    }
+
+    console.log(`📨 Broadcasting ${event.type} to ${subscribers.size} subscribers in group ${groupId}`);
+
+    for (const userId of subscribers) {
+      const ws = this.connections.get(userId);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        this.sendMessage(ws, {
+          type: event.type,
+          payload: event.payload
+        });
+      }
+    }
+  }
+
+  // ========================================================================
+  // PHASE 4 - CONVERSATION INSIGHT HANDLERS
+  // ========================================================================
+
+  /**
+   * Subscribe user to insight events for a group
+   */
+  private async handleInsightSubscribe(
+    userId: number,
+    payload: { groupId: string; sessionId?: string },
+    ws: AuthenticatedWebSocket
+  ): Promise<void> {
+    const { groupId } = payload;
+
+    // Verify membership
+    const [memberRows] = await DB.query(
+      `SELECT role FROM mirror_group_members
+       WHERE group_id = ? AND user_id = ? AND status = 'active'`,
+      [groupId, userId]
+    );
+
+    if ((memberRows as any[]).length === 0) {
+      this.sendError(ws, 'NOT_MEMBER', 'You are not a member of this group');
+      return;
+    }
+
+    // Add to group subscriptions (reuse same map for simplicity)
+    if (!this.groupSubscriptions.has(groupId)) {
+      this.groupSubscriptions.set(groupId, new Set());
+    }
+    this.groupSubscriptions.get(groupId)!.add(userId);
+
+    console.log(`🧠 User ${userId} subscribed to insight events for group ${groupId}`);
+
+    this.sendMessage(ws, {
+      type: 'insight:subscribed',
+      payload: { groupId, message: 'Subscribed to conversation insights' }
+    });
+  }
+
+  /**
+   * Unsubscribe user from insight events
+   */
+  private async handleInsightUnsubscribe(
+    userId: number,
+    payload: { groupId: string },
+    ws: AuthenticatedWebSocket
+  ): Promise<void> {
+    const { groupId } = payload;
+
+    const subscribers = this.groupSubscriptions.get(groupId);
+    if (subscribers) {
+      subscribers.delete(userId);
+      if (subscribers.size === 0) {
+        this.groupSubscriptions.delete(groupId);
+      }
+    }
+
+    console.log(`🧠 User ${userId} unsubscribed from insight events for group ${groupId}`);
+
+    this.sendMessage(ws, {
+      type: 'insight:unsubscribed',
+      payload: { groupId, message: 'Unsubscribed from conversation insights' }
+    });
+  }
+
+  /**
+   * Handle insight acknowledgment
+   */
+  private async handleInsightAcknowledge(
+    userId: number,
+    payload: { insightId: string; groupId: string },
+    ws: AuthenticatedWebSocket
+  ): Promise<void> {
+    const { insightId, groupId } = payload;
+
+    try {
+      await DB.query(
+        `UPDATE mirror_group_session_insights
+         SET acknowledged_at = COALESCE(acknowledged_at, NOW())
+         WHERE id = ? AND group_id = ?`,
+        [insightId, groupId]
+      );
+
+      this.sendMessage(ws, {
+        type: 'insight:acknowledged',
+        payload: { insightId, message: 'Insight acknowledged' }
+      });
+
+    } catch (error) {
+      console.error('Error acknowledging insight:', error);
+      this.sendError(ws, 'ACK_FAILED', 'Failed to acknowledge insight');
+    }
+  }
+
+  /**
+   * Broadcast insight event to all subscribed group members
+   * Called from routes/sessionInsights.ts
+   */
+  broadcastInsightEvent(groupId: string, event: InsightEvent): void {
+    const subscribers = this.groupSubscriptions.get(groupId);
+    if (!subscribers || subscribers.size === 0) {
+      console.log(`🧠 No subscribers for insight event in group ${groupId}`);
+      return;
+    }
+
+    console.log(`🧠 Broadcasting ${event.type} to ${subscribers.size} subscribers in group ${groupId}`);
+
+    for (const userId of subscribers) {
+      const ws = this.connections.get(userId);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        this.sendMessage(ws, {
+          type: event.type,
+          payload: event.payload
+        });
+      }
+    }
+  }
+
+  /**
+   * Send message to specific user by ID
+   * Useful for targeted notifications
+   */
+  sendToUser(userId: number, message: { type: string; payload: any }): boolean {
+    const ws = this.connections.get(userId);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      this.sendMessage(ws, message);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Check if user is connected
+   */
+  isUserConnected(userId: number): boolean {
+    const ws = this.connections.get(userId);
+    return ws !== undefined && ws.readyState === WebSocket.OPEN;
+  }
+
+  /**
+   * Get all connected users in a group
+   */
+  getConnectedGroupMembers(groupId: string): number[] {
+    const subscribers = this.groupSubscriptions.get(groupId);
+    if (!subscribers) return [];
+
+    return Array.from(subscribers).filter(userId => this.isUserConnected(userId));
+  }
+
   /**
    * Shutdown - clean up all connections
    */
   shutdown(): void {
     console.log('🛑 Shutting down GroupSignalingManager...');
-    
+
     for (const [userId, ws] of this.connections.entries()) {
       ws.close(1001, 'Server shutdown');
       this.unregisterConnection(userId);
@@ -484,7 +781,8 @@ export class GroupSignalingManager {
 
     this.connections.clear();
     this.sessions.clear();
-    
+    this.groupSubscriptions.clear();
+
     console.log('✅ GroupSignalingManager shutdown complete');
   }
 }

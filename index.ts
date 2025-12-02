@@ -37,6 +37,13 @@ import groupRoutes from './routes/groups';
 import groupInsightsRoutes from './routes/groupInsights';
 
 // ============================================================================
+// MIRRORGROUPS PHASE 4 (Conversation Intelligence + Voting)
+// ============================================================================
+import { conversationAnalyzer } from './analyzers/ConversationAnalyzer';
+import groupVotesRoutes from './routes/groupVotes';
+import sessionInsightsRoutes from './routes/sessionInsights';
+
+// ============================================================================
 // MIRRORGROUPS PHASE 3 (Group Analysis System)
 // ============================================================================
 import { groupAnalyzer } from './analyzers/GroupAnalyzer';
@@ -145,7 +152,7 @@ APP.use('/mirror/api/dashboard', dashboardRoutes);
 APP.use('/mirror/api/journal', journalRoutes);
 
 // ============================================================================
-// MOUNT MIRRORGROUPS ROUTES (PHASE 1 + PHASE 3)
+// MOUNT MIRRORGROUPS ROUTES (PHASE 1 + PHASE 3 + PHASE 4)
 // ============================================================================
 
 APP.use('/mirror/api/groups', groupRoutes);
@@ -153,6 +160,13 @@ console.log('📍 MirrorGroups routes mounted at /mirror/api/groups');
 
 APP.use('/mirror/api', groupInsightsRoutes);
 console.log('📍 MirrorGroups Insights routes mounted at /mirror/api/groups/:groupId/insights');
+
+// Phase 4: Voting and Conversation Intelligence
+APP.use('/mirror/api', groupVotesRoutes);
+console.log('📍 MirrorGroups Voting routes mounted at /mirror/api/groups/:groupId/votes');
+
+APP.use('/mirror/api', sessionInsightsRoutes);
+console.log('📍 MirrorGroups Session Insights routes mounted at /mirror/api/groups/:groupId/sessions');
 
 // ============================================================================
 // HEALTH CHECK ENDPOINT
@@ -205,6 +219,20 @@ APP.get('/mirror/api/health', (req, res) => {
         authentication: 'auto-registration',
         circuitBreaker: 'initialized',
         fallback: 'stub-synthesis'
+      },
+      phase4: {
+        name: 'Conversation Intelligence + Voting',
+        status: 'active',
+        features: {
+          voting: 'enabled',
+          conversationAnalysis: 'enabled',
+          periodicInsights: 'enabled',
+          postSessionSummary: 'enabled'
+        },
+        config: {
+          checkInIntervalMs: process.env.AI_CHECKIN_INTERVAL_MS || '1800000',
+          voteDefaultDuration: process.env.VOTE_DURATION_SECONDS || '60'
+        }
       }
     },
     endpoints: {
@@ -216,6 +244,8 @@ APP.get('/mirror/api/health', (req, res) => {
       journal: '/mirror/api/journal',
       groups: '/mirror/api/groups',
       insights: '/mirror/api/groups/:groupId/insights',
+      votes: '/mirror/api/groups/:groupId/votes',
+      sessions: '/mirror/api/groups/:groupId/sessions/:sessionId',
       websocket: 'wss://theundergroundrailroad.world:8444/mirror/groups/ws'
     }
   });
@@ -318,7 +348,20 @@ async function initializeMirrorGroupsInfrastructure(): Promise<void> {
     console.log(`   💡 LLM Synthesis: Enabled with graceful fallback to stub mode`);
     console.log(`   🔄 Resilience: Circuit breaker active, 60s recovery window`);
 
-    console.log('\n🎉 MirrorGroups Infrastructure fully initialized (Phase 0 → Phase 3.5)');
+    // =========================================================================
+    // PHASE 4: Conversation Intelligence + Voting
+    // =========================================================================
+    console.log('🗳️ Phase 4: Initializing Conversation Intelligence + Voting...');
+
+    await conversationAnalyzer.initialize();
+
+    console.log('✅ Phase 4: Conversation Intelligence + Voting initialized');
+    console.log(`   🧠 Conversation Analyzer: Ready`);
+    console.log(`   🗳️ Group Voting: Enabled (${process.env.VOTE_DURATION_SECONDS || 60}s default)`);
+    console.log(`   ⏱️ Periodic Check-ins: Every ${(parseInt(process.env.AI_CHECKIN_INTERVAL_MS || '1800000') / 60000).toFixed(0)} minutes`);
+    console.log(`   📊 Post-Session Summaries: Enabled`);
+
+    console.log('\n🎉 MirrorGroups Infrastructure fully initialized (Phase 0 → Phase 4)');
   } catch (error) {
     logError('Failed to initialize MirrorGroups Infrastructure', error);
     throw error;
@@ -342,7 +385,11 @@ function setupGracefulShutdown(server: https.Server): void {
         console.log('✅ HTTP server closed');
       });
 
-      // Shutdown MirrorGroups components in reverse order (Phase 3.5 → Phase 0)
+      // Shutdown MirrorGroups components in reverse order (Phase 4 → Phase 0)
+      console.log('🗳️ Shutting down Conversation Intelligence + Voting...');
+      await conversationAnalyzer.shutdown();
+      console.log('✅ Conversation Intelligence + Voting shutdown complete');
+
       console.log('🤖 Shutting down DINA LLM Integration...');
       await dinaLLMConnector.shutdown();
       console.log('✅ DINA LLM Integration shutdown complete');
@@ -466,6 +513,7 @@ async function startServer(): Promise<void> {
       console.log(`   ✅ Phase 1: Encryption + Group APIs + WebRTC Signaling`);
       console.log(`   ✅ Phase 3: Group Analysis (4 Analyzers) + Worker Queue`);
       console.log(`   ✅ Phase 3.5: DINA LLM Integration (DinaUniversalMessage v2.0)`);
+      console.log(`   ✅ Phase 4: Conversation Intelligence + Group Voting`);
       console.log('\n🤖 DINA INTEGRATION:');
       console.log(`   Endpoint:  ${process.env.DINA_ENDPOINT || 'https://www.theundergroundrailroad.world/dina/api/v1/models/llama2:70b/chat'}`);
       console.log(`   Protocol:  DinaUniversalMessage v2.0`);
@@ -477,6 +525,12 @@ async function startServer(): Promise<void> {
       console.log(`   ✅ Collective strength detection (8+ dimensions)`);
       console.log(`   ✅ Conflict risk prediction (severity + mitigation)`);
       console.log(`   ✅ LLM-powered narrative synthesis (contextual insights)`);
+      console.log('\n🗳️ PHASE 4 FEATURES:');
+      console.log(`   ✅ Group Voting (yes/no, multiple choice, ${process.env.VOTE_DURATION_SECONDS || 60}s timer)`);
+      console.log(`   ✅ Conversation Intelligence (AI-powered insights)`);
+      console.log(`   ✅ Periodic Check-ins (every ${parseInt(process.env.AI_CHECKIN_INTERVAL_MS || '1800000') / 60000} min)`);
+      console.log(`   ✅ Post-Session Summaries (auto-generated)`);
+      console.log(`   ✅ Real-time WebSocket events (votes, insights)`);
       console.log('='.repeat(80) + '\n');
     });
 
