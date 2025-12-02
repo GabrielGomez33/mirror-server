@@ -131,7 +131,8 @@ const appendTranscriptHandler: RequestHandler = async (req, res) => {
         Buffer.from(text, 'utf-8'),
         groupId
       );
-      encryptedText = encrypted.data.toString('base64');
+      // encrypted.encrypted is already Base64 encoded
+      encryptedText = encrypted.encrypted;
     } catch (encryptError) {
       console.warn('Transcript encryption failed, storing unencrypted:', encryptError);
       // Continue with unencrypted text for now
