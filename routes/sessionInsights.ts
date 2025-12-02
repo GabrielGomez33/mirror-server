@@ -94,8 +94,8 @@ const appendTranscriptHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    const { groupId } = req.params;
-    const { sessionId, text, durationSeconds, languageCode }: TranscriptAppend = req.body;
+    const { groupId, sessionId } = req.params;
+    const { text, durationSeconds, languageCode }: TranscriptAppend = req.body;
 
     // Validate required fields
     if (!sessionId || typeof sessionId !== 'string') {
@@ -254,8 +254,8 @@ const requestInsightHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    const { groupId } = req.params;
-    const { sessionId, type, focusAreas }: InsightRequest = req.body;
+    const { groupId, sessionId } = req.params;
+    const { type, focusAreas }: InsightRequest = req.body;
 
     // Validate required fields
     if (!sessionId || typeof sessionId !== 'string') {
