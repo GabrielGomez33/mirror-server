@@ -68,6 +68,10 @@ export interface MessageMetadata {
   formatting?: FormattingInfo;
   replyPreview?: ReplyPreview;
   custom?: Record<string, any>;
+  // Pin-related metadata (populated for pinned messages)
+  pinNote?: string | null;
+  pinnedAt?: Date | null;
+  pinnedBy?: number | null;
 }
 
 export interface MentionInfo {
