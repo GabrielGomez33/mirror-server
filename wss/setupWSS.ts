@@ -56,8 +56,9 @@ export function SetupWebSocket(
       return;
     }
 
-    // Route 2: Group WebSocket (/mirror/groups/ws)
-    if (url.startsWith('/mirror/groups/ws')) {
+    // Route 2: Group WebSocket (/mirror/groups/ws or /mirror/groups/chat)
+    // Support both paths for backward compatibility with frontend
+    if (url.startsWith('/mirror/groups/ws') || url.startsWith('/mirror/groups/chat')) {
       if (!groupNotifications) {
         console.log('Group notifications not available');
         ws.close(1011, 'Service unavailable');
@@ -114,6 +115,100 @@ export function SetupWebSocket(
           groupNotifications.unregisterConnection(decoded.id.toString());
         });
 
+        // Track subscribed groups for this connection
+        const subscribedGroups = new Set<string>();
+
+        // Handle incoming messages
+        ws.on('message', (rawData) => {
+          try {
+            const message = JSON.parse(rawData.toString());
+            console.log(`[WS] Message from user ${decoded.id}:`, message.type);
+
+            switch (message.type) {
+              case 'subscribe':
+                // Subscribe to a group's updates
+                if (message.payload?.groupId) {
+                  subscribedGroups.add(message.payload.groupId);
+                  console.log(`[WS] User ${decoded.id} subscribed to group ${message.payload.groupId}`);
+
+                  // Send acknowledgment
+                  ws.send(JSON.stringify({
+                    type: 'subscribed',
+                    data: {
+                      groupId: message.payload.groupId,
+                      timestamp: new Date().toISOString()
+                    }
+                  }));
+                }
+                break;
+
+              case 'unsubscribe':
+                // Unsubscribe from a group
+                if (message.payload?.groupId) {
+                  subscribedGroups.delete(message.payload.groupId);
+                  console.log(`[WS] User ${decoded.id} unsubscribed from group ${message.payload.groupId}`);
+
+                  ws.send(JSON.stringify({
+                    type: 'unsubscribed',
+                    data: {
+                      groupId: message.payload.groupId,
+                      timestamp: new Date().toISOString()
+                    }
+                  }));
+                }
+                break;
+
+              case 'chat':
+                // Handle chat messages - broadcast to group members
+                if (message.payload?.groupId && message.payload?.content) {
+                  const chatMessage = {
+                    type: 'chat_message',
+                    data: {
+                      groupId: message.payload.groupId,
+                      senderId: decoded.id,
+                      senderUsername: decoded.username,
+                      content: message.payload.content,
+                      timestamp: new Date().toISOString(),
+                      messageId: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+                    }
+                  };
+
+                  console.log(`[WS] Chat message from user ${decoded.id} in group ${message.payload.groupId}`);
+
+                  // For now, echo back to sender as confirmation
+                  // TODO: Broadcast to all group members via groupNotifications
+                  ws.send(JSON.stringify({
+                    type: 'chat_sent',
+                    data: chatMessage.data
+                  }));
+                }
+                break;
+
+              case 'ping':
+                // Respond to keepalive pings
+                ws.send(JSON.stringify({
+                  type: 'pong',
+                  data: {
+                    timestamp: new Date().toISOString()
+                  }
+                }));
+                break;
+
+              default:
+                console.log(`[WS] Unknown message type from user ${decoded.id}: ${message.type}`);
+            }
+          } catch (error) {
+            logError(`Failed to parse WebSocket message from user ${decoded.id}`, error);
+            ws.send(JSON.stringify({
+              type: 'error',
+              data: {
+                message: 'Invalid message format',
+                timestamp: new Date().toISOString()
+              }
+            }));
+          }
+        });
+
         // Send connection confirmation
         try {
           ws.send(JSON.stringify({
@@ -146,7 +241,7 @@ export function SetupWebSocket(
     console.error('WebSocket server error:', error);
   });
 
-  console.log('WebSocket server ready - supports /ws and /mirror/groups/ws');
+  console.log('WebSocket server ready - supports /ws, /mirror/groups/ws, and /mirror/groups/chat');
 }
 
 export function getWebSocketHealth(): {
@@ -159,11 +254,13 @@ export function getWebSocketHealth(): {
       details: {
         timestamp: new Date().toISOString(),
         implementation: 'single_server_manual_routing',
-        paths: ['/ws', '/mirror/groups/ws'],
+        paths: ['/ws', '/mirror/groups/ws', '/mirror/groups/chat'],
         authentication: {
           '/ws': 'Protocol-based (Mirror)',
-          '/mirror/groups/ws': 'JWT required'
-        }
+          '/mirror/groups/ws': 'JWT required',
+          '/mirror/groups/chat': 'JWT required (alias)'
+        },
+        messageTypes: ['subscribe', 'unsubscribe', 'chat', 'ping']
       }
     };
   } catch (error) {
