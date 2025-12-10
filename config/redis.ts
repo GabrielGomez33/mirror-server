@@ -88,6 +88,12 @@ export class MirrorRedisManager extends EventEmitter {
     COMPATIBILITY_MATRIX: 7200,   // 2 hours
     NOTIFICATION_QUEUE: 86400,    // 24 hours
     DRAWING_SESSION: 3600,        // 1 hour
+    // Phase 5: Chat Infrastructure
+    CHAT_MESSAGE: 3600,          // 1 hour
+    CHAT_TYPING: 5,              // 5 seconds
+    CHAT_PRESENCE: 60,           // 1 minute
+    CHAT_UNREAD_COUNT: 30,       // 30 seconds
+    CHAT_RATE_LIMIT: 60,         // 1 minute
   } as const;
 
   constructor() {
