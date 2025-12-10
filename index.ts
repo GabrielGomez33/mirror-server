@@ -44,6 +44,12 @@ import groupVotesRoutes from './routes/groupVotes';
 import sessionInsightsRoutes from './routes/sessionInsights';
 
 // ============================================================================
+// MIRRORGROUPS PHASE 5 (Chat Infrastructure)
+// ============================================================================
+import groupChatRoutes from './routes/groupChat';
+import { chatMessageManager } from './managers/ChatMessageManager';
+
+// ============================================================================
 // MIRRORGROUPS PHASE 3 (Group Analysis System)
 // ============================================================================
 import { groupAnalyzer } from './analyzers/GroupAnalyzer';
@@ -168,6 +174,10 @@ console.log('📍 MirrorGroups Voting routes mounted at /mirror/api/groups/:grou
 APP.use('/mirror/api', sessionInsightsRoutes);
 console.log('📍 MirrorGroups Session Insights routes mounted at /mirror/api/groups/:groupId/sessions');
 
+// Phase 5: Chat Infrastructure
+APP.use('/mirror/api/groups', groupChatRoutes);
+console.log('📍 MirrorGroups Chat routes mounted at /mirror/api/groups/:groupId/chat');
+
 // ============================================================================
 // HEALTH CHECK ENDPOINT
 // ============================================================================
@@ -233,6 +243,25 @@ APP.get('/mirror/api/health', (req, res) => {
           checkInIntervalMs: process.env.AI_CHECKIN_INTERVAL_MS || '1800000',
           voteDefaultDuration: process.env.VOTE_DURATION_SECONDS || '60'
         }
+      },
+      phase5: {
+        name: 'Chat Infrastructure',
+        status: 'active',
+        features: {
+          messaging: 'enabled',
+          encryption: 'e2e',
+          typing: 'enabled',
+          presence: 'enabled',
+          reactions: 'enabled',
+          readReceipts: 'enabled',
+          threading: 'enabled',
+          pinnedMessages: 'enabled',
+          search: 'enabled'
+        },
+        websocket: {
+          path: '/mirror/groups/chat',
+          authentication: 'JWT'
+        }
       }
     },
     endpoints: {
@@ -246,7 +275,9 @@ APP.get('/mirror/api/health', (req, res) => {
       insights: '/mirror/api/groups/:groupId/insights',
       votes: '/mirror/api/groups/:groupId/votes',
       sessions: '/mirror/api/groups/:groupId/sessions/:sessionId',
-      websocket: 'wss://theundergroundrailroad.world:8444/mirror/groups/ws'
+      chat: '/mirror/api/groups/:groupId/chat',
+      websocket: 'wss://theundergroundrailroad.world:8444/mirror/groups/ws',
+      chatWebsocket: 'wss://theundergroundrailroad.world:8444/mirror/groups/chat'
     }
   });
 });
@@ -361,7 +392,26 @@ async function initializeMirrorGroupsInfrastructure(): Promise<void> {
     console.log(`   ⏱️ Periodic Check-ins: Every ${(parseInt(process.env.AI_CHECKIN_INTERVAL_MS || '1800000') / 60000).toFixed(0)} minutes`);
     console.log(`   📊 Post-Session Summaries: Enabled`);
 
-    console.log('\n🎉 MirrorGroups Infrastructure fully initialized (Phase 0 → Phase 4)');
+    // =========================================================================
+    // PHASE 5: Chat Infrastructure
+    // =========================================================================
+    console.log('💬 Phase 5: Initializing Chat Infrastructure...');
+
+    await chatMessageManager.initialize();
+
+    console.log('✅ Phase 5: Chat Infrastructure initialized');
+    console.log(`   📱 Real-time Messaging: Enabled`);
+    console.log(`   🔐 End-to-End Encryption: Enabled`);
+    console.log(`   ⌨️ Typing Indicators: Enabled`);
+    console.log(`   👤 Presence Status: Enabled`);
+    console.log(`   😀 Reactions: Enabled`);
+    console.log(`   ✅ Read Receipts: Enabled`);
+    console.log(`   🧵 Message Threading: Enabled`);
+    console.log(`   📌 Pinned Messages: Enabled`);
+    console.log(`   🔍 Search: Enabled`);
+    console.log(`   🌐 WebSocket: /mirror/groups/chat`);
+
+    console.log('\n🎉 MirrorGroups Infrastructure fully initialized (Phase 0 → Phase 5)');
   } catch (error) {
     logError('Failed to initialize MirrorGroups Infrastructure', error);
     throw error;
@@ -385,7 +435,11 @@ function setupGracefulShutdown(server: https.Server): void {
         console.log('✅ HTTP server closed');
       });
 
-      // Shutdown MirrorGroups components in reverse order (Phase 4 → Phase 0)
+      // Shutdown MirrorGroups components in reverse order (Phase 5 → Phase 0)
+      console.log('💬 Shutting down Chat Infrastructure...');
+      await chatMessageManager.shutdown();
+      console.log('✅ Chat Infrastructure shutdown complete');
+
       console.log('🗳️ Shutting down Conversation Intelligence + Voting...');
       await conversationAnalyzer.shutdown();
       console.log('✅ Conversation Intelligence + Voting shutdown complete');

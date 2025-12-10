@@ -51,7 +51,16 @@ function isValidGroupNotificationType(type: any): type is GroupNotificationType 
     'vote_proposed',
     'vote_completed',
     'conversation_insight',
-    'conversation_summary'
+    'conversation_summary',
+    // Phase 5: Chat Infrastructure
+    'chat_message',
+    'chat_message_edited',
+    'chat_message_deleted',
+    'chat_typing',
+    'chat_presence',
+    'chat_reactions_updated',
+    'chat_message_read',
+    'chat_mention'
   ];
   return typeof type === 'string' && validTypes.includes(type as GroupNotificationType);
 }
@@ -101,7 +110,16 @@ export type GroupNotificationType =
   | 'vote_proposed'
   | 'vote_completed'
   | 'conversation_insight'
-  | 'conversation_summary';
+  | 'conversation_summary'
+  // Phase 5: Chat Infrastructure
+  | 'chat_message'
+  | 'chat_message_edited'
+  | 'chat_message_deleted'
+  | 'chat_typing'
+  | 'chat_presence'
+  | 'chat_reactions_updated'
+  | 'chat_message_read'
+  | 'chat_mention';
 
 // ============================================================================
 // TYPE ALIASES
@@ -202,6 +220,55 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
       title: (data) => `Session Summary Ready`,
       message: (data) => `Your session summary has been generated`,
       priority: 'normal',
+      channels: ['websocket', 'push']
+    },
+    // Phase 5: Chat Infrastructure
+    chat_message: {
+      title: (data) => `New Message in ${data.groupName || 'Group'}`,
+      message: (data) => `${data.senderUsername || 'Someone'} sent a message`,
+      priority: 'immediate',
+      channels: ['websocket', 'push']
+    },
+    chat_message_edited: {
+      title: (data) => `Message Edited`,
+      message: (data) => `A message was edited in ${data.groupName || 'your group'}`,
+      priority: 'low',
+      channels: ['websocket']
+    },
+    chat_message_deleted: {
+      title: (data) => `Message Deleted`,
+      message: (data) => `A message was deleted in ${data.groupName || 'your group'}`,
+      priority: 'low',
+      channels: ['websocket']
+    },
+    chat_typing: {
+      title: (data) => `Typing`,
+      message: (data) => `${data.username || 'Someone'} is typing...`,
+      priority: 'low',
+      channels: ['websocket']
+    },
+    chat_presence: {
+      title: (data) => `Status Update`,
+      message: (data) => `${data.username || 'Someone'} is now ${data.status}`,
+      priority: 'low',
+      channels: ['websocket']
+    },
+    chat_reactions_updated: {
+      title: (data) => `Reactions Updated`,
+      message: (data) => `Reactions changed on a message`,
+      priority: 'low',
+      channels: ['websocket']
+    },
+    chat_message_read: {
+      title: (data) => `Message Read`,
+      message: (data) => `Your message was read`,
+      priority: 'low',
+      channels: ['websocket']
+    },
+    chat_mention: {
+      title: (data) => `You were mentioned`,
+      message: (data) => `${data.senderUsername || 'Someone'} mentioned you in ${data.groupName || 'a group'}`,
+      priority: 'immediate',
       channels: ['websocket', 'push']
     }
   };
