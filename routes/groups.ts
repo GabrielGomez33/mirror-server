@@ -291,10 +291,11 @@ const inviteMemberHandler: RequestHandler = async (req, res) => {
     }
 
     const { groupId } = req.params;
-    const { email } = req.body;
+    const { email, username } = req.body;
 
-    if (!email || typeof email !== 'string') {
-      res.status(400).json({ success: false, error: 'Email is required' });
+    // Accept either email or username
+    if ((!email || typeof email !== 'string') && (!username || typeof username !== 'string')) {
+      res.status(400).json({ success: false, error: 'Email or username is required' });
       return;
     }
 
@@ -316,11 +317,19 @@ const inviteMemberHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    // Find user by email
-    const [userRows] = await DB.query(
-      `SELECT id FROM users WHERE email = ?`,
-      [email]
-    );
+    // Find user by email or username
+    let userRows: any[];
+    if (email) {
+      [userRows] = await DB.query(
+        `SELECT id FROM users WHERE email = ?`,
+        [email]
+      );
+    } else {
+      [userRows] = await DB.query(
+        `SELECT id FROM users WHERE username = ?`,
+        [username]
+      );
+    }
 
     if ((userRows as any[]).length === 0) {
       res.status(404).json({ success: false, error: 'User not found' });
