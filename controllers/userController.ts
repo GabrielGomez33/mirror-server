@@ -118,6 +118,64 @@ export async function fetchUserInfo(email: string): Promise<{ id: number; email:
   };
 }
 
+/**
+ * Search users by username (partial match)
+ * Returns limited user info for privacy
+ */
+export async function searchUsersByUsername(
+  query: string,
+  limit: number = 10,
+  excludeUserId?: number
+): Promise<Array<{ id: number; username: string; }>> {
+  if (!query || query.length < 2) {
+    return [];
+  }
+
+  // Sanitize and prepare search query
+  const searchTerm = `%${query.toLowerCase()}%`;
+
+  let sql = `
+    SELECT id, username
+    FROM users
+    WHERE LOWER(username) LIKE ?
+  `;
+  const params: (string | number)[] = [searchTerm];
+
+  // Exclude the searching user from results
+  if (excludeUserId) {
+    sql += ` AND id != ?`;
+    params.push(excludeUserId);
+  }
+
+  sql += ` ORDER BY username ASC LIMIT ?`;
+  params.push(limit);
+
+  const [rows] = await DB.query(sql, params);
+  const users = rows as any[];
+
+  return users.map(u => ({
+    id: u.id,
+    username: u.username,
+  }));
+}
+
+/**
+ * Get user by ID (limited info for privacy)
+ */
+export async function getUserById(userId: number): Promise<{ id: number; username: string } | null> {
+  const [rows] = await DB.query('SELECT id, username FROM users WHERE id = ?', [userId]);
+  const users = rows as any[];
+
+  if (users.length === 0) {
+    return null;
+  }
+
+  return {
+    id: users[0].id,
+    username: users[0].username,
+  };
+}
+
 // === EXPRESS HANDLERS ===
 
 export const updateUserPasswordHandler: RequestHandler = async (req, res) => {
@@ -171,5 +229,91 @@ export const deleteUserHandler: RequestHandler = async (req, res) => {
   } catch (err) {
     console.error('[User Deletion Error]', err);
     res.status(500).json({ error: 'Failed to delete user' });
+  }
+};
+
+/**
+ * Search users by username
+ * GET /api/users/search?q=<query>&limit=<limit>
+ * Requires authentication
+ */
+export const searchUsersHandler: RequestHandler = async (req, res) => {
+  const { q, limit } = req.query;
+  const currentUserId = (req as any).user?.id;
+
+  if (!q || typeof q !== 'string') {
+    res.status(400).json({
+      success: false,
+      error: 'Search query (q) is required'
+    });
+    return;
+  }
+
+  if (q.length < 2) {
+    res.status(400).json({
+      success: false,
+      error: 'Search query must be at least 2 characters'
+    });
+    return;
+  }
+
+  try {
+    const searchLimit = Math.min(parseInt(limit as string) || 10, 50);
+    const users = await searchUsersByUsername(q, searchLimit, currentUserId);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        users,
+        count: users.length,
+        query: q
+      }
+    });
+  } catch (err) {
+    console.error('[User Search Error]', err);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to search users'
+    });
+  }
+};
+
+/**
+ * Get user by ID (limited info)
+ * GET /api/users/:userId
+ * Requires authentication
+ */
+export const getUserByIdHandler: RequestHandler = async (req, res) => {
+  const { userId } = req.params;
+
+  if (!userId) {
+    res.status(400).json({
+      success: false,
+      error: 'User ID is required'
+    });
+    return;
+  }
+
+  try {
+    const user = await getUserById(parseInt(userId));
+
+    if (!user) {
+      res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      data: { user }
+    });
+  } catch (err) {
+    console.error('[Get User Error]', err);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get user'
+    });
   }
 };
