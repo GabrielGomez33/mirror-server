@@ -1,4 +1,4 @@
-// controllers/userControllers.ts
+// controllers/userController.ts
 
 import bcrypt from 'bcrypt';
 import path from 'path';
@@ -171,5 +171,62 @@ export const deleteUserHandler: RequestHandler = async (req, res) => {
   } catch (err) {
     console.error('[User Deletion Error]', err);
     res.status(500).json({ error: 'Failed to delete user' });
+  }
+};
+
+// === USER SEARCH ===
+
+export async function searchUsers(query: string, limit: number = 10): Promise<{ id: number; username: string }[]> {
+  if (!query || query.length < 2) {
+    return [];
+  }
+
+  const searchPattern = `%${query}%`;
+  const [rows] = await DB.query(
+    `SELECT id, username FROM users
+     WHERE username LIKE ?
+     ORDER BY username ASC
+     LIMIT ?`,
+    [searchPattern, limit]
+  );
+
+  return (rows as any[]).map(row => ({
+    id: row.id,
+    username: row.username
+  }));
+}
+
+export const searchUsersHandler: RequestHandler = async (req, res) => {
+  const user = (req as any).user;
+  if (!user?.id) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
+  const { q, limit } = req.query;
+  const query = String(q || '');
+  const limitNum = Math.min(Math.max(parseInt(String(limit)) || 10, 1), 50);
+
+  if (query.length < 2) {
+    res.status(400).json({
+      success: false,
+      error: 'Query must be at least 2 characters'
+    });
+    return;
+  }
+
+  try {
+    const users = await searchUsers(query, limitNum);
+    res.json({
+      success: true,
+      data: {
+        users,
+        count: users.length,
+        query
+      }
+    });
+  } catch (err) {
+    console.error('[User Search Error]', err);
+    res.status(500).json({ success: false, error: 'Failed to search users' });
   }
 };

@@ -291,17 +291,16 @@ const inviteMemberHandler: RequestHandler = async (req, res) => {
     }
 
     const { groupId } = req.params;
-    const { email } = req.body;
+    const { email, userId, username } = req.body;
 
-    if (!email || typeof email !== 'string') {
-      res.status(400).json({ success: false, error: 'Email is required' });
+    if (!email && !userId && !username) {
+      res.status(400).json({ success: false, error: 'Email, userId, or username is required' });
       return;
     }
 
     // Verify user is owner or admin
     const [memberCheck] = await DB.query(
-      `SELECT role FROM mirror_group_members
-       WHERE group_id = ? AND user_id = ? AND status = 'active'`,
+      `SELECT role FROM mirror_group_members WHERE group_id = ? AND user_id = ? AND status = 'active'`,
       [groupId, user.id]
     );
 
@@ -316,69 +315,84 @@ const inviteMemberHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    // Find user by email
-    const [userRows] = await DB.query(
-      `SELECT id FROM users WHERE email = ?`,
-      [email]
-    );
+    // Find user by userId, username, or email
+    let userRows: any[];
+    if (userId) {
+      const [rows] = await DB.query(`SELECT id FROM users WHERE id = ?`, [userId]);
+      userRows = rows as any[];
+    } else if (username) {
+      const [rows] = await DB.query(`SELECT id FROM users WHERE username = ?`, [username]);
+      userRows = rows as any[];
+    } else {
+      const [rows] = await DB.query(`SELECT id FROM users WHERE email = ?`, [email]);
+      userRows = rows as any[];
+    }
 
-    if ((userRows as any[]).length === 0) {
+    if (userRows.length === 0) {
       res.status(404).json({ success: false, error: 'User not found' });
       return;
     }
 
-    const targetUserId = (userRows as any[])[0].id;
+    const targetUserId = userRows[0].id;
 
-    // Check if already a member
+    // Check existing membership
     const [existingMember] = await DB.query(
-      `SELECT status FROM mirror_group_members
-       WHERE group_id = ? AND user_id = ?`,
+      `SELECT id, status FROM mirror_group_members WHERE group_id = ? AND user_id = ?`,
       [groupId, targetUserId]
     );
 
     if ((existingMember as any[]).length > 0) {
-      const status = (existingMember as any[])[0].status;
-      if (status === 'active') {
+      const member = (existingMember as any[])[0];
+      if (member.status === 'active') {
         res.status(400).json({ success: false, error: 'User is already a member' });
         return;
       }
-      if (status === 'invited') {
+      if (member.status === 'invited') {
         res.status(400).json({ success: false, error: 'User already has a pending invitation' });
         return;
       }
+      // Re-invite removed/left user
+      await DB.query(
+        `UPDATE mirror_group_members SET status = 'invited', invited_by = ?, joined_at = NULL WHERE id = ?`,
+        [user.id, member.id]
+      );
+    } else {
+      const memberId = uuidv4();
+      await DB.query(
+        `INSERT INTO mirror_group_members (id, group_id, user_id, role, status, invited_by) VALUES (?, ?, ?, 'member', 'invited', ?)`,
+        [memberId, groupId, targetUserId, user.id]
+      );
     }
 
-    // Create join request
-    const requestId = uuidv4();
-    await DB.query(
-      `INSERT INTO mirror_group_join_requests (id, group_id, user_id, status, requested_at, processed_by)
-       VALUES (?, ?, ?, 'pending', NOW(), ?)`,
-      [requestId, groupId, targetUserId, user.id]
+    // Handle existing pending request
+    const [existingRequest] = await DB.query(
+      `SELECT id FROM mirror_group_join_requests WHERE group_id = ? AND user_id = ? AND status = 'pending'`,
+      [groupId, targetUserId]
     );
 
-    // Add to members table with 'invited' status
-    const memberId = uuidv4();
-    await DB.query(
-      `INSERT INTO mirror_group_members (id, group_id, user_id, role, status, invited_by)
-       VALUES (?, ?, ?, 'member', 'invited', ?)`,
-      [memberId, groupId, targetUserId, user.id]
-    );
+    let requestId: string;
+    if ((existingRequest as any[]).length > 0) {
+      requestId = (existingRequest as any[])[0].id;
+      await DB.query(
+        `UPDATE mirror_group_join_requests SET processed_by = ?, requested_at = NOW() WHERE id = ?`,
+        [user.id, requestId]
+      );
+    } else {
+      requestId = uuidv4();
+      await DB.query(
+        `INSERT INTO mirror_group_join_requests (id, group_id, user_id, status, requested_at, processed_by) VALUES (?, ?, ?, 'pending', NOW(), ?)`,
+        [requestId, groupId, targetUserId, user.id]
+      );
+    }
 
     console.log(`📨 Invitation sent: ${requestId} to user ${targetUserId}`);
-
-    res.status(201).json({
-      success: true,
-      data: {
-        requestId,
-        memberId
-      },
-      message: 'Invitation sent successfully'
-    });
+    res.status(201).json({ success: true, data: { requestId }, message: 'Invitation sent successfully' });
   } catch (error) {
     console.error('❌ Error inviting member:', error);
     res.status(500).json({ success: false, error: 'Failed to invite member' });
   }
 };
+
 
 /* ============================================================================
    ACCEPT INVITATION (JOIN GROUP)
