@@ -176,17 +176,56 @@ export class GroupEncryptionManager extends EventEmitter {
         key_id: keyId
       };
 
-      // Store member's encrypted copy
-      const memberKeyId = crypto.randomUUID();
-      await DB.query(
-        `INSERT INTO mirror_group_member_keys (
-          id, group_id, user_id, key_version, encrypted_member_key, 
-          key_derivation_metadata, status, distributed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'active', NOW())`,
-        [memberKeyId, groupId, parseInt(userId), keyVersion, encryptedForUser, JSON.stringify(metadata)]
+      const parsedUserId = parseInt(userId);
+
+      // Check if user already has a key for this group/version
+      const [existingKey] = await DB.query(
+        `SELECT id FROM mirror_group_member_keys
+         WHERE group_id = ? AND user_id = ? AND key_version = ?`,
+        [groupId, parsedUserId, keyVersion]
       );
 
-      console.log(`✅ Key distributed to user ${userId}: ${memberKeyId}`);
+      let memberKeyId: string;
+
+      if ((existingKey as any[]).length > 0) {
+        // Update existing key record
+        memberKeyId = (existingKey as any[])[0].id;
+        await DB.query(
+          `UPDATE mirror_group_member_keys
+           SET encrypted_member_key = ?,
+               key_derivation_metadata = ?,
+               status = 'active',
+               distributed_at = NOW()
+           WHERE id = ?`,
+          [encryptedForUser, JSON.stringify(metadata), memberKeyId]
+        );
+        console.log(`✅ Updated existing key for user ${userId}: ${memberKeyId}`);
+      } else {
+        // Insert new key record
+        memberKeyId = crypto.randomUUID();
+        await DB.query(
+          `INSERT INTO mirror_group_member_keys (
+            id, group_id, user_id, key_version, encrypted_member_key,
+            key_derivation_metadata, status, distributed_at
+          ) VALUES (?, ?, ?, ?, ?, ?, 'active', NOW())`,
+          [memberKeyId, groupId, parsedUserId, keyVersion, encryptedForUser, JSON.stringify(metadata)]
+        );
+        console.log(`✅ Created new key for user ${userId}: ${memberKeyId}`);
+      }
+
+      // Verify the key was stored correctly
+      const [verifyKey] = await DB.query(
+        `SELECT id, status FROM mirror_group_member_keys
+         WHERE group_id = ? AND user_id = ? AND status = 'active'
+         ORDER BY key_version DESC LIMIT 1`,
+        [groupId, parsedUserId]
+      );
+
+      if ((verifyKey as any[]).length === 0) {
+        throw new Error(`Key verification failed - no active key found after distribution`);
+      }
+
+      console.log(`✅ Key distribution verified for user ${userId}, keyId: ${(verifyKey as any[])[0].id}`);
       this.emit('key-distributed', { groupId, userId, memberKeyId });
 
       return memberKeyId;

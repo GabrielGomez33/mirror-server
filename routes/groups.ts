@@ -1,13 +1,13 @@
 // ============================================================================
-// MIRRORGROUPS API ROUTES - PRODUCTION READY (PHASE 1 + 2 COMPLETE)
+// MIRRORGROUPS API ROUTES - UPDATED WITH DECLINE & MY-INVITATIONS
 // ============================================================================
 // File: server/routes/groups.ts
 // ----------------------------------------------------------------------------
-// - Secure group management endpoints (create, join, leave, list)
-// - Data sharing endpoints with real Mirror assessment extraction
-// - JWT validation via AuthMiddleware
-// - Strict input sanitization and permission checks
-// - Type-safe with Express 5 + TypeScript 5
+// CHANGES:
+// 1. Added declineInvitationHandler - to decline invitations
+// 2. Added getMyInvitationsHandler - to get user's pending invitations
+// 3. Updated leaveGroupHandler - sends WebSocket notifications
+// 4. Added routes: POST /:groupId/decline, GET /my-invitations
 // ============================================================================
 
 import express, { RequestHandler } from 'express';
@@ -18,6 +18,7 @@ import AuthMiddleware, { SecurityLevel } from '../middleware/authMiddleware';
 import { groupEncryptionManager } from '../systems/GroupEncryptionManager';
 import { publicAssessmentAggregator } from '../managers/PublicAssessmentAggregator';
 import { groupDataExtractor, ShareableDataType } from '../services/GroupDataExtractor';
+import { mirrorGroupNotifications } from '../systems/mirrorGroupNotifications';
 
 const router = express.Router();
 
@@ -40,7 +41,7 @@ function safeJsonParse<T = any>(value: unknown, fallback: T): T {
 const createGroupHandler: RequestHandler = async (req, res) => {
   try {
     const { name, description, goal, goalMetadata } = req.body;
-    const user = (req as any).user; // Set by verifyToken middleware
+    const user = (req as any).user;
     if (!user?.id) {
       res.status(401).json({ success: false, error: 'Unauthorized', code: 'NO_AUTH' });
       return;
@@ -51,7 +52,6 @@ const createGroupHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    // Validate goal if provided
     const validGoals = ['therapy', 'conflict_resolution', 'mutual_understanding', 'team_building', 'personal_growth'];
     if (goal && !validGoals.includes(goal)) {
       res.status(400).json({
@@ -63,7 +63,6 @@ const createGroupHandler: RequestHandler = async (req, res) => {
 
     const groupId = uuidv4();
 
-    // Create group with goal field
     await DB.query(
       `INSERT INTO mirror_groups (
         id, owner_user_id, name, description, goal, goal_metadata, created_at
@@ -73,12 +72,11 @@ const createGroupHandler: RequestHandler = async (req, res) => {
         user.id,
         name.trim(),
         description ?? null,
-        goal ?? 'mutual_understanding', // Default goal
+        goal ?? 'mutual_understanding',
         goalMetadata ? JSON.stringify(goalMetadata) : null
       ]
     );
 
-    // Create owner membership - FIXED: Use ON DUPLICATE KEY UPDATE to handle duplicates
     const memberId = uuidv4();
     await DB.query(
       `INSERT INTO mirror_group_members (id, group_id, user_id, role, status, joined_at)
@@ -90,14 +88,12 @@ const createGroupHandler: RequestHandler = async (req, res) => {
       [memberId, groupId, user.id]
     );
 
-    // Generate encryption key
     try {
       const keyId = await groupEncryptionManager.generateGroupKey(groupId);
       await groupEncryptionManager.distributeKeyToMember(groupId, String(user.id), keyId);
       console.log(`✅ Encryption key generated for group ${groupId} with goal: ${goal || 'mutual_understanding'}`);
     } catch (encError) {
       console.error('❌ Encryption key generation failed:', encError);
-      // Group created but encryption failed - consider cleanup
     }
 
     res.status(201).json({
@@ -207,7 +203,6 @@ const getGroupDetailsHandler: RequestHandler = async (req, res) => {
 
     const { groupId } = req.params;
 
-    // Verify user is a member
     const [memberCheck] = await DB.query(
       `SELECT role FROM mirror_group_members
        WHERE group_id = ? AND user_id = ? AND status = 'active'`,
@@ -219,7 +214,6 @@ const getGroupDetailsHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    // Get group details including goal
     const [groupRows] = await DB.query(
       `SELECT * FROM mirror_groups WHERE id = ? AND status = 'active'`,
       [groupId]
@@ -232,7 +226,6 @@ const getGroupDetailsHandler: RequestHandler = async (req, res) => {
 
     const group = (groupRows as any[])[0];
 
-    // Get all active members
     const [membersRows] = await DB.query(
       `SELECT
         gm.id, gm.user_id, gm.role, gm.status, gm.joined_at,
@@ -318,13 +311,13 @@ const inviteMemberHandler: RequestHandler = async (req, res) => {
     // Find user by userId, username, or email
     let userRows: any[];
     if (userId) {
-      const [rows] = await DB.query(`SELECT id FROM users WHERE id = ?`, [userId]);
+      const [rows] = await DB.query(`SELECT id, username FROM users WHERE id = ?`, [userId]);
       userRows = rows as any[];
     } else if (username) {
-      const [rows] = await DB.query(`SELECT id FROM users WHERE username = ?`, [username]);
+      const [rows] = await DB.query(`SELECT id, username FROM users WHERE username = ?`, [username]);
       userRows = rows as any[];
     } else {
-      const [rows] = await DB.query(`SELECT id FROM users WHERE email = ?`, [email]);
+      const [rows] = await DB.query(`SELECT id, username FROM users WHERE email = ?`, [email]);
       userRows = rows as any[];
     }
 
@@ -335,7 +328,7 @@ const inviteMemberHandler: RequestHandler = async (req, res) => {
 
     const targetUserId = userRows[0].id;
 
-    // Check existing membership
+    // Check existing membership - UPDATED: Also check for 'declined' status to allow re-invite
     const [existingMember] = await DB.query(
       `SELECT id, status FROM mirror_group_members WHERE group_id = ? AND user_id = ?`,
       [groupId, targetUserId]
@@ -351,7 +344,7 @@ const inviteMemberHandler: RequestHandler = async (req, res) => {
         res.status(400).json({ success: false, error: 'User already has a pending invitation' });
         return;
       }
-      // Re-invite removed/left user
+      // Re-invite removed/left/declined user
       await DB.query(
         `UPDATE mirror_group_members SET status = 'invited', invited_by = ?, joined_at = NULL WHERE id = ?`,
         [user.id, member.id]
@@ -384,6 +377,21 @@ const inviteMemberHandler: RequestHandler = async (req, res) => {
         [requestId, groupId, targetUserId, user.id]
       );
     }
+
+    // Get group name and inviter username for notification
+    const [groupInfo] = await DB.query(`SELECT name FROM mirror_groups WHERE id = ?`, [groupId]);
+    const [inviterInfo] = await DB.query(`SELECT username FROM users WHERE id = ?`, [user.id]);
+    const groupName = (groupInfo as any[])[0]?.name || 'Unknown Group';
+    const inviterName = (inviterInfo as any[])[0]?.username || 'Someone';
+
+    // Send WebSocket notification to invitee
+    await mirrorGroupNotifications.notifyGroupInvite({
+      inviteeUserId: String(targetUserId),
+      inviterName: inviterName,
+      groupId: groupId,
+      groupName: groupName,
+      inviteCode: requestId
+    });
 
     console.log(`📨 Invitation sent: ${requestId} to user ${targetUserId}`);
     res.status(201).json({ success: true, data: { requestId }, message: 'Invitation sent successfully' });
@@ -444,7 +452,6 @@ const acceptInvitationHandler: RequestHandler = async (req, res) => {
 
     // Distribute encryption key
     try {
-      // Get active group key
       const [keyRows] = await DB.query(
         `SELECT id, key_version FROM mirror_group_encryption_keys
          WHERE group_id = ? AND status = 'active'
@@ -469,6 +476,30 @@ const acceptInvitationHandler: RequestHandler = async (req, res) => {
       [groupId]
     );
 
+    // Get group members and new member info for notification
+    const [groupInfo] = await DB.query(`SELECT name FROM mirror_groups WHERE id = ?`, [groupId]);
+    const [userInfo] = await DB.query(`SELECT username, email FROM users WHERE id = ?`, [user.id]);
+    const [membersRows] = await DB.query(
+      `SELECT gm.user_id as userId, u.username as userName, u.email, gm.role
+       FROM mirror_group_members gm
+       JOIN users u ON gm.user_id = u.id
+       WHERE gm.group_id = ? AND gm.status = 'active'`,
+      [groupId]
+    );
+
+    const groupName = (groupInfo as any[])[0]?.name || 'Unknown Group';
+    const newMemberInfo = {
+      userId: String(user.id),
+      userName: (userInfo as any[])[0]?.username || 'Unknown'
+    };
+
+    // Notify all members that a new member joined
+    await mirrorGroupNotifications.notifyMemberJoined(
+      membersRows as any[],
+      newMemberInfo,
+      groupName
+    );
+
     console.log(`✅ User ${user.id} joined group ${groupId}`);
 
     res.json({
@@ -482,7 +513,113 @@ const acceptInvitationHandler: RequestHandler = async (req, res) => {
 };
 
 /* ============================================================================
-   LEAVE GROUP
+   DECLINE INVITATION
+============================================================================ */
+
+const declineInvitationHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    if (!user?.id) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const { groupId } = req.params;
+    const { requestId } = req.body;
+
+    if (!requestId) {
+      res.status(400).json({ success: false, error: 'requestId is required' });
+      return;
+    }
+
+    console.log(`🚫 User ${user.id} declining invitation ${requestId} for group ${groupId}`);
+
+    // Verify invitation exists and belongs to this user
+    const [requestRows] = await DB.query(
+      `SELECT * FROM mirror_group_join_requests
+       WHERE id = ? AND group_id = ? AND user_id = ? AND status = 'pending'`,
+      [requestId, groupId, user.id]
+    );
+
+    if ((requestRows as any[]).length === 0) {
+      res.status(404).json({ success: false, error: 'Invalid or expired invitation' });
+      return;
+    }
+
+    // DELETE the join request instead of updating
+    await DB.query(
+      `DELETE FROM mirror_group_join_requests WHERE id = ?`,
+      [requestId]
+    );
+
+    // DELETE the member record (allows fresh re-invite later)
+    await DB.query(
+      `DELETE FROM mirror_group_members
+       WHERE group_id = ? AND user_id = ? AND status = 'invited'`,
+      [groupId, user.id]
+    );
+
+    console.log(`✅ User ${user.id} declined invitation to group ${groupId}`);
+
+    res.json({
+      success: true,
+      message: 'Invitation declined successfully'
+    });
+  } catch (error) {
+    console.error('❌ Error declining invitation:', error);
+    res.status(500).json({ success: false, error: 'Failed to decline invitation' });
+  }
+};
+
+/* ============================================================================
+   NEW: GET MY INVITATIONS
+============================================================================ */
+
+const getMyInvitationsHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    if (!user?.id) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    console.log(`📨 Fetching pending invitations for user ${user.id}`);
+
+    // Get all pending invitations for this user
+    const [invitations] = await DB.query(
+      `SELECT
+        jr.id as request_id,
+        jr.group_id,
+        g.name as group_name,
+        g.description as group_description,
+        u.username as inviter_username,
+        jr.processed_by as inviter_id,
+        jr.requested_at,
+        jr.status
+       FROM mirror_group_join_requests jr
+       JOIN mirror_groups g ON jr.group_id = g.id
+       LEFT JOIN users u ON jr.processed_by = u.id
+       WHERE jr.user_id = ? AND jr.status = 'pending'
+       ORDER BY jr.requested_at DESC`,
+      [user.id]
+    );
+
+    console.log(`✅ Found ${(invitations as any[]).length} pending invitations for user ${user.id}`);
+
+    res.json({
+      success: true,
+      data: {
+        invitations: invitations
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error fetching invitations:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch invitations' });
+  }
+};
+
+/* ============================================================================
+   LEAVE GROUP - UPDATED WITH NOTIFICATIONS
 ============================================================================ */
 
 const leaveGroupHandler: RequestHandler = async (req, res) => {
@@ -497,7 +634,7 @@ const leaveGroupHandler: RequestHandler = async (req, res) => {
 
     // Check if user is owner
     const [groupRows] = await DB.query(
-      `SELECT owner_user_id FROM mirror_groups WHERE id = ?`,
+      `SELECT owner_user_id, name FROM mirror_groups WHERE id = ?`,
       [groupId]
     );
 
@@ -506,13 +643,28 @@ const leaveGroupHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    if ((groupRows as any[])[0].owner_user_id === user.id) {
+    const group = (groupRows as any[])[0];
+
+    if (group.owner_user_id === user.id) {
       res.status(400).json({
         success: false,
         error: 'Owner cannot leave group. Delete the group or transfer ownership first.'
       });
       return;
     }
+
+    // Get user info for notification
+    const [userInfo] = await DB.query(`SELECT username FROM users WHERE id = ?`, [user.id]);
+    const userName = (userInfo as any[])[0]?.username || 'Unknown';
+
+    // Get remaining members for notification (before removing this user)
+    const [membersRows] = await DB.query(
+      `SELECT gm.user_id as userId, u.username as userName, u.email, gm.role
+       FROM mirror_group_members gm
+       JOIN users u ON gm.user_id = u.id
+       WHERE gm.group_id = ? AND gm.status = 'active' AND gm.user_id != ?`,
+      [groupId, user.id]
+    );
 
     // Update member status to 'left'
     await DB.query(
@@ -538,6 +690,13 @@ const leaveGroupHandler: RequestHandler = async (req, res) => {
       [groupId]
     );
 
+    // Send WebSocket notification to remaining members
+    await mirrorGroupNotifications.notifyMemberLeft(
+      membersRows as any[],
+      { userId: String(user.id), userName: userName },
+      group.name
+    );
+
     console.log(`👋 User ${user.id} left group ${groupId}`);
 
     res.json({
@@ -551,7 +710,7 @@ const leaveGroupHandler: RequestHandler = async (req, res) => {
 };
 
 /* ============================================================================
-   SHARE DATA TO GROUP (PHASE 2 COMPLETE) - ENHANCED WITH MULTIPLE DATA TYPES
+   SHARE DATA TO GROUP (PHASE 2 COMPLETE)
 ============================================================================ */
 
 const shareDataHandler: RequestHandler = async (req, res) => {
@@ -564,17 +723,15 @@ const shareDataHandler: RequestHandler = async (req, res) => {
 
     const { groupId } = req.params;
     const {
-      dataTypes,  // NEW: Support array of data types
-      dataType,   // LEGACY: Support single data type for backward compatibility
+      dataTypes,
+      dataType,
       consentText = 'I consent to share my assessment data with this group'
     } = req.body;
 
-    // Handle both single dataType and multiple dataTypes
     const typesToShare: ShareableDataType[] = Array.isArray(dataTypes)
       ? dataTypes
       : (dataType ? [dataType] : ['full_profile']);
 
-    // Validate data types
     const validDataTypes: ShareableDataType[] = [
       'personality', 'cognitive', 'facial', 'voice', 'astrological', 'full_profile'
     ];
@@ -590,7 +747,6 @@ const shareDataHandler: RequestHandler = async (req, res) => {
 
     console.log(`📤 User ${user.id} sharing data with group ${groupId}: ${typesToShare.join(', ')}`);
 
-    // 1. Verify user is an active member
     const [memberCheck] = await DB.query(
       `SELECT role, status FROM mirror_group_members
        WHERE group_id = ? AND user_id = ? AND status = 'active'`,
@@ -605,7 +761,6 @@ const shareDataHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    // 2. Get the active group encryption key
     const [keyRows] = await DB.query(
       `SELECT id, key_version FROM mirror_group_encryption_keys
        WHERE group_id = ? AND status = 'active'
@@ -624,7 +779,6 @@ const shareDataHandler: RequestHandler = async (req, res) => {
     const keyId = (keyRows as any[])[0].id;
     const keyVersion = (keyRows as any[])[0].key_version;
 
-    // 3. Extract Mirror assessment data using GroupDataExtractor
     const extractionResult = await groupDataExtractor.extractData({
       userId: user.id,
       dataTypes: typesToShare as ShareableDataType[]
@@ -633,18 +787,16 @@ const shareDataHandler: RequestHandler = async (req, res) => {
     if (!extractionResult.success || !extractionResult.data || extractionResult.data.length === 0) {
       res.status(400).json({
         success: false,
-        error: extractionResult.error || 'No assessment data available to share. Please complete your Mirror assessments first.'
+        error: extractionResult.error || 'No assessment data available to share.'
       });
       return;
     }
 
-    // 4. Process each data type
     const shareResults: any[] = [];
     const shareErrors: any[] = [];
 
     for (const extractedData of extractionResult.data) {
       try {
-        // Check if user already shared this data type
         const [existingShare] = await DB.query(
           `SELECT id, shared_at FROM mirror_group_shared_data
            WHERE group_id = ? AND user_id = ? AND data_type = ?
@@ -654,17 +806,14 @@ const shareDataHandler: RequestHandler = async (req, res) => {
 
         const alreadyShared = (existingShare as any[]).length > 0;
 
-        // Encrypt data for the group
         const dataBuffer = Buffer.from(JSON.stringify(extractedData.data));
         const encryptedPackage = await groupEncryptionManager.encryptForGroup(dataBuffer, keyId);
 
-        // Generate consent signature
         const consentSignature = crypto
           .createHash('sha256')
           .update(`${user.id}-${groupId}-${extractedData.dataType}-${consentText}-${Date.now()}`)
           .digest('hex');
 
-        // Prepare encryption metadata JSON
         const encryptionMetadata = {
           keyId,
           keyVersion,
@@ -672,45 +821,23 @@ const shareDataHandler: RequestHandler = async (req, res) => {
           encryptedAt: new Date().toISOString()
         };
 
-        // Store or update
         if (alreadyShared) {
-          // Update existing share
           await DB.query(
             `UPDATE mirror_group_shared_data
-             SET encrypted_data = ?,
-                 encryption_metadata = ?,
-                 consent_signature = ?,
-                 data_version = ?,
-                 shared_at = NOW()
+             SET encrypted_data = ?, encryption_metadata = ?, consent_signature = ?,
+                 data_version = ?, shared_at = NOW()
              WHERE group_id = ? AND user_id = ? AND data_type = ?`,
-            [
-              encryptedPackage.encrypted,
-              JSON.stringify(encryptionMetadata),
-              consentSignature,
-              extractedData.dataVersion,
-              groupId,
-              user.id,
-              extractedData.dataType
-            ]
+            [encryptedPackage.encrypted, JSON.stringify(encryptionMetadata),
+             consentSignature, extractedData.dataVersion, groupId, user.id, extractedData.dataType]
           );
-          console.log(`📝 Updated ${extractedData.dataType} share for user ${user.id}`);
         } else {
-          // Create new share
           await DB.query(
             `INSERT INTO mirror_group_shared_data
              (group_id, user_id, data_type, encrypted_data, encryption_metadata, consent_signature, data_version)
              VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [
-              groupId,
-              user.id,
-              extractedData.dataType,
-              encryptedPackage.encrypted,
-              JSON.stringify(encryptionMetadata),
-              consentSignature,
-              extractedData.dataVersion
-            ]
+            [groupId, user.id, extractedData.dataType, encryptedPackage.encrypted,
+             JSON.stringify(encryptionMetadata), consentSignature, extractedData.dataVersion]
           );
-          console.log(`✅ New ${extractedData.dataType} share created for user ${user.id}`);
         }
 
         shareResults.push({
@@ -721,41 +848,23 @@ const shareDataHandler: RequestHandler = async (req, res) => {
 
       } catch (error) {
         console.error(`❌ Error sharing ${extractedData.dataType}:`, error);
-        shareErrors.push({
-          dataType: extractedData.dataType,
-          error: (error as Error).message
-        });
+        shareErrors.push({ dataType: extractedData.dataType, error: (error as Error).message });
       }
     }
 
-    // 5. Trigger group analysis queue
     try {
       const analysisJobId = uuidv4();
       await DB.query(
         `INSERT INTO mirror_group_analysis_queue
          (id, group_id, analysis_type, priority, status, trigger_event, parameters, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, NOW())`,
-        [
-          analysisJobId,
-          groupId,
-          'data_update',
-          7, // Higher priority for new data
-          'pending',
-          'new_data_share',
-          JSON.stringify({
-            userId: user.id,
-            dataTypes: typesToShare,
-            timestamp: new Date().toISOString()
-          })
-        ]
+        [analysisJobId, groupId, 'data_update', 7, 'pending', 'new_data_share',
+         JSON.stringify({ userId: user.id, dataTypes: typesToShare, timestamp: new Date().toISOString() })]
       );
-      console.log(`📊 Analysis queued: ${analysisJobId} for group ${groupId}`);
     } catch (queueError) {
       console.error('❌ Failed to queue analysis:', queueError);
-      // Non-fatal - don't block the response
     }
 
-    // 6. Response
     res.json({
       success: true,
       message: `Successfully shared ${shareResults.length} data type(s) with group`,
@@ -766,11 +875,7 @@ const shareDataHandler: RequestHandler = async (req, res) => {
 
   } catch (error) {
     console.error('❌ Error sharing data with group:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to share data with group',
-      details: (error as Error).message
-    });
+    res.status(500).json({ success: false, error: 'Failed to share data with group' });
   }
 };
 
@@ -788,7 +893,6 @@ const getSharedDataHandler: RequestHandler = async (req, res) => {
 
     const { groupId } = req.params;
 
-    // 1. Verify user is a member
     const [memberCheck] = await DB.query(
       `SELECT role FROM mirror_group_members
        WHERE group_id = ? AND user_id = ? AND status = 'active'`,
@@ -796,27 +900,13 @@ const getSharedDataHandler: RequestHandler = async (req, res) => {
     );
 
     if ((memberCheck as any[]).length === 0) {
-      res.status(403).json({
-        success: false,
-        error: 'Not a member of this group'
-      });
+      res.status(403).json({ success: false, error: 'Not a member of this group' });
       return;
     }
 
-    // 2. Get all shared data
     const [sharedData] = await DB.query(
-      `SELECT
-        sd.id,
-        sd.user_id,
-        sd.data_type,
-        sd.encrypted_data,
-        sd.encryption_metadata,
-        sd.shared_at,
-        sd.consent_signature,
-        sd.data_version,
-        u.username,
-        u.email,
-        gm.role as member_role
+      `SELECT sd.id, sd.user_id, sd.data_type, sd.encrypted_data, sd.encryption_metadata,
+              sd.shared_at, sd.consent_signature, sd.data_version, u.username, u.email, gm.role as member_role
        FROM mirror_group_shared_data sd
        JOIN users u ON u.id = sd.user_id
        JOIN mirror_group_members gm ON gm.user_id = sd.user_id AND gm.group_id = sd.group_id
@@ -825,88 +915,57 @@ const getSharedDataHandler: RequestHandler = async (req, res) => {
       [groupId]
     );
 
-    // 3. Decrypt data for the requesting user
     const decryptedShares = await Promise.all(
       (sharedData as any[]).map(async (share) => {
         try {
-          // Decrypt the data
           const decryptedResult = await groupEncryptionManager.decryptForUser(
-            share.encrypted_data,
-            String(user.id),
-            groupId
+            share.encrypted_data, String(user.id), groupId
           );
-
-          // Parse the decrypted data
-          const decryptedString = decryptedResult.data.toString('utf-8');
-          const decryptedData = JSON.parse(decryptedString);
-
-          // Parse encryption metadata
+          const decryptedData = JSON.parse(decryptedResult.data.toString('utf-8'));
           const encryptionMeta = typeof share.encryption_metadata === 'string'
-            ? JSON.parse(share.encryption_metadata)
-            : share.encryption_metadata;
+            ? JSON.parse(share.encryption_metadata) : share.encryption_metadata;
 
           return {
-            id: share.id,
-            userId: share.user_id,
-            username: share.username,
-            memberRole: share.member_role,
-            dataType: share.data_type,
-            data: decryptedData,
-            sharedAt: share.shared_at,
-            dataVersion: share.data_version,
-            encryptionInfo: {
-              keyVersion: encryptionMeta.keyVersion,
-              algorithm: encryptionMeta.algorithm
-            }
+            id: share.id, userId: share.user_id, username: share.username,
+            memberRole: share.member_role, dataType: share.data_type, data: decryptedData,
+            sharedAt: share.shared_at, dataVersion: share.data_version,
+            encryptionInfo: { keyVersion: encryptionMeta.keyVersion, algorithm: encryptionMeta.algorithm }
           };
         } catch (error) {
-          console.error(`Failed to decrypt share ${share.id}:`, error);
           return {
-            id: share.id,
-            userId: share.user_id,
-            username: share.username,
-            memberRole: share.member_role,
-            dataType: share.data_type,
-            data: null,
-            error: 'Unable to decrypt',
-            sharedAt: share.shared_at
+            id: share.id, userId: share.user_id, username: share.username,
+            memberRole: share.member_role, dataType: share.data_type, data: null,
+            error: 'Unable to decrypt', sharedAt: share.shared_at
           };
         }
       })
     );
-
-    // 4. Group shares by data type
-    const sharesByType = {
-      personality: decryptedShares.filter(s => s.dataType === 'personality'),
-      cognitive: decryptedShares.filter(s => s.dataType === 'cognitive'),
-      facial: decryptedShares.filter(s => s.dataType === 'facial'),
-      astrological: decryptedShares.filter(s => s.dataType === 'astrological'),
-      voice: decryptedShares.filter(s => s.dataType === 'voice'),
-      full_profile: decryptedShares.filter(s => s.dataType === 'full_profile')
-    };
 
     res.json({
       success: true,
       data: {
         groupId,
         totalShares: decryptedShares.length,
-        sharesByType,
+        sharesByType: {
+          personality: decryptedShares.filter(s => s.dataType === 'personality'),
+          cognitive: decryptedShares.filter(s => s.dataType === 'cognitive'),
+          facial: decryptedShares.filter(s => s.dataType === 'facial'),
+          astrological: decryptedShares.filter(s => s.dataType === 'astrological'),
+          voice: decryptedShares.filter(s => s.dataType === 'voice'),
+          full_profile: decryptedShares.filter(s => s.dataType === 'full_profile')
+        },
         allShares: decryptedShares
       }
     });
 
   } catch (error) {
     console.error('❌ Error retrieving shared data:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to retrieve shared data',
-      details: (error as Error).message
-    });
+    res.status(500).json({ success: false, error: 'Failed to retrieve shared data' });
   }
 };
 
 /* ============================================================================
-   GET DATA SUMMARY - NEW: Check what data user can share
+   GET DATA SUMMARY
 ============================================================================ */
 
 const getDataSummaryHandler: RequestHandler = async (req, res) => {
@@ -930,11 +989,7 @@ const getDataSummaryHandler: RequestHandler = async (req, res) => {
     });
   } catch (error) {
     console.error('❌ Error getting data summary:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to get data summary',
-      details: (error as Error).message
-    });
+    res.status(500).json({ success: false, error: 'Failed to get data summary' });
   }
 };
 
@@ -942,22 +997,23 @@ const getDataSummaryHandler: RequestHandler = async (req, res) => {
    ROUTE REGISTRATION
 ============================================================================ */
 
-// Cast or wrap async middlewares so Express 5 typing passes cleanly:
 const verified = AuthMiddleware.verifyToken as unknown as RequestHandler;
 const basicSecurity = AuthMiddleware.requireSecurityLevel(SecurityLevel.BASIC) as unknown as RequestHandler;
 
 // Phase 1 routes
 router.post('/create', verified, createGroupHandler);
 router.get('/list', verified, listGroupsHandler);
+router.get('/my-invitations', verified, getMyInvitationsHandler);  // Get pending invitations
 router.get('/:groupId', verified, getGroupDetailsHandler);
 router.post('/:groupId/invite', verified, inviteMemberHandler);
 router.post('/:groupId/accept', verified, acceptInvitationHandler);
+router.post('/:groupId/decline', verified, declineInvitationHandler);  // Decline invitation
 router.post('/:groupId/leave', verified, leaveGroupHandler);
 router.post('/join', verified, joinGroupHandler);
 
-// Phase 2 routes - ENHANCED
+// Phase 2 routes
 router.post('/:groupId/share-data', verified, basicSecurity, shareDataHandler);
 router.get('/:groupId/shared-data', verified, getSharedDataHandler);
-router.get('/data-summary', verified, getDataSummaryHandler); // NEW: Check available data
+router.get('/data-summary', verified, getDataSummaryHandler);
 
 export default router;
