@@ -442,11 +442,9 @@ const acceptInvitationHandler: RequestHandler = async (req, res) => {
       [groupId, user.id]
     );
 
-    // Update join request
+    // DELETE the join request instead of updating (avoids unique constraint violation)
     await DB.query(
-      `UPDATE mirror_group_join_requests
-       SET status = 'approved', processed_at = NOW()
-       WHERE id = ?`,
+      `DELETE FROM mirror_group_join_requests WHERE id = ?`,
       [requestId]
     );
 
@@ -1003,11 +1001,11 @@ const basicSecurity = AuthMiddleware.requireSecurityLevel(SecurityLevel.BASIC) a
 // Phase 1 routes
 router.post('/create', verified, createGroupHandler);
 router.get('/list', verified, listGroupsHandler);
-router.get('/my-invitations', verified, getMyInvitationsHandler);  // Get pending invitations
+router.get('/my-invitations', verified, getMyInvitationsHandler);
 router.get('/:groupId', verified, getGroupDetailsHandler);
 router.post('/:groupId/invite', verified, inviteMemberHandler);
 router.post('/:groupId/accept', verified, acceptInvitationHandler);
-router.post('/:groupId/decline', verified, declineInvitationHandler);  // Decline invitation
+router.post('/:groupId/decline', verified, declineInvitationHandler);
 router.post('/:groupId/leave', verified, leaveGroupHandler);
 router.post('/join', verified, joinGroupHandler);
 

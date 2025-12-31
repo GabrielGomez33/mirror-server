@@ -347,13 +347,13 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
     }
   }
 
-  // ✅ Type guard for notification queue items  
+  // ✅ Type guard for notification queue items
   private isValidNotificationQueueItem(item: any): item is NotificationQueue & { type: GroupNotificationType } {
     return (
       typeof item === 'object' &&
       item !== null &&
       typeof item.id === 'string' &&
-      typeof item.userId === 'string' &&
+      (typeof item.userId === 'string' || typeof item.userId === 'number') && // Accept both string and number
       isValidGroupNotificationType(item.type) &&
       typeof item.content === 'object' &&
       typeof item.priority === 'string' &&
@@ -680,8 +680,9 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
   private async deliverNotification(queueItem: NotificationQueue & { type: GroupNotificationType }): Promise<boolean> {
     try {
       // ✅ TypeScript now knows queueItem.type is GroupNotificationType
+      // Ensure userId is a string (may come from DB as number)
       const notification: NotificationDelivery = {
-        userId: queueItem.userId,
+        userId: String(queueItem.userId),
         type: queueItem.type, // ✅ Now properly typed as GroupNotificationType
         content: queueItem.content,
         priority: queueItem.priority,
