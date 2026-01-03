@@ -216,8 +216,8 @@ export class GroupSignalingManager {
 
     // Verify user is a member of this group
     const [memberRows] = await DB.query(
-      `SELECT role FROM mirror_group_members 
-       WHERE group_id = ? AND user_id = ? AND is_active = TRUE`,
+      `SELECT role FROM mirror_group_members
+       WHERE group_id = ? AND user_id = ? AND status = 'active'`,
       [groupId, userId]
     );
 
