@@ -16,6 +16,22 @@ import { chatController, AuthenticatedRequest } from '../controllers/chatControl
 const router = express.Router();
 
 // ============================================================================
+// BROADCAST FUNCTION (set by index.ts for WebSocket integration)
+// ============================================================================
+
+// Broadcast function for real-time updates
+let broadcastFn: ((groupId: string, payload: any) => void) | null = null;
+
+export function setBroadcastFunction(fn: (groupId: string, payload: any) => void): void {
+  broadcastFn = fn;
+  console.log('[GroupChat] ✅ WebSocket broadcast function configured');
+}
+
+export function getBroadcastFunction(): ((groupId: string, payload: any) => void) | null {
+  return broadcastFn;
+}
+
+// ============================================================================
 // MIDDLEWARE SETUP
 // ============================================================================
 
@@ -305,4 +321,3 @@ router.get('/:groupId/chat/search', verified, (async (req, res) => {
 // ============================================================================
 
 export default router;
-
