@@ -22,6 +22,7 @@ export type ShareableDataType =
   | 'facial'         // Facial analysis, emotional spectrum
   | 'voice'          // Voice patterns, communication style
   | 'astrological'   // Sun/moon signs, astrology data
+  | 'profile'        // Contact info (email, phone, birthdate, location)
   | 'full_profile';  // Everything combined
 
 /**
@@ -61,17 +62,6 @@ export interface ExtractionOptions {
 export class GroupDataExtractor {
   /**
    * Extract shareable data from user's Mirror assessments
-   *
-   * @param options - Extraction options including userId and data types
-   * @returns ExtractionResult with success status and data
-   *
-   * @example
-   * ```typescript
-   * const result = await extractor.extractData({
-   *   userId: 48,
-   *   dataTypes: ['personality', 'cognitive']
-   * });
-   * ```
    */
   async extractData(options: ExtractionOptions): Promise<ExtractionResult> {
     try {
@@ -136,14 +126,6 @@ export class GroupDataExtractor {
 
   /**
    * Extract a specific data type from the full profile
-   *
-   * @param userId - User ID
-   * @param dataType - Type of data to extract
-   * @param fullProfile - Complete user profile from aggregator
-   * @param timestamp - Timestamp for the extraction
-   * @returns ShareableData object
-   *
-   * @private
    */
   private extractDataType(
     userId: number,
@@ -194,18 +176,6 @@ export class GroupDataExtractor {
 
   /**
    * Validate that a user has required data types before sharing
-   *
-   * @param userId - User ID to check
-   * @param requiredTypes - Data types that must be present
-   * @returns Object with validation result and missing types
-   *
-   * @example
-   * ```typescript
-   * const validation = await extractor.validateUserData(48, ['personality', 'cognitive']);
-   * if (!validation.valid) {
-   *   console.log('Missing:', validation.missingTypes);
-   * }
-   * ```
    */
   async validateUserData(
     userId: number,
@@ -247,12 +217,6 @@ export class GroupDataExtractor {
 
   /**
    * Check if profile has data for a specific type
-   *
-   * @param profile - User profile
-   * @param dataType - Data type to check
-   * @returns true if data exists
-   *
-   * @private
    */
   private hasDataForType(profile: any, dataType: ShareableDataType): boolean {
     switch (dataType) {
@@ -281,16 +245,6 @@ export class GroupDataExtractor {
 
   /**
    * Get a summary of available data types for a user
-   *
-   * @param userId - User ID to check
-   * @returns Object with available and unavailable data types
-   *
-   * @example
-   * ```typescript
-   * const summary = await extractor.getDataSummary(48);
-   * console.log('Available:', summary.available);
-   * console.log('Unavailable:', summary.unavailable);
-   * ```
    */
   async getDataSummary(userId: number): Promise<{
     success: boolean;

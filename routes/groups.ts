@@ -730,9 +730,10 @@ const shareDataHandler: RequestHandler = async (req, res) => {
       ? dataTypes
       : (dataType ? [dataType] : ['full_profile']);
 
-    const validDataTypes: ShareableDataType[] = [
-      'personality', 'cognitive', 'facial', 'voice', 'astrological', 'full_profile'
+        const validDataTypes: ShareableDataType[] = [
+      'personality', 'cognitive', 'facial', 'voice', 'astrological', 'profile', 'full_profile'
     ];
+
 
     const invalidTypes = typesToShare.filter(t => !validDataTypes.includes(t as ShareableDataType));
     if (invalidTypes.length > 0) {

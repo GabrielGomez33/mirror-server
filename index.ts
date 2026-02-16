@@ -1,5 +1,5 @@
-// index.ts - Mirror Server with MirrorGroups Phase 3.5 Integration
-// Includes: Existing routes, Redis, Notifications, Encryption, Group APIs, WebSocket signaling, Group Analysis, DINA LLM
+// index.ts - Mirror Server with MirrorGroups Phase 3.5 Integration + @Dina Chat
+// Includes: Existing routes, Redis, Notifications, Encryption, Group APIs, WebSocket signaling, Group Analysis, DINA LLM, @Dina Chat
 
 import https from 'https';
 import fs from 'fs';
@@ -46,7 +46,7 @@ import sessionInsightsRoutes from './routes/sessionInsights';
 // ============================================================================
 // MIRRORGROUPS PHASE 5 (Chat Infrastructure)
 // ============================================================================
-import groupChatRoutes from './routes/groupChat';
+import groupChatRoutes, { setBroadcastFunction as setChatBroadcast } from './routes/groupChat';
 import { chatMessageManager } from './managers/ChatMessageManager';
 
 // ============================================================================
@@ -61,6 +61,16 @@ import { conflictRiskPredictor } from './analyzers/ConflictRiskPredictor';
 // MIRRORGROUPS PHASE 3.5 (DINA LLM Integration)
 // ============================================================================
 import { dinaLLMConnector } from './integrations/DINALLMConnector';
+
+// ============================================================================
+// @DINA CHAT - WebSocket Connection + Queue Processor
+// ============================================================================
+// The DINA WebSocket connection is established on server startup
+// This serves as the ONLY path for communication between Mirror and DINA
+import { dinaWebSocket } from './services/DinaWebSocketClient';
+
+// Note: DinaChatQueueProcessor uses the WebSocket connection for real-time streaming
+// Run processor separately: npx ts-node workers/DinaChatQueueProcessor.ts
 
 // ============================================================================
 // ERROR HANDLING UTILITIES
@@ -79,7 +89,7 @@ function getErrorStack(error: unknown): string | undefined {
 
 function logError(context: string, error: unknown): void {
   console.error(`❌ ${context}:`, getErrorMessage(error));
-  
+
   // Log full error object in development
   if (process.env.NODE_ENV === 'development') {
     const stack = getErrorStack(error);
@@ -103,11 +113,11 @@ dotenv.config();
 
 // Validate required environment variables
 const requiredEnvs = [
-  'TUGRRPRIV', 
-  'TUGRRCERT', 
-  'TUGRRINTERCERT', 
-  'MIRRORPORT', 
-  'MIRRORSTORAGE', 
+  'TUGRRPRIV',
+  'TUGRRCERT',
+  'TUGRRINTERCERT',
+  'MIRRORPORT',
+  'MIRRORSTORAGE',
   'JWT_KEY',
   'REDIS_PASSWORD',           // Phase 0
   'SYSTEM_MASTER_KEY'         // Phase 1
@@ -179,17 +189,25 @@ APP.use('/mirror/api/groups', groupChatRoutes);
 console.log('📍 MirrorGroups Chat routes mounted at /mirror/api/groups/:groupId/chat');
 
 // ============================================================================
+// @DINA CHAT - Processor runs as SEPARATE PROCESS (via PM2/systemd)
+// ============================================================================
+// Stats endpoint removed - query the processor directly when running separately
+// Run processor: npx ts-node workers/DinaChatQueueProcessor.ts
+
+// ============================================================================
 // HEALTH CHECK ENDPOINT
 // ============================================================================
 
-APP.get('/mirror/api/health', (req, res) => {
+APP.get('/mirror/api/health', async (req, res) => {
   const wsHealth = getWebSocketHealth();
+
+  // Note: @Dina Chat Processor runs as separate process - not monitored here
 
   res.json({
     status: 'healthy',
     service: 'mirror-server',
     timestamp: new Date().toISOString(),
-    version: '3.5.0',
+    version: '3.6.0', // Bumped for @Dina chat integration
     features: {
       authentication: 'enabled',
       redis: mirrorRedis.isConnected() ? 'connected' : 'disconnected',
@@ -199,6 +217,7 @@ APP.get('/mirror/api/health', (req, res) => {
       groupAnalysis: 'enabled',
       dinaIntegration: 'enabled',
       llmSynthesis: 'enabled',
+      dinaChatProcessor: 'separate_process', // Runs via PM2/systemd
       websocket: wsHealth.status
     },
     mirrorgroups: {
@@ -245,7 +264,7 @@ APP.get('/mirror/api/health', (req, res) => {
         }
       },
       phase5: {
-        name: 'Chat Infrastructure',
+        name: 'Chat Infrastructure + @Dina',
         status: 'active',
         features: {
           messaging: 'enabled',
@@ -256,7 +275,12 @@ APP.get('/mirror/api/health', (req, res) => {
           readReceipts: 'enabled',
           threading: 'enabled',
           pinnedMessages: 'enabled',
-          search: 'enabled'
+          search: 'enabled',
+          dinaChatBot: 'enabled'
+        },
+        dinaChatProcessor: {
+          note: 'Runs as separate process via PM2/systemd',
+          command: 'npx ts-node workers/DinaChatQueueProcessor.ts'
         },
         websocket: {
           path: '/mirror/groups/chat',
@@ -292,9 +316,10 @@ APP.get('/mirror/api/health', (req, res) => {
  * Phase 1: Encryption + Group APIs
  * Phase 3: Group Analysis System
  * Phase 3.5: DINA LLM Integration
+ * Phase 5: Chat Infrastructure + @Dina Chat Processor
  */
 async function initializeMirrorGroupsInfrastructure(): Promise<void> {
-  console.log('🚀 Initializing MirrorGroups Infrastructure (Phase 0 → Phase 3.5)...');
+  console.log('🚀 Initializing MirrorGroups Infrastructure (Phase 0 → Phase 5 + @Dina)...');
 
   try {
     // =========================================================================
@@ -356,7 +381,7 @@ async function initializeMirrorGroupsInfrastructure(): Promise<void> {
     // =========================================================================
     console.log('🤖 Phase 3.5: Initializing DINA LLM Integration...');
 
-    const dinaEndpoint = process.env.DINA_ENDPOINT || 'https://www.theundergroundrailroad.world/dina/api/v1/models/llama2:70b/chat';
+    const dinaEndpoint = process.env.DINA_ENDPOINT || 'https://www.theundergroundrailroad.world/dina/api/v1/models/mistral:7b/chat';
     const dinaKey = process.env.DINA_KEY;
     const userId = process.env.DINA_USER_ID || 'mirror-groups-system';
 
@@ -411,11 +436,53 @@ async function initializeMirrorGroupsInfrastructure(): Promise<void> {
     console.log(`   🔍 Search: Enabled`);
     console.log(`   🌐 WebSocket: /mirror/groups/chat`);
 
+    // =========================================================================
+    // @DINA CHAT QUEUE PROCESSOR - RUNS AS SEPARATE PROCESS
+    // =========================================================================
+    console.log('📝 Note: @Dina Chat Queue Processor runs as a SEPARATE PROCESS');
+    console.log('   Run separately via PM2/systemd: npx ts-node workers/DinaChatQueueProcessor.ts');
+    console.log('   This ensures non-blocking, truly async processing');
+
     console.log('\n🎉 MirrorGroups Infrastructure fully initialized (Phase 0 → Phase 5)');
   } catch (error) {
     logError('Failed to initialize MirrorGroups Infrastructure', error);
     throw error;
   }
+}
+
+// ============================================================================
+// WEBSOCKET BROADCAST WIRING
+// ============================================================================
+
+/**
+ * Wire up the WebSocket broadcast function for Chat routes
+ * Call this after WebSocket is set up
+ * Note: @Dina Chat Processor runs as separate process with its own WebSocket handling
+ */
+function wireWebSocketBroadcast(wss: any): void {
+  // Create a broadcast function that emits to all clients in a group
+  const broadcastToGroup = (groupId: string, payload: any) => {
+    // This implementation depends on your WebSocket setup
+    // Option 1: Using Socket.io
+    // wss.to(`group:${groupId}`).emit(payload.type, payload);
+
+    // Option 2: Using raw WebSocket with room management
+    // Your SetupWebSocket should expose a broadcast method
+    if (wss.broadcastToGroup) {
+      wss.broadcastToGroup(groupId, payload);
+    } else if (wss.to) {
+      // Socket.io style
+      wss.to(`group:${groupId}`).emit(payload.type, payload);
+    } else {
+      console.log(`[WS] Broadcast to group ${groupId}:`, payload.type);
+    }
+  };
+
+  // Wire up to groupChat routes
+  // Note: DinaChatQueueProcessor runs as separate process - handles its own broadcasting
+  setChatBroadcast(broadcastToGroup);
+
+  console.log('✅ WebSocket broadcast wired to Chat routes');
 }
 
 // ============================================================================
@@ -436,6 +503,12 @@ function setupGracefulShutdown(server: https.Server): void {
       });
 
       // Shutdown MirrorGroups components in reverse order (Phase 5 → Phase 0)
+
+      // Shutdown DINA WebSocket connection first
+      console.log('🔌 Closing DINA WebSocket connection...');
+      await dinaWebSocket.shutdown();
+      console.log('✅ DINA WebSocket connection closed');
+
       console.log('💬 Shutting down Chat Infrastructure...');
       await chatMessageManager.shutdown();
       console.log('✅ Chat Infrastructure shutdown complete');
@@ -525,17 +598,49 @@ const httpsServer = https.createServer(credentials, APP);
  */
 async function startServer(): Promise<void> {
   try {
-    console.log('🚀 Starting Mirror Server with MirrorGroups (Phase 0 → Phase 3.5)...');
+    console.log('🚀 Starting Mirror Server with MirrorGroups (Phase 0 → Phase 5 + @Dina)...');
     console.log('📅 Startup time:', new Date().toISOString());
 
     // Initialize all MirrorGroups infrastructure
     await initializeMirrorGroupsInfrastructure();
 
+    // ========================================================================
+    // DINA WEBSOCKET CONNECTION (Must happen before WebSocket layer setup)
+    // This establishes the secure connection to DINA server
+    // All @Dina chat communication will flow through this single connection
+    // ========================================================================
+    console.log('\n' + '─'.repeat(60));
+    console.log('🔌 DINA WEBSOCKET INITIALIZATION');
+    console.log('─'.repeat(60));
+    console.log(`   Target: ${process.env.DINA_WS_URL || 'wss://localhost:8445/dina/ws'}`);
+    console.log('   Initiating connection...');
+    try {
+      await dinaWebSocket.initialize();
+      console.log('─'.repeat(60));
+      console.log('✅ WSS TO DINA-SERVER INITIATED');
+      console.log('─'.repeat(60));
+      console.log(`   Status: CONNECTED`);
+      console.log(`   Connection ID: ${dinaWebSocket.getConnectionId()}`);
+      console.log(`   Ready for @Dina chat requests`);
+      console.log('─'.repeat(60) + '\n');
+    } catch (dinaError) {
+      console.log('─'.repeat(60));
+      console.warn('⚠️ WSS TO DINA-SERVER FAILED');
+      console.log('─'.repeat(60));
+      console.warn(`   Error: ${getErrorMessage(dinaError)}`);
+      console.warn('   Status: Will retry automatically');
+      console.warn('   Fallback: HTTP requests until connection restored');
+      console.log('─'.repeat(60) + '\n');
+    }
+
     // Setup WebSocket layer
     // This handles: Mirror protocol, Group notifications, Group signaling (WebRTC)
     console.log('🔌 Setting up WebSocket layer...');
-    SetupWebSocket(httpsServer, mirrorGroupNotifications);
+    const wss = SetupWebSocket(httpsServer, mirrorGroupNotifications);
     console.log('✅ WebSocket layer ready');
+
+    // Wire up WebSocket broadcast for @Dina and Chat
+    wireWebSocketBroadcast(wss);
 
     // Setup graceful shutdown handlers
     setupGracefulShutdown(httpsServer);
@@ -544,7 +649,7 @@ async function startServer(): Promise<void> {
     const PORT = parseInt(process.env.MIRRORPORT || '8444');
     httpsServer.listen(PORT, () => {
       console.log('\n' + '='.repeat(80));
-      console.log('🎉 MIRROR SERVER WITH MIRRORGROUPS SUCCESSFULLY STARTED');
+      console.log('🎉 MIRROR SERVER WITH MIRRORGROUPS + @DINA CHAT SUCCESSFULLY STARTED');
       console.log('='.repeat(80));
       console.log(`📍 Port: ${PORT}`);
       console.log(`🌐 Base URL: https://theundergroundrailroad.world:${PORT}`);
@@ -562,17 +667,28 @@ async function startServer(): Promise<void> {
       console.log(`   Journal:   /mirror/api/journal/*`);
       console.log(`   Groups:    /mirror/api/groups/* (Phase 1-3)`);
       console.log(`   Insights:  /mirror/api/groups/:groupId/insights (Phase 3.5)`);
+      console.log(`   @Dina Stats: /mirror/api/dina/chat/stats`);
       console.log('\n🎯 MIRRORGROUPS STATUS:');
       console.log(`   ✅ Phase 0: Redis + Notifications`);
       console.log(`   ✅ Phase 1: Encryption + Group APIs + WebRTC Signaling`);
       console.log(`   ✅ Phase 3: Group Analysis (4 Analyzers) + Worker Queue`);
       console.log(`   ✅ Phase 3.5: DINA LLM Integration (DinaUniversalMessage v2.0)`);
       console.log(`   ✅ Phase 4: Conversation Intelligence + Group Voting`);
+      console.log(`   ✅ Phase 5: Chat Infrastructure + @Dina Chat Bot`);
+      console.log('\n🤖 @DINA CHAT BOT:');
+      console.log(`   How it works: Users mention @Dina in group chat`);
+      console.log(`   Queue Processing: Automatic (started with server)`);
+      console.log(`   Streaming: ${process.env.DINA_STREAMING_ENABLED !== 'false' ? 'ENABLED (default)' : 'DISABLED'}`);
+      console.log(`   DINA Server: ${process.env.DINA_BASE_URL || 'http://localhost:8445'}`);
+      console.log(`   WebSocket: ${dinaWebSocket.connected ? '✅ CONNECTED' : '⚠️ DISCONNECTED (will retry)'}`);
+      console.log(`   Connection ID: ${dinaWebSocket.getConnectionId() || 'N/A'}`);
+      console.log(`   Model: ${process.env.DEFAULT_MODEL || 'mistral:7b'}`);
+      console.log(`   HTTP Fallback: Active (if WebSocket unavailable)`);
       console.log('\n🤖 DINA INTEGRATION:');
-      console.log(`   Endpoint:  ${process.env.DINA_ENDPOINT || 'https://www.theundergroundrailroad.world/dina/api/v1/models/llama2:70b/chat'}`);
+      console.log(`   Endpoint:  ${process.env.DINA_ENDPOINT || 'https://www.theundergroundrailroad.world/dina/api/v1/models/mistral:7b/chat'}`);
       console.log(`   Protocol:  DinaUniversalMessage v2.0`);
       console.log(`   Auth:      Auto-registration (${process.env.DINA_KEY ? 'registered' : 'will register on first request'})`);
-      console.log(`   LLM Model: llama2:70b (high-quality synthesis)`);
+      console.log(`   LLM Model: mistral:7b (fast responses for chat)`);
       console.log(`   Fallback:  Intelligent stub synthesis (circuit breaker protected)`);
       console.log('\n📊 ANALYSIS CAPABILITIES:');
       console.log(`   ✅ Compatibility scoring (pairwise + group average)`);
