@@ -18,6 +18,9 @@ import { mirrorRedis } from '../config/redis';
 import { groupEncryptionManager } from '../systems/GroupEncryptionManager';
 import { mirrorGroupNotifications } from '../systems/mirrorGroupNotifications';
 
+// @Dina Chat Integration - queue messages for AI processing
+import { DinaChatQueueProcessor } from '../workers/DinaChatQueueProcessor';
+
 // ============================================================================
 // TYPES & INTERFACES
 // ============================================================================
@@ -382,6 +385,86 @@ export class ChatMessageManager extends EventEmitter {
         reactions: [],
         readBy: []
       };
+
+      // ========== @DINA CHAT INTEGRATION ==========
+      // Check if message contains @Dina mention and queue for AI processing
+      console.log('\n' + '🔍'.repeat(20));
+      console.log('[DINA-CHECK] Checking message for @Dina mention...');
+      console.log(`  📝 Content: "${sanitizedContent.substring(0, 100)}${sanitizedContent.length > 100 ? '...' : ''}"`);
+      console.log(`  👤 Sender: ${senderUsername} (ID: ${input.senderUserId})`);
+      console.log(`  🏠 Group: ${input.groupId}`);
+      console.log('🔍'.repeat(20));
+
+      const hasDinaMention = DinaChatQueueProcessor.containsDinaMention(sanitizedContent);
+      console.log(`[DINA-CHECK] Has @Dina mention: ${hasDinaMention ? '✅ YES' : '❌ NO'}`);
+
+      if (hasDinaMention) {
+        console.log('[DINA-CHECK] 🎯 @DINA MENTION DETECTED! Processing...');
+        try {
+          const dinaQuery = DinaChatQueueProcessor.extractDinaQuery(sanitizedContent);
+          console.log(`[DINA-CHECK] 📝 Extracted query: "${dinaQuery}"`);
+          console.log(`[DINA-CHECK] 📏 Query length: ${dinaQuery.length}`);
+
+          if (dinaQuery.length > 0) {
+            console.log('[DINA-CHECK] ✅ Valid query, queuing for processing...');
+            const queueId = await DinaChatQueueProcessor.queueDinaMessage({
+              groupId: input.groupId,
+              userId: input.senderUserId,
+              username: senderUsername,
+              query: dinaQuery,
+              originalMessageId: messageId,
+              context: {
+                parentMessageId: input.parentMessageId,
+                contentType: input.contentType,
+                timestamp: now.toISOString(),
+              },
+              priority: 5,
+            });
+
+            console.log('\n' + '✅'.repeat(20));
+            console.log(`[DINA-CHECK] 🎉 SUCCESSFULLY QUEUED @DINA MESSAGE`);
+            console.log(`  📋 Queue ID: ${queueId}`);
+            console.log(`  👤 From: ${senderUsername}`);
+            console.log(`  🏠 Group: ${input.groupId}`);
+            console.log(`  💬 Query: "${dinaQuery.substring(0, 50)}..."`);
+            console.log('✅'.repeat(20) + '\n');
+
+            // Broadcast dina:processing_start to notify frontend of pending response
+            try {
+              const [members] = await DB.query(
+                `SELECT user_id FROM mirror_group_members WHERE group_id = ? AND status = 'active'`,
+                [input.groupId]
+              );
+              for (const member of members as any[]) {
+                await mirrorGroupNotifications.notify(member.user_id, {
+                  type: 'dina_processing_started',
+                  payload: {
+                    queueId,
+                    originalMessageId: messageId,
+                    groupId: input.groupId,
+                    userId: input.senderUserId,
+                    username: senderUsername,
+                    timestamp: new Date().toISOString(),
+                  },
+                });
+              }
+              console.log(`[DINA-CHECK] 📡 Broadcast dina:processing_start to ${(members as any[]).length} members`);
+            } catch (broadcastError) {
+              console.error('[DINA-CHECK] ⚠️ Failed to broadcast processing_start:', broadcastError);
+            }
+          } else {
+            console.log('[DINA-CHECK] ⚠️ Empty query after extraction, skipping');
+          }
+        } catch (dinaError) {
+          // Don't fail message send if @Dina queue fails
+          console.error('\n' + '❌'.repeat(20));
+          console.error('[DINA-CHECK] ❌ FAILED TO QUEUE @DINA MESSAGE');
+          console.error(`  Error: ${(dinaError as Error).message}`);
+          console.error(`  Stack: ${(dinaError as Error).stack}`);
+          console.error('❌'.repeat(20) + '\n');
+        }
+      }
+      // ========== END @DINA INTEGRATION ==========
 
       // Cache the message
       await this.cacheMessage(message);

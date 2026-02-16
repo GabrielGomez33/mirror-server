@@ -60,7 +60,9 @@ function isValidGroupNotificationType(type: any): type is GroupNotificationType 
     'chat_presence',
     'chat_reactions_updated',
     'chat_message_read',
-    'chat_mention'
+    'chat_mention',
+    //Dina processing status
+    'dina_processing_started',
   ];
   return typeof type === 'string' && validTypes.includes(type as GroupNotificationType);
 }
@@ -119,7 +121,8 @@ export type GroupNotificationType =
   | 'chat_presence'
   | 'chat_reactions_updated'
   | 'chat_message_read'
-  | 'chat_mention';
+  | 'chat_mention'
+  |	'dina_processing_started';
 
 // ============================================================================
 // TYPE ALIASES
@@ -270,6 +273,13 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
       message: (data) => `${data.senderUsername || 'Someone'} mentioned you in ${data.groupName || 'a group'}`,
       priority: 'immediate',
       channels: ['websocket', 'push']
+    },
+
+    dina_processing_started: {
+      title: (data) => `DINA`,
+      message: (data) => `DINA: processing started`,
+      priority: 'immediate',
+      channels: ['websocket','push']
     }
   };
 
