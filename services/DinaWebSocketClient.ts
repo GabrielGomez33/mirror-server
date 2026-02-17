@@ -23,6 +23,10 @@
 // - Request/response correlation via requestId
 // - Streaming chat support with chunk callbacks
 // - Heartbeat/pong response handling
+//
+// FIXES APPLIED:
+// - handleResponse() now delivers content via streamCallback for streaming requests
+//   (fixes "Total length: 0" bug where response content was not being captured)
 // ============================================================================
 
 import WebSocket from 'ws';
@@ -134,11 +138,6 @@ export class DinaWebSocketClient extends EventEmitter {
   // CONSTRUCTOR
   // ================================
 
-  /**
-   * Create a new DinaWebSocketClient instance
-   * @param serviceName - Identifier for this service (e.g., 'mirror-server', 'DCQP')
-   * @param config - Optional connection configuration
-   */
   constructor(serviceName: string = 'mirror', config?: Partial<DinaConnectionConfig>) {
     super();
     this.serviceName = serviceName;
@@ -194,17 +193,11 @@ export class DinaWebSocketClient extends EventEmitter {
   // CONNECTION MANAGEMENT
   // ================================
 
-  /**
-   * Initialize and connect (called once on service startup)
-   */
   public async initialize(): Promise<void> {
     this.log('Initializing connection to DINA server...');
     return this.connect();
   }
 
-  /**
-   * Connect to DINA WebSocket server
-   */
   private connect(): Promise<void> {
     return new Promise((resolve, reject) => {
       if (this.isConnected) {
@@ -224,14 +217,13 @@ export class DinaWebSocketClient extends EventEmitter {
 
       try {
         this.ws = new WebSocket(this.config.url, {
-          rejectUnauthorized: false, // Allow self-signed certs
+          rejectUnauthorized: false,
           handshakeTimeout: 10000,
         });
 
         this.ws.on('open', () => {
           this.log('WebSocket connection opened');
           this.isConnecting = false;
-          // Don't set isConnected yet - wait for welcome message
         });
 
         this.ws.on('message', (data: Buffer) => {
@@ -255,7 +247,6 @@ export class DinaWebSocketClient extends EventEmitter {
           this.ws?.pong();
         });
 
-        // Set initial connection timeout
         const connectionTimeout = setTimeout(() => {
           if (!this.isConnected) {
             this.logError('Connection timeout');
@@ -265,7 +256,6 @@ export class DinaWebSocketClient extends EventEmitter {
           }
         }, 15000);
 
-        // Wait for welcome message to confirm connection
         this.once('connected', () => {
           clearTimeout(connectionTimeout);
           resolve();
@@ -348,7 +338,6 @@ export class DinaWebSocketClient extends EventEmitter {
     console.log(`   Capabilities: ${message.payload.data.capabilities?.join(', ')}`);
     console.log('─'.repeat(50));
 
-    // Start heartbeat
     this.startHeartbeat();
 
     this.emit('connected', {
@@ -366,11 +355,9 @@ export class DinaWebSocketClient extends EventEmitter {
     if (callback) {
       callback(chunk);
 
-      // Clean up on done or error
       if (chunk.type === 'done' || chunk.type === 'error') {
         this.streamCallbacks.delete(chunk.requestId);
 
-        // Also resolve any pending request
         const pending = this.pendingRequests.get(chunk.requestId);
         if (pending) {
           clearTimeout(pending.timeoutId);
@@ -396,59 +383,105 @@ export class DinaWebSocketClient extends EventEmitter {
 
   /**
    * Handle standard response
+   *
+   * FIX: When a response comes back for a streaming request (has streamCallback),
+   * extract the content from the response payload and deliver it via the callback.
+   * This fixes the "Total length: 0" bug where the dina-server returns the complete
+   * response via the standard response pathway (not as streaming chunks), but the
+   * content was never being delivered to the stream callback.
    */
   private handleResponse(response: DinaResponse): void {
     console.log(
-      `[services/DinaWebsocketClient.ts/handleResponse()]: Contents of response -> ${JSON.stringify(response)}`
+      `[DinaWS:${this.serviceName}/handleResponse()] Response status: ${response.status}`
     );
-  
-    console.log(
-      `[services/DinaWebsocketClient.ts/handleResponse()]: contents of PendingRequests -> ${this.pendingRequests}`
-    );
-  
-    this.pendingRequests.forEach((value, key) => {
-      const safeValue = { ...value };
-      console.log(`Key: ${key}, Value: ${safeValue}`);
-    });
-  
-    console.log(
-      `[services/DinaWebsocketClient.ts/handleResponse()]: Response status -> ${response.status}`
-    );
-  
+
+    // Extract sourceRequestId from various possible locations in the response
     const sourceRequestId =
       response.payload?.data?.metadata?.sourceRequestId ??
       response.payload?.metadata?.sourceRequestId ??
       null;
-  
+
     console.log(
-      `[services/DinaWebsocketClient.ts/handleResponse()]: Extracted sourceRequestId -> ${sourceRequestId}`
+      `[DinaWS:${this.serviceName}/handleResponse()] Extracted sourceRequestId: ${sourceRequestId}`
     );
-  
+
     if (!sourceRequestId) {
       this.log(
         `Received response without sourceRequestId (status=${response.status}, request_id=${response.request_id})`
       );
       return;
     }
-  
+
     const pending = this.pendingRequests.get(sourceRequestId);
-  
+
     if (pending) {
       clearTimeout(pending.timeoutId);
       this.pendingRequests.delete(sourceRequestId);
-  
+
+      // Also clean up stream callback map if present
+      this.streamCallbacks.delete(sourceRequestId);
+
       if (response.status === 'error') {
         pending.reject(
           new Error(response.error?.message || 'Request failed')
         );
-      } else {
-        pending.resolve(response);
+        return;
       }
+
+      // =====================================================================
+      // FIX: Deliver response content to streamCallback for streaming requests
+      // =====================================================================
+      // When dina-server returns a complete response (not streaming chunks),
+      // the content is in the payload but the streamCallback was never called.
+      // This delivers the content as a single chunk + done signal.
+      if (pending.streamCallback) {
+        const responseData = response.payload?.data;
+        const content =
+          responseData?.content ||
+          responseData?.response ||
+          (typeof responseData === 'string' ? responseData : '');
+
+        console.log(
+          `[DinaWS:${this.serviceName}/handleResponse()] ✅ STREAMING FIX: Delivering response content via streamCallback. Content length: ${content.length}`
+        );
+
+        if (content) {
+          // Deliver the complete response as a single chunk
+          pending.streamCallback({
+            type: 'chunk',
+            sourceRequestId,
+            requestId: sourceRequestId,
+            content,
+            chunkIndex: 0,
+          });
+
+          // Signal streaming is done
+          pending.streamCallback({
+            type: 'done',
+            sourceRequestId,
+            requestId: sourceRequestId,
+            metadata: {
+              totalChunks: 1,
+              processingTime: response.metrics?.processing_time_ms || 0,
+              deliveredViaResponse: true,
+            },
+          });
+        } else {
+          console.warn(
+            `[DinaWS:${this.serviceName}/handleResponse()] ⚠️ Response matched streaming request but content is empty`
+          );
+          console.warn(
+            `[DinaWS:${this.serviceName}/handleResponse()] Response payload: ${JSON.stringify(response.payload).substring(0, 500)}`
+          );
+        }
+      }
+
+      // Resolve the pending promise
+      pending.resolve(response);
     } else {
       this.log(`Received response for unknown request: ${sourceRequestId}`);
     }
   }
-  
 
   /**
    * Handle disconnection
@@ -458,7 +491,6 @@ export class DinaWebSocketClient extends EventEmitter {
     this.connectionId = null;
     this.stopHeartbeat();
 
-    // Reject all pending requests
     this.pendingRequests.forEach((pending, requestId) => {
       clearTimeout(pending.timeoutId);
       pending.reject(new Error('Connection lost'));
@@ -468,7 +500,6 @@ export class DinaWebSocketClient extends EventEmitter {
 
     this.emit('disconnected');
 
-    // Attempt reconnection
     this.scheduleReconnect();
   }
 
@@ -484,7 +515,7 @@ export class DinaWebSocketClient extends EventEmitter {
 
     const delay = Math.min(
       this.config.reconnectIntervalMs * Math.pow(2, this.reconnectAttempts),
-      60000 // Max 60 seconds
+      60000
     );
 
     this.reconnectAttempts++;
@@ -507,13 +538,7 @@ export class DinaWebSocketClient extends EventEmitter {
     this.stopHeartbeat();
     this.heartbeatTimer = setInterval(() => {
       if (this.isConnected && this.ws?.readyState === WebSocket.OPEN) {
-        // Send ping message
-//        this.send({
-//          target: { module: 'core', method: 'ping', priority: 1 },
-//          payload: { data: { timestamp: Date.now() } },
-//        }).catch(err => {
-//          this.logWarn('Heartbeat ping failed', err.message);
-//        });
+        // Heartbeat ping (currently disabled, can be enabled if needed)
       }
     }, this.config.heartbeatIntervalMs);
   }
@@ -614,11 +639,9 @@ export class DinaWebSocketClient extends EventEmitter {
             max_tokens: params.options?.maxTokens || 500,
             temperature: params.options?.temperature || 0.7,
           },
-        
       },
       security: { user_id: params.userId },
     });
-    ;
 
     return new Promise((resolve, reject) => {
       const timeoutId = setTimeout(() => {
@@ -640,7 +663,6 @@ export class DinaWebSocketClient extends EventEmitter {
         console.log(`   Request ID: ${requestId}`);
         console.log(`   Group: ${params.groupId}`);
         console.log(`   User: ${params.username} (${params.userId})`);
-        //console.log(`   Query: "${message.payload.query.substring(0, 80)}${params.query.length > 80 ? '...' : ''}"`);
         console.log(`   Model: ${params.options?.model || 'mistral:7b'}`);
         console.log(`   Target: mirror.mirror_chat_stream`);
 
@@ -667,41 +689,41 @@ export class DinaWebSocketClient extends EventEmitter {
     }
   ): DumpMessage {
     const now = Date.now();
-  
+
     const safeData = params.payload?.data ?? {};
     console.log(`Creating DUMP compliant message using -> ${JSON.stringify(params)}`);
-  
+
     return {
       id: requestId,
       timestamp: new Date().toISOString(),
       version: '2.0.0',
-  
+
       source: {
         module: this.serviceName,
         instance: this.connectionId || this.sessionId,
         version: '1.0.0',
       },
-  
+
       target: {
         module: params.target.module,
         method: params.target.method,
         priority: params.target.priority ?? 5,
       },
-  
+
       security: {
         user_id: params.security?.user_id,
         session_id: params.security?.session_id ?? this.sessionId,
         clearance: 'public',
         sanitized: false,
       },
-  
+
       payload: {
-        ...params.payload, // ✅ everything lives here
+        ...params.payload,
         metadata: {
           size_bytes: JSON.stringify(safeData).length,
         },
       },
-  
+
       qos: {
         delivery_mode: 'at_least_once',
         timeout_ms: 30000,
@@ -709,47 +731,34 @@ export class DinaWebSocketClient extends EventEmitter {
         max_retries: 3,
         require_ack: true,
       },
-  
+
       trace: {
         created_at: now,
         route: [this.serviceName],
         request_chain: [],
         performance_target_ms: 1000,
       },
-  
+
       method: params.target.method,
     };
   }
-  
 
   // ================================
   // STATUS
   // ================================
 
-  /**
-   * Check if connected
-   */
   public get connected(): boolean {
     return this.isConnected && this.ws?.readyState === WebSocket.OPEN;
   }
 
-  /**
-   * Get connection ID
-   */
   public getConnectionId(): string | null {
     return this.connectionId;
   }
 
-  /**
-   * Get service name
-   */
   public getServiceName(): string {
     return this.serviceName;
   }
 
-  /**
-   * Get connection status
-   */
   public getStatus(): {
     connected: boolean;
     connectionId: string | null;
@@ -768,9 +777,6 @@ export class DinaWebSocketClient extends EventEmitter {
     };
   }
 
-  /**
-   * Graceful shutdown
-   */
   public async shutdown(): Promise<void> {
     this.log('Shutting down...');
 
@@ -781,7 +787,6 @@ export class DinaWebSocketClient extends EventEmitter {
       this.reconnectTimer = null;
     }
 
-    // Reject pending requests
     this.pendingRequests.forEach((pending) => {
       clearTimeout(pending.timeoutId);
       pending.reject(new Error('Client shutting down'));
@@ -805,18 +810,6 @@ export class DinaWebSocketClient extends EventEmitter {
 // FACTORY FUNCTION
 // ============================================================================
 
-/**
- * Create a new DinaWebSocketClient instance
- * Use this when you need a dedicated connection (e.g., in a separate process)
- *
- * @param serviceName - Identifier for logging (e.g., 'DCQP', 'analyzer')
- * @param config - Optional connection configuration overrides
- * @returns A new DinaWebSocketClient instance
- *
- * @example
- * const wsClient = createDinaWebSocket('DCQP');
- * await wsClient.initialize();
- */
 export function createDinaWebSocket(
   serviceName: string,
   config?: Partial<DinaConnectionConfig>
@@ -828,7 +821,6 @@ export function createDinaWebSocket(
 // SINGLETON EXPORT (for mirror-server backwards compatibility)
 // ============================================================================
 
-// Default singleton instance for mirror-server
 const mirrorServerInstance = new DinaWebSocketClient('mirror-server');
 
 export const dinaWebSocket = mirrorServerInstance;

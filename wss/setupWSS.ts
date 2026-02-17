@@ -1,5 +1,6 @@
 // wss/setupWSS.ts - Single WebSocket server with manual routing
 // Phase 5: Extended with real-time chat support
+// Phase 5.1: @Dina broadcast bridge via Redis pub/sub
 
 import { WebSocketServer, WebSocket } from 'ws';
 import { IncomingMessage } from 'http';
@@ -7,6 +8,8 @@ import * as https from 'https';
 import { TokenManager } from '../controllers/authController';
 import { MirrorGroupNotificationSystem } from '../systems/mirrorGroupNotifications';
 import { chatWSHandler } from './chatWSHandler';
+import { mirrorRedis } from '../config/redis';
+import { DINA_BROADCAST_CHANNEL } from '../workers/DinaChatQueueProcessor';
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -31,6 +34,19 @@ export function SetupWebSocket(
   // Initialize chat WebSocket handler
   chatWSHandler.initialize().catch(err => {
     console.error('Failed to initialize chat WebSocket handler:', err);
+  });
+
+  // Subscribe to @Dina broadcast channel (bridges separate processor → chat WebSocket)
+  mirrorRedis.subscribe(DINA_BROADCAST_CHANNEL, (message: string) => {
+    try {
+      const { groupId, payload } = JSON.parse(message);
+      const sent = chatWSHandler.broadcastToGroup(groupId, payload);
+      if (sent > 0) {
+        console.log(`[DINA-BRIDGE] Delivered ${payload.type} to ${sent} client(s) in group ${groupId}`);
+      }
+    } catch (err) {
+      console.error('[DINA-BRIDGE] Failed to relay broadcast:', err);
+    }
   });
 
   // Single WebSocket server - no path specified

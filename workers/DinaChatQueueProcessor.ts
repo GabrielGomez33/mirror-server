@@ -37,6 +37,9 @@ import {
   DinaWebSocketClient
 } from '../services/DinaWebSocketClient';
 
+// Encryption - use the same encryption as regular chat messages
+import { groupEncryptionManager } from '../systems/GroupEncryptionManager';
+
 // DCQP's own WebSocket instance (initialized in standalone mode)
 // When running in mirror-server process, uses the shared mirrorServerWebSocket
 let dcqpWebSocket: DinaWebSocketClient = mirrorServerWebSocket;
@@ -55,6 +58,7 @@ import {
   getDinaRequestHeaders,
   sanitizeDinaQuery,
   getMySQLNow,
+  formatMySQLDateTime,
   DINA_ENDPOINTS,
   DINA_DEFAULTS,
   DINA_DEFAULT_MODEL,
@@ -62,16 +66,21 @@ import {
 } from '../utils/dinaMessageUtils';
 
 // ============================================================================
-// WEBSOCKET BROADCAST - Will be wired up from main server
+// WEBSOCKET BROADCAST - Publishes to Redis for the main server to deliver
 // ============================================================================
+import { mirrorRedis } from '../config/redis';
+
+const DINA_BROADCAST_CHANNEL = 'dina:chat:broadcast';
+
 let broadcastToGroup = (groupId: string, payload: any) => {
-  console.log(`[DINA-WS] 📡 Broadcast to group ${groupId}: ${payload.type}`);
+  mirrorRedis.publish(DINA_BROADCAST_CHANNEL, JSON.stringify({ groupId, payload }));
 };
 
 export function setBroadcastFunction(fn: (groupId: string, payload: any) => void) {
-  console.log('[DINA] ✅ WebSocket broadcast function configured');
   broadcastToGroup = fn;
 }
+
+export { DINA_BROADCAST_CHANNEL };
 
 // ============================================================================
 // TYPES
@@ -641,6 +650,7 @@ export class DinaChatQueueProcessor extends EventEmitter {
       broadcastToGroup(params.groupId, {
         type: 'dina:processing_start',
         payload: {
+          groupId: params.groupId,
           queueId: id,
           originalMessageId: params.originalMessageId,
           username: params.username,
@@ -805,13 +815,17 @@ export class DinaChatQueueProcessor extends EventEmitter {
       const context = await this.buildDinaContext(item);
       console.log(`[DINA-PROCESS] ✅ Context built`);
 
-      // Create message ID for Dina's response
+      // Create message ID for Dina's response.
+      // Offset timestamp by 1 second to guarantee Dina's reply sorts AFTER
+      // the user's message. MySQL DATETIME has second precision, so if the
+      // DCQP picks up the item within the same second, both messages would
+      // share the same created_at and display order becomes indeterminate.
       const messageId = uuidv4();
-      const now = getMySQLNow(); // MySQL-compatible datetime format
+      const now = formatMySQLDateTime(new Date(Date.now() + 1000));
 
-      // Send typing indicator
-      console.log(`[DINA-PROCESS] ⌨️ Sending typing indicator...`);
-      this.sendTypingIndicator(item.group_id, true);
+      // Note: typing indicator is NOT sent here to avoid duplication.
+      // ChatMessageManager.sendMessage() already broadcasts dina_processing_started
+      // when it detects the @Dina mention and queues the message.
 
       let response: string;
       let wasStreamed = false;
@@ -830,15 +844,48 @@ export class DinaChatQueueProcessor extends EventEmitter {
 
         // Finalize the message in DB
         await this.finalizeMessage(messageId, item, response);
+
+        // FIX: Broadcast the completed Dina message to the group
+        // The streaming path sent dina:stream_* events, but the frontend's
+        // ChatContext only listens for `chat:message` to add messages.
+        if (response) {
+          const dinaMetadata = {
+            isDinaResponse: true,
+            originalQuery: item.query.substring(0, 200),
+            respondingTo: item.username,
+            replyPreview: {
+              messageId: item.original_message_id,
+              senderUsername: item.username,
+              content: item.query.substring(0, 100) + (item.query.length > 100 ? '...' : ''),
+            },
+          };
+
+          console.log(`[DINA-PROCESS] 📡 Broadcasting completed Dina response to group ${item.group_id}`);
+          broadcastToGroup(item.group_id, {
+            type: 'chat:message',
+            payload: {
+              id: messageId,
+              groupId: item.group_id,
+              senderUserId: this.DINA_USER_ID,
+              senderUsername: this.DINA_USERNAME,
+              content: response,
+              contentType: 'text',
+              status: 'sent',
+              createdAt: now,
+              metadata: dinaMetadata,
+            },
+            timestamp: new Date().toISOString(),
+          });
+          console.log(`[DINA-PROCESS] ✅ Dina response broadcast complete (${response.length} chars)`);
+        } else {
+          console.warn(`[DINA-PROCESS] ⚠️ No response content to broadcast for item ${item.id}`);
+        }
       } else {
         // Non-streaming: get full response then insert
         console.log(`[DINA-PROCESS] 📨 Starting non-streaming request to DINA server...`);
         response = await this.getFullResponse(item, context, sanitizedQuery);
         await this.insertDinaResponse(messageId, item, response, now);
       }
-
-      // Stop typing indicator
-      this.sendTypingIndicator(item.group_id, false);
 
       // Sanitize response
       const sanitizedResponse = this.sanitizer.sanitizeResponse(response, this.config.maxResponseLength);
@@ -880,7 +927,6 @@ export class DinaChatQueueProcessor extends EventEmitter {
       console.log(`  📚 Stack: ${(error as Error).stack}`);
       console.log('❌'.repeat(30) + '\n');
 
-      this.sendTypingIndicator(item.group_id, false);
       this.circuitBreaker.recordFailure();
 
       if (item.retry_count < this.config.maxRetries) {
@@ -1183,6 +1229,7 @@ export class DinaChatQueueProcessor extends EventEmitter {
     broadcastToGroup(state.groupId, {
       type: 'dina:stream_chunk',
       payload: {
+        groupId: state.groupId,
         messageId: state.messageId,
         chunk,
         chunkIndex: state.chunkIndex,
@@ -1197,6 +1244,7 @@ export class DinaChatQueueProcessor extends EventEmitter {
     broadcastToGroup(groupId, {
       type: 'dina:stream_start',
       payload: {
+        groupId,
         messageId,
         senderUserId: this.DINA_USER_ID,
         senderUsername: this.DINA_USERNAME,
@@ -1210,6 +1258,7 @@ export class DinaChatQueueProcessor extends EventEmitter {
     broadcastToGroup(state.groupId, {
       type: 'dina:stream_complete',
       payload: {
+        groupId: state.groupId,
         messageId,
         finalContent: state.accumulatedContent,
         totalChunks: state.chunkIndex,
@@ -1230,6 +1279,7 @@ export class DinaChatQueueProcessor extends EventEmitter {
         senderUsername: this.DINA_USERNAME,
         content,
         contentType: 'text',
+        parentMessageId: null,
         status: 'sent',
         createdAt: new Date().toISOString(),
         metadata: { isDinaResponse: true },
@@ -1263,17 +1313,42 @@ export class DinaChatQueueProcessor extends EventEmitter {
   private async buildDinaContext(item: DinaChatQueueItem): Promise<DinaChatContext & { groupId: string; requestingUser: { id: number; username: string } }> {
     console.log(`[DINA-CONTEXT] 🔧 Building context for group ${item.group_id}...`);
 
-    // Fetch recent messages
+    // Fetch recent messages (including encryption_key_id for decryption)
     const [recentMessages]: any = await DB.query(
-      `SELECT m.content, m.sender_user_id, u.username, m.created_at
+      `SELECT m.content, m.sender_user_id, m.encryption_key_id, u.username, m.created_at
        FROM mirror_group_messages m
        LEFT JOIN users u ON u.id = m.sender_user_id
        WHERE m.group_id = ? AND m.is_deleted = 0
        ORDER BY m.created_at DESC
        LIMIT ?`,
-      [item.group_id, DINA_DEFAULTS.MAX_CONTEXT_MESSAGES]
+      [item.group_id, 40]  // Increased from DINA_DEFAULTS (20) for richer conversation context
     );
     console.log(`[DINA-CONTEXT] 📜 Found ${recentMessages?.length || 0} recent messages`);
+
+    // Decrypt message contents — messages are stored encrypted in the database.
+    // Uses the requesting user's member key to unwrap the group key for decryption.
+    const decryptedMessages = await Promise.all(
+      (recentMessages || []).map(async (msg: any) => {
+        let decryptedContent = msg.content;
+        try {
+          const decrypted = await groupEncryptionManager.decryptForUser(
+            msg.content,
+            item.user_id.toString(),
+            item.group_id
+          );
+          decryptedContent = decrypted.data.toString('utf-8');
+        } catch {
+          // Decryption may fail for pre-encryption messages (stored as plaintext).
+          // In that case, use the raw content as-is.
+          console.log(`[DINA-CONTEXT] ⚠️ Could not decrypt message from ${msg.username}, using raw content`);
+        }
+        return {
+          ...msg,
+          content: decryptedContent,
+        };
+      })
+    );
+    console.log(`[DINA-CONTEXT] 🔓 Decrypted ${decryptedMessages.length} messages for context`);
 
     // Fetch group info
     const [groupInfo]: any = await DB.query(
@@ -1296,11 +1371,11 @@ export class DinaChatQueueProcessor extends EventEmitter {
     // Parse any original context from the queue item
     const originalContext = safeJsonParse(item.context, {});
 
-    // Build standardized context using utility
+    // Build standardized context using utility (with decrypted messages)
     const chatContext = buildDinaChatContext({
       groupInfo: groupInfo[0] || null,
       members: members || [],
-      recentMessages: (recentMessages || []).reverse(),
+      recentMessages: decryptedMessages.reverse(),
       requestingUser: {
         id: item.user_id,
         username: item.username,
@@ -1321,8 +1396,8 @@ export class DinaChatQueueProcessor extends EventEmitter {
 
   private buildSystemPrompt(context: any): string {
     const recentMessagesText = context.recentMessages
-      ?.slice(-10)
-      .map((m: any) => `${m.username}: ${m.content?.substring(0, 200)}`)
+      ?.slice(-25)
+      .map((m: any) => `${m.username}: ${m.content?.substring(0, 300)}`)
       .join('\n') || 'No recent messages';
 
     return `You are Dina, an intelligent and friendly AI assistant integrated into Mirror, a group chat application focused on personal growth and meaningful connections.
@@ -1352,6 +1427,8 @@ GUIDELINES:
     console.log(`[DINA-MSG] 📝 Inserting placeholder message ${messageId}...`);
 
     // Build metadata with reply preview for visual threading
+    // Note: parent_message_id is NOT set — Dina messages appear in the main chat view.
+    // The replyPreview in metadata provides the visual link to the original message.
     const metadata = {
       isDinaResponse: true,
       isStreaming: true,
@@ -1364,22 +1441,25 @@ GUIDELINES:
       },
     };
 
+    // Encrypt placeholder content using same encryption as regular messages
+    const { encryptedContent, keyId } = await this.encryptContent('', item.group_id);
+
     await DB.query(
       `INSERT INTO mirror_group_messages
-       (id, group_id, sender_user_id, content, content_type, status, parent_message_id, metadata, created_at, updated_at)
+       (id, group_id, sender_user_id, content, content_type, status, encryption_key_id, metadata, created_at, updated_at)
        VALUES (?, ?, ?, ?, 'text', 'sending', ?, ?, ?, ?)`,
       [
         messageId,
         item.group_id,
         this.DINA_USER_ID,
-        '',
-        item.original_message_id,
+        encryptedContent,
+        keyId,
         JSON.stringify(metadata),
         now,
         now,
       ]
     );
-    console.log(`[DINA-MSG] ✅ Placeholder message inserted`);
+    console.log(`[DINA-MSG] ✅ Placeholder message inserted (encrypted)`);
   }
 
   private async finalizeMessage(messageId: string, item: DinaChatQueueItem, content: string): Promise<void> {
@@ -1399,12 +1479,16 @@ GUIDELINES:
       },
     };
 
+    // Encrypt final content using same encryption as regular messages
+    const { encryptedContent, keyId } = await this.encryptContent(content, item.group_id);
+
     await DB.query(
       `UPDATE mirror_group_messages
-       SET content = ?, status = 'sent', metadata = ?, updated_at = ?
+       SET content = ?, status = 'sent', encryption_key_id = ?, metadata = ?, updated_at = ?
        WHERE id = ?`,
       [
-        content,
+        encryptedContent,
+        keyId,
         JSON.stringify(metadata),
         now,
         messageId,
@@ -1417,6 +1501,8 @@ GUIDELINES:
     console.log(`[DINA-MSG] 📝 Inserting Dina response ${messageId}...`);
 
     // Build metadata with reply preview for visual threading
+    // Note: parent_message_id is NOT set — Dina messages appear in the main chat view.
+    // The replyPreview in metadata provides the visual link to the original message.
     const metadata = {
       isDinaResponse: true,
       originalQuery: item.query.substring(0, 200),
@@ -1428,16 +1514,19 @@ GUIDELINES:
       },
     };
 
+    // Encrypt content using same encryption as regular messages
+    const { encryptedContent, keyId } = await this.encryptContent(response, item.group_id);
+
     await DB.query(
       `INSERT INTO mirror_group_messages
-       (id, group_id, sender_user_id, content, content_type, status, parent_message_id, metadata, created_at, updated_at)
+       (id, group_id, sender_user_id, content, content_type, status, encryption_key_id, metadata, created_at, updated_at)
        VALUES (?, ?, ?, ?, 'text', 'sent', ?, ?, ?, ?)`,
       [
         messageId,
         item.group_id,
         this.DINA_USER_ID,
-        response,
-        item.original_message_id,
+        encryptedContent,
+        keyId,
         JSON.stringify(metadata),
         now,
         now,
@@ -1454,7 +1543,6 @@ GUIDELINES:
         senderUsername: this.DINA_USERNAME,
         content: response,
         contentType: 'text',
-        parentMessageId: item.original_message_id,
         status: 'sent',
         createdAt: now,
         metadata,
@@ -1482,16 +1570,19 @@ GUIDELINES:
       },
     };
 
+    // Encrypt content using same encryption as regular messages
+    const { encryptedContent, keyId } = await this.encryptContent(response, item.group_id);
+
     await DB.query(
       `INSERT INTO mirror_group_messages
-       (id, group_id, sender_user_id, content, content_type, status, parent_message_id, metadata, created_at, updated_at)
+       (id, group_id, sender_user_id, content, content_type, status, encryption_key_id, metadata, created_at, updated_at)
        VALUES (?, ?, ?, ?, 'text', 'sent', ?, ?, ?, ?)`,
       [
         messageId,
         item.group_id,
         this.DINA_USER_ID,
-        response,
-        item.original_message_id,
+        encryptedContent,
+        keyId,
         JSON.stringify(metadata),
         now,
         now,
@@ -1507,7 +1598,6 @@ GUIDELINES:
         senderUsername: this.DINA_USERNAME,
         content: response,
         contentType: 'text',
-        parentMessageId: item.original_message_id,
         status: 'sent',
         createdAt: now,
         metadata,
@@ -1519,6 +1609,32 @@ GUIDELINES:
   // ============================================================================
   // DATABASE & UTILITY HELPERS
   // ============================================================================
+
+  /**
+   * Encrypt content using the same encryption pathway as regular chat messages.
+   * This ensures Dina's messages can be decrypted by getMessages() on page load.
+   */
+  private async encryptContent(content: string, groupId: string): Promise<{ encryptedContent: string; keyId: string }> {
+    const [keyRows] = await DB.query(
+      `SELECT id FROM mirror_group_encryption_keys
+       WHERE group_id = ? AND status = 'active'
+       ORDER BY key_version DESC LIMIT 1`,
+      [groupId]
+    );
+
+    let keyId: string;
+    if ((keyRows as any[]).length === 0) {
+      keyId = await groupEncryptionManager.generateGroupKey(groupId);
+    } else {
+      keyId = (keyRows as any[])[0].id;
+    }
+
+    const encrypted = await groupEncryptionManager.encryptForGroup(
+      Buffer.from(content, 'utf-8'),
+      keyId
+    );
+    return { encryptedContent: encrypted.encrypted, keyId };
+  }
 
   private async updateItemStatus(id: string, status: string, updates: Record<string, any> = {}): Promise<void> {
     const fields: string[] = ['status = ?', 'updated_at = NOW()'];

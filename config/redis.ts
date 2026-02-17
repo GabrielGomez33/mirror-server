@@ -1,7 +1,7 @@
 // mirror-server/config/redis.ts
 /**
  * MIRROR REDIS MANAGER - Phase 0 Infrastructure
- * 
+ *
  * Handles all Redis operations for MirrorGroups:
  * - Drawing synchronization (pub/sub)
  * - Session participant tracking
@@ -9,7 +9,6 @@
  * - Notification queuing
  * - WebRTC signaling support
  */
-
 import Redis from 'ioredis';
 import { EventEmitter } from 'events';
 
@@ -69,11 +68,14 @@ export interface NotificationQueue {
 
 export class MirrorRedisManager extends EventEmitter {
   private client!: Redis;        // ✅ Definite assignment assertion
-  private subscriber!: Redis;    // ✅ Definite assignment assertion  
+  private subscriber!: Redis;    // ✅ Definite assignment assertion
   private publisher!: Redis;     // ✅ Definite assignment assertion
   private connected: boolean = false;
   private reconnectAttempts: number = 0;
   private readonly MAX_RECONNECT_ATTEMPTS = 5;
+
+  // Track channel-specific callbacks for general-purpose subscribe
+  private channelCallbacks: Map<string, (message: string) => void> = new Map();
 
   // Configuration
   private readonly host: string;
@@ -98,7 +100,7 @@ export class MirrorRedisManager extends EventEmitter {
 
   constructor() {
     super();
-    
+
     // Load configuration from environment
     this.host = process.env.REDIS_HOST || 'localhost';
     this.port = parseInt(process.env.REDIS_PORT || '6380');
@@ -106,6 +108,7 @@ export class MirrorRedisManager extends EventEmitter {
     this.db = parseInt(process.env.REDIS_DB || '0');
 
     console.log(`🔌 Initializing Mirror Redis Manager (${this.host}:${this.port})`);
+
     this.initializeConnections();
   }
 
@@ -128,10 +131,10 @@ export class MirrorRedisManager extends EventEmitter {
     try {
       // Main client for general operations
       this.client = new Redis(config);
-      
+
       // Dedicated subscriber for pub/sub
       this.subscriber = new Redis(config);
-      
+
       // Dedicated publisher for pub/sub
       this.publisher = new Redis(config);
 
@@ -206,9 +209,9 @@ export class MirrorRedisManager extends EventEmitter {
 
     this.reconnectAttempts++;
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
-    
+
     console.log(`🔄 Attempting Mirror Redis reconnection ${this.reconnectAttempts}/${this.MAX_RECONNECT_ATTEMPTS} in ${delay}ms`);
-    
+
     setTimeout(() => {
       this.connect().catch(error => {
         console.error('❌ Reconnection failed:', error);
@@ -274,15 +277,15 @@ export class MirrorRedisManager extends EventEmitter {
     try {
       const channel = `mirror:drawing:${sessionId}`;
       const message = JSON.stringify(action);
-      
+
       await this.publisher.publish(channel, message);
-      
+
       // Also store the action for late joiners
       const historyKey = `mirror:drawing:history:${sessionId}`;
       await this.client.lpush(historyKey, message);
       await this.client.ltrim(historyKey, 0, 99); // Keep last 100 actions
       await this.client.expire(historyKey, this.TTL.DRAWING_SESSION);
-      
+
       return true;
     } catch (error) {
       console.error(`❌ Failed to publish draw action for session ${sessionId}:`, error);
@@ -293,9 +296,9 @@ export class MirrorRedisManager extends EventEmitter {
   async subscribeToDrawing(sessionId: string, callback: (action: DrawAction) => void): Promise<boolean> {
     try {
       const channel = `mirror:drawing:${sessionId}`;
-      
+
       await this.subscriber.subscribe(channel);
-      
+
       this.subscriber.on('message', (receivedChannel, message) => {
         if (receivedChannel === channel) {
           try {
@@ -306,7 +309,7 @@ export class MirrorRedisManager extends EventEmitter {
           }
         }
       });
-      
+
       return true;
     } catch (error) {
       console.error(`❌ Failed to subscribe to drawing session ${sessionId}:`, error);
@@ -329,7 +332,7 @@ export class MirrorRedisManager extends EventEmitter {
     try {
       const historyKey = `mirror:drawing:history:${sessionId}`;
       const messages = await this.client.lrange(historyKey, 0, -1);
-      
+
       return messages.map(message => {
         try {
           return JSON.parse(message) as DrawAction;
@@ -363,11 +366,11 @@ export class MirrorRedisManager extends EventEmitter {
     try {
       const key = `mirror:session:participants:${sessionId}`;
       const existing = await this.get(key) || [];
-      
+
       // Remove if already exists (update case)
       const filtered = existing.filter((p: SessionParticipant) => p.userId !== participant.userId);
       filtered.push(participant);
-      
+
       await this.set(key, filtered, this.TTL.SESSION_PARTICIPANTS);
       return true;
     } catch (error) {
@@ -380,7 +383,7 @@ export class MirrorRedisManager extends EventEmitter {
     try {
       const key = `mirror:session:participants:${sessionId}`;
       const existing = await this.get(key) || [];
-      
+
       const filtered = existing.filter((p: SessionParticipant) => p.userId !== userId);
       await this.set(key, filtered, this.TTL.SESSION_PARTICIPANTS);
       return true;
@@ -430,7 +433,7 @@ export class MirrorRedisManager extends EventEmitter {
     try {
       const pattern = `mirror:group:insights:${groupId}:*`;
       const keys = await this.client.keys(pattern);
-      
+
       if (keys.length > 0) {
         await this.client.del(...keys);
       }
@@ -449,7 +452,7 @@ export class MirrorRedisManager extends EventEmitter {
     try {
       const queueKey = `mirror:notifications:${notification.priority}`;
       const message = JSON.stringify(notification);
-      
+
       await this.client.lpush(queueKey, message);
       await this.client.expire(queueKey, this.TTL.NOTIFICATION_QUEUE);
       return true;
@@ -463,9 +466,9 @@ export class MirrorRedisManager extends EventEmitter {
     try {
       const queueKey = `mirror:notifications:${priority}`;
       const message = await this.client.rpop(queueKey);
-      
+
       if (!message) return null;
-      
+
       return JSON.parse(message) as NotificationQueue;
     } catch (error) {
       console.error(`❌ Failed to dequeue ${priority} notification:`, error);
@@ -496,6 +499,59 @@ export class MirrorRedisManager extends EventEmitter {
       return 0;
     }
   }
+
+  /**
+   * Subscribe to a Redis pub/sub channel with a callback.
+   * Uses the dedicated subscriber connection managed by this class.
+   */
+  async subscribe(channel: string, callback: (message: string) => void): Promise<boolean> {
+    try {
+      // Store the callback for this channel
+      this.channelCallbacks.set(channel, callback);
+
+      await this.subscriber.subscribe(channel);
+
+      // Attach a message listener that routes to the correct callback
+      // (Uses a named function reference so we don't stack duplicate listeners)
+      this.subscriber.on('message', this.handleSubscriberMessage);
+
+      console.log(`✅ Subscribed to channel: ${channel}`);
+      return true;
+    } catch (error) {
+      console.error(`❌ Failed to subscribe to channel ${channel}:`, error);
+      this.channelCallbacks.delete(channel);
+      return false;
+    }
+  }
+
+  /**
+   * Unsubscribe from a Redis pub/sub channel.
+   */
+  async unsubscribe(channel: string): Promise<boolean> {
+    try {
+      await this.subscriber.unsubscribe(channel);
+      this.channelCallbacks.delete(channel);
+      console.log(`✅ Unsubscribed from channel: ${channel}`);
+      return true;
+    } catch (error) {
+      console.error(`❌ Failed to unsubscribe from channel ${channel}:`, error);
+      return false;
+    }
+  }
+
+  /**
+   * Internal handler that routes incoming pub/sub messages to registered callbacks.
+   */
+  private handleSubscriberMessage = (receivedChannel: string, message: string): void => {
+    const callback = this.channelCallbacks.get(receivedChannel);
+    if (callback) {
+      try {
+        callback(message);
+      } catch (error) {
+        console.error(`❌ Error in subscriber callback for channel ${receivedChannel}:`, error);
+      }
+    }
+  };
 
   // ============================================================================
   // UTILITY METHODS
@@ -537,8 +593,11 @@ export class MirrorRedisManager extends EventEmitter {
 
   async shutdown(): Promise<void> {
     console.log('🔌 Shutting down Mirror Redis Manager...');
-    
+
     try {
+      // Clear all channel callbacks
+      this.channelCallbacks.clear();
+
       await Promise.all([
         this.client.quit(),
         this.subscriber.quit(),
