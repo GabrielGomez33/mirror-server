@@ -12,7 +12,6 @@
  * @module workers/AnalysisQueueProcessor
  * @requires Node.js 18+
  */
-
 import { DB } from '../db';
 import { mirrorRedis } from '../config/redis';
 import { Logger } from '../utils/logger';
@@ -156,7 +155,6 @@ export class AnalysisQueueProcessor {
    */
   private async subscribeToQueue(): Promise<void> {
     try {
-      // Subscribe using MirrorRedisManager
       await mirrorRedis.subscribe('mirror:analysis:queue', async (message: string) => {
         try {
           const notification = JSON.parse(message);
@@ -233,7 +231,6 @@ export class AnalysisQueueProcessor {
       // Process jobs in parallel
       const jobPromises = jobs.map(job => this.processJob(job));
       await Promise.allSettled(jobPromises);
-
     } catch (error) {
       this.logger.error('Failed to fetch pending jobs', error);
     }
@@ -339,7 +336,6 @@ export class AnalysisQueueProcessor {
 
       // Handle retry logic
       await this.handleJobFailure(job, error);
-
     } finally {
       // Remove from current jobs
       this.currentJobs.delete(job.id);
@@ -376,7 +372,6 @@ export class AnalysisQueueProcessor {
         retryCount,
         nextRetryAt
       });
-
     } else {
       // Max retries exceeded - mark as failed
       await DB.query(`
