@@ -1,13 +1,21 @@
 // ============================================================================
-// MIRRORGROUPS API ROUTES - UPDATED WITH DECLINE & MY-INVITATIONS
+// MIRRORGROUPS API ROUTES - UPDATED WITH SHARED DATA + LAST ACTIVE TRACKING
 // ============================================================================
 // File: server/routes/groups.ts
 // ----------------------------------------------------------------------------
-// CHANGES:
-// 1. Added declineInvitationHandler - to decline invitations
-// 2. Added getMyInvitationsHandler - to get user's pending invitations
-// 3. Updated leaveGroupHandler - sends WebSocket notifications
-// 4. Added routes: POST /:groupId/decline, GET /my-invitations
+// CHANGES (Issue #1 Fix - Shared data not reflected in members list):
+// 1. Updated getGroupDetailsHandler - members query now LEFT JOINs with
+//    mirror_group_shared_data to include has_shared_data and shared_data_types
+// 2. Added getMembersHandler - GET /:groupId/members endpoint
+// 3. Added getMemberDetailsHandler - GET /:groupId/members/:memberId endpoint
+// 4. Added helper: enrichMembersWithSharedData() for DRY shared data enrichment
+// 5. Route registration updated with new member endpoints
+// CHANGES (Issue #2 Fix - Last Active showing Unknown):
+// 6. All member queries now include u.last_active from users table
+// 7. Added is_online field using WebSocket connection tracking
+// CHANGES (Issue #3 Fix - Active state not updating on login):
+// 8. Added router-level middleware to update last_active on authenticated requests
+// 9. SQL queries now use GREATEST(last_active, last_login) for reliable fallback
 // ============================================================================
 
 import express, { RequestHandler } from 'express';
@@ -19,8 +27,27 @@ import { groupEncryptionManager } from '../systems/GroupEncryptionManager';
 import { publicAssessmentAggregator } from '../managers/PublicAssessmentAggregator';
 import { groupDataExtractor, ShareableDataType } from '../services/GroupDataExtractor';
 import { mirrorGroupNotifications } from '../systems/mirrorGroupNotifications';
+import { isUserOnline } from '../wss/setupWSS';
 
 const router = express.Router();
+
+/* ============================================================================
+   MIDDLEWARE: Update last_active on every authenticated API request
+   This ensures last_active is set even when WebSocket connections fail to
+   establish (e.g. wrong URL, network issues, browser blocking WS).
+   The auth middleware has already decoded req.user by the time routes run.
+============================================================================ */
+
+router.use(((req, _res, next) => {
+  const user = (req as any).user;
+  if (user?.id) {
+    DB.query(
+      'UPDATE users SET last_active = NOW() WHERE id = ? AND (last_active IS NULL OR last_active < DATE_SUB(NOW(), INTERVAL 30 SECOND))',
+      [user.id]
+    ).catch(() => {});
+  }
+  next();
+}) as RequestHandler);
 
 /* ============================================================================
    HELPERS
@@ -32,6 +59,68 @@ function safeJsonParse<T = any>(value: unknown, fallback: T): T {
     try { return JSON.parse(value) as T; } catch { return fallback; }
   }
   return value as T;
+}
+
+/**
+ * Enrich an array of member rows with shared data information.
+ * Queries mirror_group_shared_data once for the group and maps shared data
+ * types onto each member, adding has_shared_data and shared_data_types fields.
+ */
+async function enrichMembersWithSharedData(groupId: string, members: any[]): Promise<any[]> {
+  if (!members || members.length === 0) return [];
+
+  try {
+    // Get all shared data for this group in a single query
+    const [sharedDataRows] = await DB.query(
+      `SELECT sd.user_id, sd.data_type, sd.shared_at, sd.data_version
+       FROM mirror_group_shared_data sd
+       WHERE sd.group_id = ?
+       ORDER BY sd.shared_at DESC`,
+      [groupId]
+    );
+
+    // Build a map: userId -> array of shared data types
+    const sharedDataMap = new Map<number, { dataTypes: string[]; sharedData: any[] }>();
+    for (const row of (sharedDataRows as any[])) {
+      const userId = row.user_id;
+      if (!sharedDataMap.has(userId)) {
+        sharedDataMap.set(userId, { dataTypes: [], sharedData: [] });
+      }
+      const entry = sharedDataMap.get(userId)!;
+      // Avoid duplicate data types (could have updated records)
+      if (!entry.dataTypes.includes(row.data_type)) {
+        entry.dataTypes.push(row.data_type);
+      }
+      entry.sharedData.push({
+        dataType: row.data_type,
+        sharedAt: row.shared_at,
+        dataVersion: row.data_version
+      });
+    }
+
+    // Enrich each member with shared data info and online status
+    return members.map((member: any) => {
+      const userId = member.user_id;
+      const sharedInfo = sharedDataMap.get(userId);
+      const hasSharedData = !!sharedInfo && sharedInfo.dataTypes.length > 0;
+      const sharedDataTypes = sharedInfo ? sharedInfo.dataTypes : [];
+
+      return {
+        ...member,
+        has_shared_data: hasSharedData,
+        shared_data_types: sharedDataTypes,
+        is_online: isUserOnline(userId)
+      };
+    });
+  } catch (error) {
+    console.error('⚠️ Error enriching members with shared data:', error);
+    // Return members without shared data rather than failing entirely
+    return members.map((member: any) => ({
+      ...member,
+      has_shared_data: false,
+      shared_data_types: []
+    }));
+  }
 }
 
 /* ============================================================================
@@ -190,7 +279,7 @@ const joinGroupHandler: RequestHandler = async (req, res) => {
 };
 
 /* ============================================================================
-   GET GROUP DETAILS
+   GET GROUP DETAILS - FIXED: Now includes shared data per member
 ============================================================================ */
 
 const getGroupDetailsHandler: RequestHandler = async (req, res) => {
@@ -226,10 +315,12 @@ const getGroupDetailsHandler: RequestHandler = async (req, res) => {
 
     const group = (groupRows as any[])[0];
 
+    // Fetch base member rows (uses GREATEST to pick most recent of last_active/last_login)
     const [membersRows] = await DB.query(
       `SELECT
         gm.id, gm.user_id, gm.role, gm.status, gm.joined_at,
-        u.username, u.email
+        u.username, u.email,
+        GREATEST(COALESCE(u.last_active, '1970-01-01'), COALESCE(u.last_login, '1970-01-01')) AS last_active
       FROM mirror_group_members gm
       INNER JOIN users u ON gm.user_id = u.id
       WHERE gm.group_id = ? AND gm.status = 'active'
@@ -242,6 +333,9 @@ const getGroupDetailsHandler: RequestHandler = async (req, res) => {
         gm.joined_at ASC`,
       [groupId]
     );
+
+    // FIXED: Enrich members with shared data info + online status
+    const enrichedMembers = await enrichMembersWithSharedData(groupId, membersRows as any[]);
 
     res.json({
       success: true,
@@ -260,7 +354,7 @@ const getGroupDetailsHandler: RequestHandler = async (req, res) => {
           status: group.status,
           created_at: group.created_at
         },
-        members: membersRows,
+        members: enrichedMembers,
         userRole: (memberCheck as any[])[0].role,
         isOwner: group.owner_user_id === user.id
       }
@@ -268,6 +362,182 @@ const getGroupDetailsHandler: RequestHandler = async (req, res) => {
   } catch (error) {
     console.error('❌ Error getting group details:', error);
     res.status(500).json({ success: false, error: 'Failed to get group details' });
+  }
+};
+
+/* ============================================================================
+   GET MEMBERS LIST - NEW ENDPOINT
+   GET /:groupId/members
+============================================================================ */
+
+const getMembersHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    if (!user?.id) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const { groupId } = req.params;
+
+    // Verify user is a member
+    const [memberCheck] = await DB.query(
+      `SELECT role FROM mirror_group_members
+       WHERE group_id = ? AND user_id = ? AND status = 'active'`,
+      [groupId, user.id]
+    );
+
+    if ((memberCheck as any[]).length === 0) {
+      res.status(403).json({ success: false, error: 'Not a member of this group' });
+      return;
+    }
+
+    const [membersRows] = await DB.query(
+      `SELECT
+        gm.id, gm.user_id, gm.role, gm.status, gm.joined_at,
+        u.username, u.email,
+        GREATEST(COALESCE(u.last_active, '1970-01-01'), COALESCE(u.last_login, '1970-01-01')) AS last_active
+      FROM mirror_group_members gm
+      INNER JOIN users u ON gm.user_id = u.id
+      WHERE gm.group_id = ? AND gm.status = 'active'
+      ORDER BY
+        CASE gm.role
+          WHEN 'owner' THEN 1
+          WHEN 'admin' THEN 2
+          ELSE 3
+        END,
+        gm.joined_at ASC`,
+      [groupId]
+    );
+
+    const enrichedMembers = await enrichMembersWithSharedData(groupId, membersRows as any[]);
+
+    res.json({
+      success: true,
+      data: {
+        members: enrichedMembers
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error getting members:', error);
+    res.status(500).json({ success: false, error: 'Failed to get members' });
+  }
+};
+
+/* ============================================================================
+   GET MEMBER DETAILS - NEW ENDPOINT
+   GET /:groupId/members/:memberId
+   Returns extended member info with shared data attached to the member object
+============================================================================ */
+
+const getMemberDetailsHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    if (!user?.id) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const { groupId, memberId } = req.params;
+
+    // Verify requesting user is a member
+    const [memberCheck] = await DB.query(
+      `SELECT role FROM mirror_group_members
+       WHERE group_id = ? AND user_id = ? AND status = 'active'`,
+      [groupId, user.id]
+    );
+
+    if ((memberCheck as any[]).length === 0) {
+      res.status(403).json({ success: false, error: 'Not a member of this group' });
+      return;
+    }
+
+    // Fetch the target member - support lookup by user_id (numeric) or member id (uuid)
+    const isNumericId = /^\d+$/.test(memberId);
+    const memberQuery = isNumericId
+      ? `SELECT gm.id, gm.user_id, gm.role, gm.status, gm.joined_at,
+                u.username, u.email, u.created_at as user_created_at,
+                GREATEST(COALESCE(u.last_active, '1970-01-01'), COALESCE(u.last_login, '1970-01-01')) AS last_active
+         FROM mirror_group_members gm
+         INNER JOIN users u ON gm.user_id = u.id
+         WHERE gm.group_id = ? AND gm.user_id = ? AND gm.status = 'active'`
+      : `SELECT gm.id, gm.user_id, gm.role, gm.status, gm.joined_at,
+                u.username, u.email, u.created_at as user_created_at,
+                GREATEST(COALESCE(u.last_active, '1970-01-01'), COALESCE(u.last_login, '1970-01-01')) AS last_active
+         FROM mirror_group_members gm
+         INNER JOIN users u ON gm.user_id = u.id
+         WHERE gm.group_id = ? AND gm.id = ? AND gm.status = 'active'`;
+
+    const [memberRows] = await DB.query(memberQuery, [groupId, memberId]);
+
+    if ((memberRows as any[]).length === 0) {
+      res.status(404).json({ success: false, error: 'Member not found' });
+      return;
+    }
+
+    const member = (memberRows as any[])[0];
+
+    // Get shared data for this specific member
+    const [sharedDataRows] = await DB.query(
+      `SELECT data_type, shared_at, data_version
+       FROM mirror_group_shared_data
+       WHERE group_id = ? AND user_id = ?
+       ORDER BY shared_at DESC`,
+      [groupId, member.user_id]
+    );
+
+    const sharedData = (sharedDataRows as any[]).map((row: any) => ({
+      dataType: row.data_type,
+      sharedAt: row.shared_at,
+      dataVersion: row.data_version
+    }));
+
+    const sharedDataTypes = [...new Set(sharedData.map((sd: any) => sd.dataType))];
+    const hasSharedData = sharedDataTypes.length > 0;
+
+    // Determine hasSharedProfile: true if 'profile' or 'full_profile' is shared
+    const hasSharedProfile = sharedDataTypes.includes('profile') || sharedDataTypes.includes('full_profile');
+
+    // Build the enriched member object with shared data fields INSIDE it
+    const enrichedMember = {
+      id: member.id,
+      user_id: member.user_id,
+      username: member.username,
+      display_name: member.username,
+      role: member.role,
+      status: member.status,
+      joined_at: member.joined_at,
+      user_created_at: member.user_created_at,
+      last_active: member.last_active,
+      is_online: isUserOnline(member.user_id),
+      has_shared_data: hasSharedData,
+      shared_data_types: sharedDataTypes,
+      // Include profile fields only if profile is shared
+      ...(hasSharedProfile ? { email: member.email } : {})
+    };
+
+    // Build shared data summary
+    const dataTypeCounts: Record<string, number> = {};
+    for (const sd of sharedData) {
+      dataTypeCounts[sd.dataType] = (dataTypeCounts[sd.dataType] || 0) + 1;
+    }
+
+    res.json({
+      success: true,
+      data: {
+        member: enrichedMember,
+        sharedData: sharedData,
+        sharedDataSummary: {
+          totalShared: sharedDataTypes.length,
+          dataTypes: dataTypeCounts
+        },
+        hasSharedData: hasSharedData,
+        hasSharedProfile: hasSharedProfile
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error getting member details:', error);
+    res.status(500).json({ success: false, error: 'Failed to get member details' });
   }
 };
 
@@ -993,7 +1263,7 @@ const getDataSummaryHandler: RequestHandler = async (req, res) => {
 };
 
 /* ============================================================================
-   ROUTE REGISTRATION
+   ROUTE REGISTRATION - UPDATED with new member endpoints
 ============================================================================ */
 
 const verified = AuthMiddleware.verifyToken as unknown as RequestHandler;
@@ -1009,6 +1279,10 @@ router.post('/:groupId/accept', verified, acceptInvitationHandler);
 router.post('/:groupId/decline', verified, declineInvitationHandler);
 router.post('/:groupId/leave', verified, leaveGroupHandler);
 router.post('/join', verified, joinGroupHandler);
+
+// NEW: Member-specific endpoints (must be before generic /:groupId routes)
+router.get('/:groupId/members', verified, getMembersHandler);
+router.get('/:groupId/members/:memberId', verified, getMemberDetailsHandler);
 
 // Phase 2 routes
 router.post('/:groupId/share-data', verified, basicSecurity, shareDataHandler);

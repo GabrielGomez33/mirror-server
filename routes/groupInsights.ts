@@ -246,7 +246,12 @@ const analyzeGroupHandler: RequestHandler = async (req, res) => {
     }
 
     const { groupId } = req.params;
-    const { forceRefresh = false } = req.body;
+    const { forceRefresh = false, userContext } = req.body;
+
+    // Sanitize userContext if provided (max 2000 chars)
+    const sanitizedUserContext = userContext
+      ? String(userContext).slice(0, 2000).trim()
+      : undefined;
 
     // Verify membership first
     const isMember = await verifyGroupMembership(groupId, user.id);
@@ -268,7 +273,7 @@ const analyzeGroupHandler: RequestHandler = async (req, res) => {
     }
     // ========== END OWNER-ONLY CHECK ==========
 
-    // Queue analysis job
+    // Queue analysis job with optional user context
     const jobId = uuidv4();
     await DB.query(
       `INSERT INTO mirror_group_analysis_queue
@@ -281,7 +286,12 @@ const analyzeGroupHandler: RequestHandler = async (req, res) => {
         forceRefresh ? 10 : 5,
         'pending',
         'owner_request',
-        JSON.stringify({ requestedBy: user.id, forceRefresh, isOwner: true })
+        JSON.stringify({
+          requestedBy: user.id,
+          forceRefresh,
+          isOwner: true,
+          userContext: sanitizedUserContext,
+        })
       ]
     );
 
@@ -971,11 +981,9 @@ const getMemberDetailsHandler: RequestHandler = async (req, res) => {
       `SELECT
         gm.id, gm.user_id, gm.role, gm.status, gm.joined_at,
         u.username, u.created_at as user_created_at,
-        up.display_name, up.avatar_url,
-        ${hasSharedProfile ? `u.email, up.bio, up.birthdate, up.phone, up.location, up.timezone` : `NULL as email, NULL as bio, NULL as birthdate, NULL as phone, NULL as location, NULL as timezone`}
+        ${hasSharedProfile ? `u.email` : `NULL as email`}
        FROM mirror_group_members gm
        JOIN users u ON gm.user_id = u.id
-       LEFT JOIN user_profiles up ON u.id = up.user_id
        WHERE gm.group_id = ? AND gm.user_id = ? AND gm.status = 'active'`,
       [groupId, memberId]
     );
@@ -987,6 +995,12 @@ const getMemberDetailsHandler: RequestHandler = async (req, res) => {
 
     const member = memberRows[0];
 
+    // Count shared data items per type for the data sharing stats
+    const dataTypeCounts: Record<string, number> = {};
+    for (const sd of sharedData) {
+      dataTypeCounts[sd.dataType] = (dataTypeCounts[sd.dataType] || 0) + 1;
+    }
+
     res.json({
       success: true,
       data: {
@@ -994,23 +1008,20 @@ const getMemberDetailsHandler: RequestHandler = async (req, res) => {
           id: member.id,
           userId: member.user_id,
           username: member.username,
-          displayName: member.display_name || member.username,
-          avatar: member.avatar_url,
+          displayName: member.username,
           role: member.role,
           status: member.status,
           joinedAt: member.joined_at,
           userCreatedAt: member.user_created_at,
-          // Only include profile data if user has consented
           ...(hasSharedProfile && {
             email: member.email,
-            bio: member.bio,
-            birthdate: member.birthdate,
-            phone: member.phone,
-            location: member.location,
-            timezone: member.timezone,
           })
         },
         sharedData,
+        sharedDataSummary: {
+          totalShared: sharedData.length,
+          dataTypes: dataTypeCounts,
+        },
         hasSharedData: sharedData.length > 0,
         hasSharedProfile
       }
@@ -1072,16 +1083,13 @@ const getMembersWithDetailsHandler: RequestHandler = async (req, res) => {
       }
     }
 
-    // Get all members with basic details (extended info fetched conditionally)
+    // Get all members with basic details
     const [memberRows]: any = await DB.query(
       `SELECT
         gm.id, gm.user_id, gm.role, gm.status, gm.joined_at,
-        u.username, u.email, u.created_at as user_created_at,
-        up.display_name, up.avatar_url, up.bio, up.birthdate,
-        up.phone, up.location, up.timezone
+        u.username, u.email, u.created_at as user_created_at
        FROM mirror_group_members gm
        JOIN users u ON gm.user_id = u.id
-       LEFT JOIN user_profiles up ON u.id = up.user_id
        WHERE gm.group_id = ? AND gm.status = 'active'
        ORDER BY
          CASE gm.role
@@ -1098,27 +1106,30 @@ const getMembersWithDetailsHandler: RequestHandler = async (req, res) => {
       const memberSharedData = sharedDataByUser[odUserId] || [];
       const hasSharedProfile = profileSharedByUser[odUserId] || false;
 
+      // Count shared data items per type for data sharing stats
+      const dataTypeCounts: Record<string, number> = {};
+      for (const sd of memberSharedData) {
+        dataTypeCounts[sd.dataType] = (dataTypeCounts[sd.dataType] || 0) + 1;
+      }
+
       return {
         id: member.id,
         userId: member.user_id,
         username: member.username,
-        displayName: member.display_name || member.username,
-        avatar: member.avatar_url,
+        displayName: member.username,
         role: member.role,
         status: member.status,
         joinedAt: member.joined_at,
         hasSharedData: memberSharedData.length > 0,
         sharedDataTypes: memberSharedData.map((sd: { dataType: string }) => sd.dataType),
         sharedData: memberSharedData,
+        sharedDataSummary: {
+          totalShared: memberSharedData.length,
+          dataTypes: dataTypeCounts,
+        },
         hasSharedProfile,
-        // Only include profile data if user has consented
         ...(hasSharedProfile && {
           email: member.email,
-          bio: member.bio,
-          birthdate: member.birthdate,
-          phone: member.phone,
-          location: member.location,
-          timezone: member.timezone,
         })
       };
     });

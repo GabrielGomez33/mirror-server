@@ -1,6 +1,7 @@
 // wss/setupWSS.ts - Single WebSocket server with manual routing
 // Phase 5: Extended with real-time chat support
 // Phase 5.1: @Dina broadcast bridge via Redis pub/sub
+// Phase 5.2: last_active tracking on connect/disconnect
 
 import { WebSocketServer, WebSocket } from 'ws';
 import { IncomingMessage } from 'http';
@@ -10,6 +11,7 @@ import { MirrorGroupNotificationSystem } from '../systems/mirrorGroupNotificatio
 import { chatWSHandler } from './chatWSHandler';
 import { mirrorRedis } from '../config/redis';
 import { DINA_BROADCAST_CHANNEL } from '../workers/DinaChatQueueProcessor';
+import { DB } from '../db';
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -24,6 +26,42 @@ function logError(context: string, error: unknown): void {
 function logSecurityEvent(event: string, details: any): void {
   console.warn(`SECURITY: ${event}`, details);
 }
+
+// ============================================================================
+// CONNECTED USERS TRACKING (for online status)
+// ============================================================================
+
+// Track all users with active WebSocket connections (group WS + chat WS)
+const connectedUserIds: Set<number> = new Set();
+
+/**
+ * Update last_active timestamp in the users table.
+ * Fire-and-forget: errors are logged but do not break the connection flow.
+ */
+function updateLastActive(userId: number): void {
+  DB.query('UPDATE users SET last_active = NOW() WHERE id = ?', [userId]).catch(err => {
+    logError(`Failed to update last_active for user ${userId}`, err);
+  });
+}
+
+/**
+ * Check if a user currently has an active WebSocket connection.
+ * This checks both group notification WS and chat WS connections.
+ */
+export function isUserOnline(userId: number): boolean {
+  return connectedUserIds.has(userId) || chatWSHandler.isUserConnected(userId);
+}
+
+/**
+ * Get all currently connected user IDs.
+ */
+export function getConnectedUserIds(): number[] {
+  return Array.from(connectedUserIds);
+}
+
+// ============================================================================
+// WEBSOCKET SERVER SETUP
+// ============================================================================
 
 export function SetupWebSocket(
   server: https.Server,
@@ -125,16 +163,25 @@ export function SetupWebSocket(
 
         console.log(`Authenticated group WebSocket connection for user ${decoded.id}`);
 
+        // Track connection and update last_active
+        connectedUserIds.add(decoded.id);
+        updateLastActive(decoded.id);
+
         groupNotifications.registerConnection(decoded.id.toString(), ws);
 
         ws.on('close', () => {
           console.log(`Group WebSocket connection closed for user ${decoded.id}`);
           groupNotifications.unregisterConnection(decoded.id.toString());
+          connectedUserIds.delete(decoded.id);
+          // Update last_active on disconnect (last seen time)
+          updateLastActive(decoded.id);
         });
 
         ws.on('error', (error) => {
           logError(`Group WebSocket error for user ${decoded.id}`, error);
           groupNotifications.unregisterConnection(decoded.id.toString());
+          connectedUserIds.delete(decoded.id);
+          updateLastActive(decoded.id);
         });
 
         // Send connection confirmation
@@ -201,6 +248,10 @@ export function SetupWebSocket(
 
         console.log(`💬 Chat WebSocket connection for user ${decoded.id} (${decoded.username})`);
 
+        // Track connection and update last_active
+        connectedUserIds.add(decoded.id);
+        updateLastActive(decoded.id);
+
         // Register with chat handler
         const chatUser = chatWSHandler.registerUser({
           userId: decoded.id,
@@ -226,11 +277,16 @@ export function SetupWebSocket(
         ws.on('close', () => {
           console.log(`💬 Chat WebSocket connection closed for user ${decoded.id}`);
           chatWSHandler.unregisterUser(decoded.id);
+          connectedUserIds.delete(decoded.id);
+          // Update last_active on disconnect (last seen time)
+          updateLastActive(decoded.id);
         });
 
         ws.on('error', (error) => {
           logError(`Chat WebSocket error for user ${decoded.id}`, error);
           chatWSHandler.unregisterUser(decoded.id);
+          connectedUserIds.delete(decoded.id);
+          updateLastActive(decoded.id);
         });
 
         // Send connection confirmation
@@ -302,7 +358,8 @@ export function getWebSocketHealth(): {
           connectedUsers: chatStats.connectedUsers,
           activeGroups: chatStats.activeGroups,
           totalSubscriptions: chatStats.totalSubscriptions
-        }
+        },
+        connectedUserIds: connectedUserIds.size
       }
     };
   } catch (error) {
@@ -321,6 +378,13 @@ export function getWebSocketHealth(): {
  */
 export async function shutdownWebSocket(): Promise<void> {
   console.log('Shutting down WebSocket handlers...');
+
+  // Update last_active for all connected users before shutdown
+  for (const userId of connectedUserIds) {
+    updateLastActive(userId);
+  }
+  connectedUserIds.clear();
+
   await chatWSHandler.shutdown();
   console.log('WebSocket handlers shutdown complete');
 }
