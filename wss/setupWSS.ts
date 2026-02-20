@@ -2,6 +2,7 @@
 // Phase 5: Extended with real-time chat support
 // Phase 5.1: @Dina broadcast bridge via Redis pub/sub
 // Phase 5.2: last_active tracking on connect/disconnect
+// Phase 6: Robust connection management with native ping/pong
 
 import { WebSocketServer, WebSocket } from 'ws';
 import { IncomingMessage } from 'http';
@@ -28,11 +29,31 @@ function logSecurityEvent(event: string, details: any): void {
 }
 
 // ============================================================================
+// CONNECTION LIVENESS CONFIGURATION
+// ============================================================================
+
+/** How often the server sends native WebSocket ping frames (ms) */
+const PING_INTERVAL = 30_000;
+
+/** How long to wait for a pong before considering the connection dead (ms) */
+const PONG_TIMEOUT = 10_000;
+
+// ============================================================================
 // CONNECTED USERS TRACKING (for online status)
 // ============================================================================
 
 // Track all users with active WebSocket connections (group WS + chat WS)
 const connectedUserIds: Set<number> = new Set();
+
+// Track all managed WebSocket connections for heartbeat sweeping
+interface ManagedConnection {
+  ws: WebSocket;
+  userId: number | null;
+  route: string;
+  isAlive: boolean;
+  connectedAt: number;
+}
+const managedConnections: Set<ManagedConnection> = new Set();
 
 /**
  * Update last_active timestamp in the users table.
@@ -59,9 +80,63 @@ export function getConnectedUserIds(): number[] {
   return Array.from(connectedUserIds);
 }
 
+/**
+ * Register a WebSocket for server-side liveness monitoring.
+ * Attaches a pong listener and tracks the connection for periodic sweeps.
+ */
+function trackConnection(ws: WebSocket, userId: number | null, route: string): ManagedConnection {
+  const conn: ManagedConnection = {
+    ws,
+    userId,
+    route,
+    isAlive: true,
+    connectedAt: Date.now(),
+  };
+
+  // Native pong handler: the ws library fires 'pong' when the client
+  // responds to a protocol-level ping frame. This is handled at the TCP
+  // level by the browser and does NOT require any application-level code
+  // on the client side.
+  ws.on('pong', () => {
+    conn.isAlive = true;
+  });
+
+  managedConnections.add(conn);
+
+  // Clean up tracking on close
+  const onClose = () => {
+    managedConnections.delete(conn);
+  };
+  ws.on('close', onClose);
+
+  return conn;
+}
+
+/**
+ * Handle application-level ping messages from clients.
+ * Clients send JSON {"type":"ping"} and expect {"type":"pong"}.
+ * Returns true if the message was a ping and was handled.
+ */
+function handleAppPing(ws: WebSocket, data: string): boolean {
+  try {
+    const msg = JSON.parse(data);
+    if (msg.type === 'ping') {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'pong', timestamp: new Date().toISOString() }));
+      }
+      return true;
+    }
+  } catch {
+    // Not JSON or parse error - not a ping
+  }
+  return false;
+}
+
 // ============================================================================
 // WEBSOCKET SERVER SETUP
 // ============================================================================
+
+let heartbeatSweepTimer: ReturnType<typeof setInterval> | null = null;
 
 export function SetupWebSocket(
   server: https.Server,
@@ -92,6 +167,40 @@ export function SetupWebSocket(
     server
   });
 
+  // --------------------------------------------------------------------------
+  // Server-side heartbeat sweep: ping all connections, terminate dead ones
+  // --------------------------------------------------------------------------
+  // This runs at PING_INTERVAL. On each sweep:
+  //   1. Any connection that hasn't responded to the PREVIOUS ping is dead → terminate it.
+  //   2. All surviving connections get a new ping frame sent.
+  // The ws library's native ping/pong uses WebSocket control frames (opcode 0x9/0xA).
+  // Browsers respond to these automatically at the protocol level - no client JS needed.
+  heartbeatSweepTimer = setInterval(() => {
+    for (const conn of managedConnections) {
+      if (!conn.isAlive) {
+        // Did not respond to previous ping - connection is dead
+        console.log(`[WS-HEARTBEAT] Dead connection detected (user=${conn.userId}, route=${conn.route}), terminating`);
+        conn.ws.terminate();
+        // 'close' event handler will clean up managedConnections + connectedUserIds
+        continue;
+      }
+
+      // Mark as not-alive, send ping. If pong comes back before next sweep, isAlive resets to true.
+      conn.isAlive = false;
+      try {
+        conn.ws.ping();
+      } catch {
+        // Socket already broken, terminate
+        conn.ws.terminate();
+      }
+    }
+  }, PING_INTERVAL);
+
+  // Don't let the sweep timer keep the process alive during graceful shutdown
+  if (heartbeatSweepTimer.unref) {
+    heartbeatSweepTimer.unref();
+  }
+
   wss.on('connection', async (ws: WebSocket, req: IncomingMessage) => {
     const url = req.url || '';
 
@@ -101,6 +210,7 @@ export function SetupWebSocket(
 
       if (protocol === 'Mirror') {
         console.log('Mirror client connected');
+        trackConnection(ws, null, '/ws');
 
         ws.on('close', () => {
           console.log('Mirror client disconnected');
@@ -163,11 +273,20 @@ export function SetupWebSocket(
 
         console.log(`Authenticated group WebSocket connection for user ${decoded.id}`);
 
-        // Track connection and update last_active
+        // Track connection for liveness monitoring + update last_active
+        trackConnection(ws, decoded.id, '/mirror/groups/ws');
         connectedUserIds.add(decoded.id);
         updateLastActive(decoded.id);
 
         groupNotifications.registerConnection(decoded.id.toString(), ws);
+
+        // Handle incoming messages (required for application-level ping/pong)
+        ws.on('message', (data: Buffer | string) => {
+          const raw = data.toString();
+          // Handle application-level ping from client
+          if (handleAppPing(ws, raw)) return;
+          // Other group WS messages can be handled here in the future
+        });
 
         ws.on('close', () => {
           console.log(`Group WebSocket connection closed for user ${decoded.id}`);
@@ -246,9 +365,10 @@ export function SetupWebSocket(
           return;
         }
 
-        console.log(`💬 Chat WebSocket connection for user ${decoded.id} (${decoded.username})`);
+        console.log(`Chat WebSocket connection for user ${decoded.id} (${decoded.username})`);
 
-        // Track connection and update last_active
+        // Track connection for liveness monitoring + update last_active
+        trackConnection(ws, decoded.id, '/mirror/groups/chat');
         connectedUserIds.add(decoded.id);
         updateLastActive(decoded.id);
 
@@ -266,8 +386,10 @@ export function SetupWebSocket(
         // Handle incoming messages
         ws.on('message', async (data: Buffer | string) => {
           try {
-            const message = data.toString();
-            await chatWSHandler.handleMessage(decoded.id, message);
+            const raw = data.toString();
+            // Handle application-level ping from client
+            if (handleAppPing(ws, raw)) return;
+            await chatWSHandler.handleMessage(decoded.id, raw);
           } catch (error) {
             logError(`Chat message handling error for user ${decoded.id}`, error);
           }
@@ -275,7 +397,7 @@ export function SetupWebSocket(
 
         // Handle disconnection
         ws.on('close', () => {
-          console.log(`💬 Chat WebSocket connection closed for user ${decoded.id}`);
+          console.log(`Chat WebSocket connection closed for user ${decoded.id}`);
           chatWSHandler.unregisterUser(decoded.id);
           connectedUserIds.delete(decoded.id);
           // Update last_active on disconnect (last seen time)
@@ -333,7 +455,7 @@ export function SetupWebSocket(
     console.error('WebSocket server error:', error);
   });
 
-  console.log('WebSocket server ready - supports /ws, /mirror/groups/ws, and /mirror/groups/chat');
+  console.log(`WebSocket server ready - supports /ws, /mirror/groups/ws, and /mirror/groups/chat (ping interval: ${PING_INTERVAL / 1000}s)`);
 }
 
 export function getWebSocketHealth(): {
@@ -359,7 +481,8 @@ export function getWebSocketHealth(): {
           activeGroups: chatStats.activeGroups,
           totalSubscriptions: chatStats.totalSubscriptions
         },
-        connectedUserIds: connectedUserIds.size
+        connectedUserIds: connectedUserIds.size,
+        totalManagedConnections: managedConnections.size,
       }
     };
   } catch (error) {
@@ -379,11 +502,27 @@ export function getWebSocketHealth(): {
 export async function shutdownWebSocket(): Promise<void> {
   console.log('Shutting down WebSocket handlers...');
 
+  // Stop the heartbeat sweep
+  if (heartbeatSweepTimer) {
+    clearInterval(heartbeatSweepTimer);
+    heartbeatSweepTimer = null;
+  }
+
   // Update last_active for all connected users before shutdown
   for (const userId of connectedUserIds) {
     updateLastActive(userId);
   }
   connectedUserIds.clear();
+
+  // Close all managed connections gracefully
+  for (const conn of managedConnections) {
+    try {
+      conn.ws.close(1001, 'Server shutting down');
+    } catch {
+      conn.ws.terminate();
+    }
+  }
+  managedConnections.clear();
 
   await chatWSHandler.shutdown();
   console.log('WebSocket handlers shutdown complete');
