@@ -70,6 +70,7 @@ export interface GroupAnalysisOptions {
   includeLLMSynthesis?: boolean;
   forceRefresh?: boolean;
   confidenceThreshold?: number;
+  userContext?: string;
 }
 
 export interface GroupAnalysisResult {
@@ -302,7 +303,7 @@ export class GroupAnalyzer {
 
       // LLM Synthesis (requires other analyses to complete first)
       if (analysisOptions.includeLLMSynthesis && Object.keys(result.insights).length > 0) {
-        await this.runLLMSynthesis(result);
+        await this.runLLMSynthesis(result, analysisOptions.userContext);
       }
 
       // Calculate overall confidence
@@ -535,9 +536,12 @@ export class GroupAnalyzer {
   /**
    * Run LLM synthesis
    */
-  private async runLLMSynthesis(result: GroupAnalysisResult): Promise<void> {
+  private async runLLMSynthesis(result: GroupAnalysisResult, userContext?: string): Promise<void> {
     try {
-      const synthesis = await dinaLLMConnector.synthesizeInsights(result);
+      // Pass userContext as SynthesisOptions if the connector supports it
+      const synthesis = userContext
+        ? await dinaLLMConnector.synthesizeInsights(result, { userContext } as any)
+        : await dinaLLMConnector.synthesizeInsights(result);
 
       result.insights.llmSynthesis = synthesis;
       result.metadata.algorithmsUsed.push('llm_synthesis_v1');

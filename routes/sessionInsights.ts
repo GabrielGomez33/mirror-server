@@ -8,6 +8,10 @@
 // - Request AI insights
 // - Get session insights
 // - Post-session summaries
+//
+// ENHANCED: requestInsightHandler now accepts optional userContext from
+// the request body and passes it through to ConversationAnalyzer for
+// richer, context-aware analysis via the mirror module.
 // ============================================================================
 
 import express, { RequestHandler } from 'express';
@@ -36,6 +40,7 @@ interface InsightRequest {
   sessionId: string;
   type?: 'periodic' | 'on_demand' | 'post_session';
   focusAreas?: string[];
+  userContext?: string;  // Optional user-provided extra context
 }
 
 // ============================================================================
@@ -245,6 +250,7 @@ async function shouldTriggerPeriodicAnalysis(
 
 /**
  * Request an AI insight on-demand
+ * ENHANCED: Accepts optional userContext to guide the analysis
  */
 const requestInsightHandler: RequestHandler = async (req, res) => {
   try {
@@ -255,7 +261,7 @@ const requestInsightHandler: RequestHandler = async (req, res) => {
     }
 
     const { groupId, sessionId } = req.params;
-    const { type, focusAreas }: InsightRequest = req.body;
+    const { type, focusAreas, userContext }: InsightRequest = req.body;
 
     // Validate required fields
     if (!sessionId || typeof sessionId !== 'string') {
@@ -286,14 +292,27 @@ const requestInsightHandler: RequestHandler = async (req, res) => {
     // Set rate limit
     await mirrorRedis.set(rateLimitKey, Date.now().toString(), 300); // 5 min TTL
 
-    // Generate insight
+    // Sanitize userContext (max 2000 chars, defense-in-depth prompt injection stripping)
+    const sanitizedUserContext = userContext
+      ? String(userContext)
+          .slice(0, 2000)
+          .trim()
+          .replace(/\b(system|assistant|user)\s*:/gi, '$1 -')
+          .replace(/```/g, "'''")
+          .replace(/\[INST\]|\[\/INST\]|<<SYS>>|<<\/SYS>>|<\/s>|<s>/gi, '')
+          .replace(/<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>/gi, '')
+        || undefined
+      : undefined;
+
+    // Generate insight - with userContext passed through to analyzer
     const insight = await conversationAnalyzer.analyzeConversation(
       groupId,
       sessionId,
       {
         insightType: type || 'on_demand',
         includeCompatibilityContext: true,
-        focusAreas: focusAreas || ['engagement', 'dynamics', 'actionable']
+        focusAreas: focusAreas || ['engagement', 'dynamics', 'actionable'],
+        userContext: sanitizedUserContext,
       }
     );
 

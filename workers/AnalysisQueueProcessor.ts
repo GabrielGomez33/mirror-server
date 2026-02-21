@@ -29,6 +29,7 @@ interface QueueJob {
   status: 'pending' | 'processing' | 'completed' | 'failed';
   retry_count: number;
   created_at: Date;
+  parameters?: string; // JSON string with { userContext?, requestedBy?, ... }
 }
 
 /**
@@ -212,7 +213,7 @@ export class AnalysisQueueProcessor {
       const [rows] = await DB.query(`
         SELECT
           id, group_id, analysis_type, priority, trigger_event,
-          status, retry_count, created_at
+          status, retry_count, created_at, parameters
         FROM mirror_group_analysis_queue
         WHERE status = 'pending'
           AND (next_retry_at IS NULL OR next_retry_at <= NOW())
@@ -244,7 +245,7 @@ export class AnalysisQueueProcessor {
       const [rows] = await DB.query(`
         SELECT
           id, group_id, analysis_type, priority, trigger_event,
-          status, retry_count, created_at
+          status, retry_count, created_at, parameters
         FROM mirror_group_analysis_queue
         WHERE id = ? AND status = 'pending'
       `, [jobId]);
@@ -287,6 +288,15 @@ export class AnalysisQueueProcessor {
         WHERE id = ?
       `, [job.id]);
 
+      // Extract userContext from job parameters if available
+      let jobUserContext: string | undefined;
+      if (job.parameters) {
+        try {
+          const params = JSON.parse(job.parameters);
+          jobUserContext = params.userContext;
+        } catch { /* ignore parse errors */ }
+      }
+
       // Execute the analysis
       const result = await this.logger.time(
         `Analysis for group ${job.group_id}`,
@@ -297,7 +307,8 @@ export class AnalysisQueueProcessor {
             includeConflicts: true,
             includeGoalAlignment: true,
             includeLLMSynthesis: true,
-            forceRefresh: true
+            forceRefresh: true,
+            userContext: jobUserContext,
           });
         }
       );

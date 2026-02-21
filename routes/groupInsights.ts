@@ -6,6 +6,8 @@
 // - Group analysis and insights endpoints
 // - Compatibility matrix, strengths, conflict risks
 // - UPDATED: Generate insights is now owner-only
+// - ENHANCED: Added /generate-insights route (same handler as /analyze)
+//   to match frontend's groupsApi.generateInsights() calls
 // - JWT validation via authenticateToken middleware
 // ============================================================================
 
@@ -248,9 +250,16 @@ const analyzeGroupHandler: RequestHandler = async (req, res) => {
     const { groupId } = req.params;
     const { forceRefresh = false, userContext } = req.body;
 
-    // Sanitize userContext if provided (max 2000 chars)
+    // Sanitize userContext (max 2000 chars, defense-in-depth prompt injection stripping)
     const sanitizedUserContext = userContext
-      ? String(userContext).slice(0, 2000).trim()
+      ? String(userContext)
+          .slice(0, 2000)
+          .trim()
+          .replace(/\b(system|assistant|user)\s*:/gi, '$1 -')
+          .replace(/```/g, "'''")
+          .replace(/\[INST\]|\[\/INST\]|<<SYS>>|<<\/SYS>>|<\/s>|<s>/gi, '')
+          .replace(/<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>/gi, '')
+        || undefined
       : undefined;
 
     // Verify membership first
@@ -1162,6 +1171,7 @@ const verified = AuthMiddleware.verifyToken as unknown as RequestHandler;
 
 // Register routes with authentication
 router.post('/groups/:groupId/analyze', verified, analyzeGroupHandler);
+router.post('/groups/:groupId/generate-insights', verified, analyzeGroupHandler); // Same handler - frontend calls this endpoint
 router.get('/groups/:groupId/insights', verified, getGroupInsightsHandler);
 router.get('/groups/:groupId/insights/permission', verified, getInsightsPermissionHandler);
 router.get('/groups/:groupId/insights/history', verified, getInsightsHistoryHandler);
