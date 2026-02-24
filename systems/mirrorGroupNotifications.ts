@@ -1,17 +1,24 @@
 // mirror-server/systems/mirrorGroupNotifications.ts
 /**
  * MIRROR GROUP NOTIFICATION SYSTEM
- * 
+ *
  * Handles all group-related notifications:
  * - Group invitations
  * - Peer reviews
  * - Video call notifications
  * - Member activity alerts
  * - Admin role changes
- * 
+ * - Analysis completion events
+ *
  * Delivery channels:
  * - WebSocket (real-time in-app)
  * - Push notifications (placeholder for future)
+ *
+ * CHANGES:
+ * - Added 'analysis_completed' to GroupNotificationType union and validTypes
+ * - Added 'analysis_completed' template in TEMPLATES
+ * - Added sendDirectWebSocketMessage() for raw WebSocket sends (preserves event type)
+ * - Added notifyAnalysisCompleted() for sending to group members
  */
 
 import { EventEmitter } from 'events';
@@ -63,6 +70,8 @@ function isValidGroupNotificationType(type: any): type is GroupNotificationType 
     'chat_mention',
     //Dina processing status
     'dina_processing_started',
+    // Phase 6: Analysis completion
+    'analysis_completed',
   ];
   return typeof type === 'string' && validTypes.includes(type as GroupNotificationType);
 }
@@ -122,7 +131,9 @@ export type GroupNotificationType =
   | 'chat_reactions_updated'
   | 'chat_message_read'
   | 'chat_mention'
-  |	'dina_processing_started';
+  |	'dina_processing_started'
+  // Phase 6: Analysis completion
+  | 'analysis_completed';
 
 // ============================================================================
 // TYPE ALIASES
@@ -138,7 +149,7 @@ type ValidatedNotificationQueue = NotificationQueue & { type: GroupNotificationT
 export class MirrorGroupNotificationSystem extends EventEmitter {
   private initialized: boolean = false;
   private activeConnections: Map<string, WebSocket> = new Map();
-  
+
   // Notification templates
   private readonly TEMPLATES: Record<GroupNotificationType, {
     title: (data: any) => string;
@@ -280,7 +291,15 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
       message: (data) => `DINA: processing started`,
       priority: 'immediate',
       channels: ['websocket','push']
-    }
+    },
+
+    // Phase 6: Analysis completion
+    analysis_completed: {
+      title: (data) => `Analysis Complete`,
+      message: (data) => `Group analysis is ready for "${data.groupName || 'your group'}"`,
+      priority: 'immediate',
+      channels: ['websocket']
+    },
   };
 
   constructor() {
@@ -311,7 +330,7 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
 
       this.initialized = true;
       console.log('✅ Mirror Group Notification System initialized successfully');
-      
+
       this.emit('initialized');
     } catch (error) {
       logError('Failed to initialize Mirror Group Notification System', error);
@@ -379,7 +398,7 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
 
   registerConnection(userId: string, ws: WebSocket): void {
     this.activeConnections.set(userId, ws);
-    
+
     ws.on('close', () => {
       this.activeConnections.delete(userId);
     });
@@ -421,7 +440,7 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
     userName: string;
   }, groupName: string): Promise<boolean[]> {
     const results: boolean[] = [];
-    
+
     for (const member of groupMembers) {
       if (member.userId !== newMember.userId) { // Don't notify the new member
         const result = await this.sendNotification('member_joined', member.userId, {
@@ -431,7 +450,7 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
         results.push(result);
       }
     }
-    
+
     return results;
   }
 
@@ -440,7 +459,7 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
     userName: string;
   }, groupName: string): Promise<boolean[]> {
     const results: boolean[] = [];
-    
+
     for (const member of groupMembers) {
       const result = await this.sendNotification('member_left', member.userId, {
         memberName: leftMember.userName,
@@ -448,7 +467,7 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
       });
       results.push(result);
     }
-    
+
     return results;
   }
 
@@ -470,7 +489,7 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
 
   async notifyCompatibilityUpdated(groupMembers: GroupMember[], groupName: string): Promise<boolean[]> {
     const results: boolean[] = [];
-    
+
     for (const member of groupMembers) {
       const result = await this.sendNotification('compatibility_updated', member.userId, {
         groupName: groupName,
@@ -478,7 +497,7 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
       });
       results.push(result);
     }
-    
+
     return results;
   }
 
@@ -487,7 +506,7 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
     userName: string;
   }, groupName: string, sessionId: string): Promise<boolean[]> {
     const results: boolean[] = [];
-    
+
     for (const member of groupMembers) {
       if (member.userId !== initiator.userId) { // Don't notify the initiator
         const result = await this.sendNotification('video_call_started', member.userId, {
@@ -499,7 +518,7 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
         results.push(result);
       }
     }
-    
+
     return results;
   }
 
@@ -530,7 +549,7 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
     userName: string;
   }, groupName: string, sessionId: string): Promise<boolean[]> {
     const results: boolean[] = [];
-    
+
     for (const member of groupMembers) {
       if (member.userId !== initiator.userId) { // Don't notify the initiator
         const result = await this.sendNotification('drawing_session_started', member.userId, {
@@ -542,7 +561,40 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
         results.push(result);
       }
     }
-    
+
+    return results;
+  }
+
+  /**
+   * Notify all group members that analysis has completed.
+   * Sends direct 'analysis:completed' WebSocket messages (not wrapped as 'group_notification')
+   * so the client's EventHandlers can receive them with the correct event type.
+   */
+  async notifyAnalysisCompleted(
+    groupMembers: GroupMember[],
+    data: {
+      groupId: string;
+      groupName: string;
+      analysisId: string;
+    }
+  ): Promise<boolean[]> {
+    const results: boolean[] = [];
+
+    const wsMessage = JSON.stringify({
+      type: 'analysis:completed',
+      payload: {
+        groupId: data.groupId,
+        analysisId: data.analysisId,
+        status: 'completed',
+        timestamp: new Date().toISOString()
+      }
+    });
+
+    for (const member of groupMembers) {
+      const result = await this.sendDirectWebSocketMessage(member.userId, wsMessage);
+      results.push(result);
+    }
+
     return results;
   }
 
@@ -611,12 +663,39 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
   }
 
   // ============================================================================
+  // DIRECT WEBSOCKET SEND (Phase 6)
+  // ============================================================================
+
+  /**
+   * Send a raw WebSocket message directly to a connected user.
+   * Unlike deliverViaWebSocket which wraps in 'group_notification' type,
+   * this sends the message as-is, preserving the original event type
+   * (e.g., 'analysis:completed').
+   *
+   * Used by the WebSocket server's Redis subscription handler to forward
+   * analysis events directly to clients with the correct event type.
+   */
+  async sendDirectWebSocketMessage(userId: string, message: string): Promise<boolean> {
+    try {
+      const ws = this.activeConnections.get(userId);
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return false;
+      }
+      ws.send(message);
+      return true;
+    } catch (error) {
+      logError(`Direct WebSocket send failed for user ${userId}`, error);
+      return false;
+    }
+  }
+
+  // ============================================================================
   // CORE NOTIFICATION LOGIC
   // ============================================================================
 
   private async sendNotification(
-    type: GroupNotificationType, 
-    userId: string, 
+    type: GroupNotificationType,
+    userId: string,
     data: any
   ): Promise<boolean> {
     try {
@@ -719,7 +798,7 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
 
       // Consider successful if any channel worked
       const success = results.some(result => result === true);
-      
+
       if (!success && queueItem.retryCount < 3) {
         // Requeue with incremented retry count
         queueItem.retryCount++;
@@ -804,7 +883,7 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
 
   async shutdown(): Promise<void> {
     console.log('📬 Shutting down Mirror Group Notification System...');
-    
+
     try {
       // Close all WebSocket connections
       for (const [userId, ws] of this.activeConnections) {

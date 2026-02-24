@@ -8,6 +8,11 @@
  * - Priority-based job execution
  * - Error handling with retry logic
  * - Graceful shutdown
+ * - WebSocket notification on analysis completion
+ *
+ * CHANGES:
+ * - Fixed parameters parsing to handle both string and object types (JSON column compatibility)
+ * - Added WebSocket notification broadcast on analysis completion via Redis pub/sub
  *
  * @module workers/AnalysisQueueProcessor
  * @requires Node.js 18+
@@ -29,7 +34,7 @@ interface QueueJob {
   status: 'pending' | 'processing' | 'completed' | 'failed';
   retry_count: number;
   created_at: Date;
-  parameters?: string; // JSON string with { userContext?, requestedBy?, ... }
+  parameters?: string | Record<string, any>; // May be string OR object depending on MySQL driver/column type
 }
 
 /**
@@ -261,6 +266,39 @@ export class AnalysisQueueProcessor {
   }
 
   /**
+   * Safely parse job parameters, handling both string (TEXT column)
+   * and object (JSON column) types from MySQL.
+   *
+   * FIX: MySQL JSON columns return parsed objects directly via the driver,
+   * while TEXT columns return strings. The previous code only handled strings
+   * and silently swallowed parse errors, causing userContext to always be undefined.
+   */
+  private parseJobParameters(parameters: string | Record<string, any> | undefined): Record<string, any> {
+    if (!parameters) return {};
+
+    // If MySQL driver already parsed the JSON column into an object, use it directly
+    if (typeof parameters === 'object' && parameters !== null) {
+      return parameters;
+    }
+
+    // If it's a string (TEXT column), parse it
+    if (typeof parameters === 'string') {
+      try {
+        const parsed = JSON.parse(parameters);
+        return typeof parsed === 'object' && parsed !== null ? parsed : {};
+      } catch (error) {
+        this.logger.warn('Failed to parse job parameters JSON string', {
+          error: (error as Error).message,
+          parametersPreview: parameters.substring(0, 100)
+        });
+        return {};
+      }
+    }
+
+    return {};
+  }
+
+  /**
    * Process a single job
    */
   private async processJob(job: QueueJob): Promise<void> {
@@ -288,14 +326,16 @@ export class AnalysisQueueProcessor {
         WHERE id = ?
       `, [job.id]);
 
-      // Extract userContext from job parameters if available
-      let jobUserContext: string | undefined;
-      if (job.parameters) {
-        try {
-          const params = JSON.parse(job.parameters);
-          jobUserContext = params.userContext;
-        } catch { /* ignore parse errors */ }
-      }
+      // FIX: Extract userContext using safe parser that handles both string and object types
+      const params = this.parseJobParameters(job.parameters);
+      const jobUserContext: string | undefined = params.userContext;
+
+      this.logger.debug('Extracted job parameters', {
+        jobId: job.id,
+        hasUserContext: !!jobUserContext,
+        userContextLength: jobUserContext?.length || 0,
+        parametersType: typeof job.parameters
+      });
 
       // Execute the analysis
       const result = await this.logger.time(
@@ -338,6 +378,12 @@ export class AnalysisQueueProcessor {
         processingTime: result.metadata.processingTime
       });
 
+      // FIX: Broadcast analysis:completed via Redis so WebSocket server can notify clients.
+      // This is separate from GroupAnalyzer.queueNotifications() which publishes to a
+      // PUB/SUB channel that nothing subscribes to. This publishes to a channel that
+      // the WebSocket server (setupWSS.ts) should subscribe to for real-time delivery.
+      await this.broadcastAnalysisCompleted(job.group_id, result.analysisId);
+
     } catch (error) {
       this.logger.error('Job processing failed', {
         jobId: job.id,
@@ -347,9 +393,55 @@ export class AnalysisQueueProcessor {
 
       // Handle retry logic
       await this.handleJobFailure(job, error);
+
+      // Broadcast analysis failure so frontend can clear loading state
+      await this.broadcastAnalysisFailed(job.group_id);
     } finally {
       // Remove from current jobs
       this.currentJobs.delete(job.id);
+    }
+  }
+
+  /**
+   * Broadcast analysis completion to all connected group members via Redis.
+   * The WebSocket server subscribes to 'mirror:analysis:events' and forwards
+   * the message to connected clients with the matching groupId.
+   */
+  private async broadcastAnalysisCompleted(groupId: string, analysisId: string): Promise<void> {
+    try {
+      await mirrorRedis.publish(
+        'mirror:analysis:events',
+        JSON.stringify({
+          type: 'analysis:completed',
+          groupId,
+          analysisId,
+          status: 'completed',
+          timestamp: new Date().toISOString()
+        })
+      );
+      this.logger.info('Broadcast analysis:completed event', { groupId, analysisId });
+    } catch (error) {
+      this.logger.error('Failed to broadcast analysis:completed', { groupId, error });
+    }
+  }
+
+  /**
+   * Broadcast analysis failure so frontend can clear loading state
+   */
+  private async broadcastAnalysisFailed(groupId: string): Promise<void> {
+    try {
+      await mirrorRedis.publish(
+        'mirror:analysis:events',
+        JSON.stringify({
+          type: 'analysis:completed',
+          groupId,
+          status: 'failed',
+          timestamp: new Date().toISOString()
+        })
+      );
+      this.logger.info('Broadcast analysis:failed event', { groupId });
+    } catch (error) {
+      this.logger.error('Failed to broadcast analysis:failed', { groupId, error });
     }
   }
 

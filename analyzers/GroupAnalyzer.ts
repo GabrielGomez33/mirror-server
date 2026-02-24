@@ -10,6 +10,16 @@
  * - Goal alignment scoring
  * - LLM synthesis coordination
  *
+ * CHANGES:
+ * - storeLLMSynthesis(): Removed DELETE before INSERT to preserve insight history.
+ *   The GET /insights endpoint uses ORDER BY generated_at DESC LIMIT 1
+ *   so old entries don't interfere, and the history endpoint benefits from them.
+ * - analyzeGroup(): Now fetches recent group chat history and passes it
+ *   to the LLM synthesis for richer, conversation-aware insights.
+ *   Follows the same pattern as @dina chat (DinaChatQueueProcessor).
+ * - runLLMSynthesis(): Updated to accept and forward conversationHistory
+ *   to DINALLMConnector, which already supports it in SynthesisOptions.
+ *
  * @module analyzers/GroupAnalyzer
  * @requires Node.js 18+, TypeScript 5+
  */
@@ -298,12 +308,20 @@ export class GroupAnalyzer {
         );
       }
 
+      // Fetch chat history in parallel with other analyses (non-blocking)
+      // Uses first member's userId for group encryption decryption
+      const chatHistoryPromise = this.fetchChatHistory(groupId, memberData[0].userId);
+      analysisPromises.push(chatHistoryPromise.then(() => {})); // Add to parallel work, ignore result in Promise.all
+
       // Execute parallel analyses
       await Promise.all(analysisPromises);
 
+      // Retrieve chat history result (already resolved)
+      const conversationHistory = await chatHistoryPromise;
+
       // LLM Synthesis (requires other analyses to complete first)
       if (analysisOptions.includeLLMSynthesis && Object.keys(result.insights).length > 0) {
-        await this.runLLMSynthesis(result, analysisOptions.userContext);
+        await this.runLLMSynthesis(result, analysisOptions.userContext, conversationHistory);
       }
 
       // Calculate overall confidence
@@ -449,6 +467,84 @@ export class GroupAnalyzer {
   }
 
   /**
+   * Fetch recent group chat history for LLM synthesis context.
+   *
+   * Follows the same pattern as DinaChatQueueProcessor.buildDinaContext():
+   * - Queries mirror_group_messages (most recent first)
+   * - Decrypts each message using group encryption
+   * - Returns in chronological order (oldest first) for natural conversation flow
+   *
+   * Limits:
+   * - Fetches 50 messages from DB (comprehensive context window)
+   * - Sends last 25 to the LLM (balances richness vs token budget)
+   * - Content truncated to 300 chars per message
+   *
+   * Non-blocking: returns empty array on failure so analysis continues.
+   */
+  private async fetchChatHistory(
+    groupId: string,
+    memberUserId: string
+  ): Promise<Array<{ speaker: string; text: string; timestamp?: string }>> {
+    try {
+      const [rows] = await DB.query(`
+        SELECT m.content, m.sender_user_id, u.username, m.created_at
+        FROM mirror_group_messages m
+        LEFT JOIN users u ON u.id = m.sender_user_id
+        WHERE m.group_id = ? AND m.is_deleted = 0
+        ORDER BY m.created_at DESC
+        LIMIT 50
+      `, [groupId]);
+
+      const messages = rows as any[];
+
+      if (messages.length === 0) {
+        this.logger.debug('No chat history found for group', { groupId });
+        return [];
+      }
+
+      // Decrypt messages in parallel (following @dina pattern)
+      const decrypted = await Promise.all(
+        messages.map(async (msg) => {
+          let content = msg.content;
+          try {
+            const result = await groupEncryptionManager.decryptForUser(
+              msg.content,
+              memberUserId,
+              groupId
+            );
+            content = result.data.toString('utf-8');
+          } catch {
+            // Fallback to raw content if decryption fails
+            // This can happen for system messages or messages from removed members
+            this.logger.debug('Could not decrypt chat message, using raw content');
+          }
+
+          return {
+            speaker: msg.username || `User ${msg.sender_user_id}`,
+            text: content.substring(0, 300),
+            timestamp: msg.created_at?.toISOString?.() || String(msg.created_at),
+          };
+        })
+      );
+
+      // Reverse to chronological order (oldest first), take last 25
+      const chronological = decrypted.reverse().slice(-25);
+
+      this.logger.info('Chat history loaded for analysis', {
+        groupId,
+        totalFetched: messages.length,
+        afterDecryptAndTrim: chronological.length,
+      });
+
+      return chronological;
+    } catch (error) {
+      this.logger.error('Failed to fetch chat history for analysis', error);
+      // Non-blocking: analysis continues without chat context
+      return [];
+    }
+  }
+
+  /**
    * Run compatibility analysis
    */
   private async runCompatibilityAnalysis(
@@ -534,13 +630,31 @@ export class GroupAnalyzer {
   }
 
   /**
-   * Run LLM synthesis
+   * Run LLM synthesis with optional user context and conversation history
    */
-  private async runLLMSynthesis(result: GroupAnalysisResult, userContext?: string): Promise<void> {
+  private async runLLMSynthesis(
+    result: GroupAnalysisResult,
+    userContext?: string,
+    conversationHistory?: Array<{ speaker: string; text: string; timestamp?: string }>
+  ): Promise<void> {
     try {
-      // Pass userContext as SynthesisOptions if the connector supports it
-      const synthesis = userContext
-        ? await dinaLLMConnector.synthesizeInsights(result, { userContext } as any)
+      // Build synthesis options with all available context
+      const hasSynthesisContext = userContext || (conversationHistory && conversationHistory.length > 0);
+      const synthesisOptions = hasSynthesisContext
+        ? {
+            ...(userContext ? { userContext } : {}),
+            ...(conversationHistory && conversationHistory.length > 0 ? { conversationHistory } : {}),
+          }
+        : undefined;
+
+      this.logger.info('Running LLM synthesis', {
+        groupId: result.groupId,
+        hasUserContext: !!userContext,
+        chatHistoryEntries: conversationHistory?.length || 0,
+      });
+
+      const synthesis = synthesisOptions
+        ? await dinaLLMConnector.synthesizeInsights(result, synthesisOptions)
         : await dinaLLMConnector.synthesizeInsights(result);
 
       result.insights.llmSynthesis = synthesis;
@@ -849,18 +963,17 @@ export class GroupAnalyzer {
 
   /**
    * Store LLM synthesis
+   *
+   * FIX: Do NOT delete previous entries - they form the insights history.
+   * The GET /insights endpoint uses ORDER BY generated_at DESC LIMIT 1
+   * to fetch the latest synthesis, so old entries don't interfere.
+   * The GET /insights/history endpoint returns all entries for the group.
    */
   private async storeLLMSynthesis(
     groupId: string,
     synthesis: LLMSynthesis
   ): Promise<void> {
     try {
-      // Delete existing overview synthesis for this group
-      await DB.query(`
-        DELETE FROM mirror_group_llm_synthesis
-        WHERE group_id = ? AND synthesis_type = 'overview'
-      `, [groupId]);
-
       // Build key points from synthesis data
       const keyPoints = {
         overview: synthesis.overview,
@@ -877,7 +990,7 @@ export class GroupAnalyzer {
         analysisVersion: '1.0'
       };
 
-      // Insert new synthesis
+      // Insert new synthesis (preserving previous entries for history)
       await DB.query(`
         INSERT INTO mirror_group_llm_synthesis (
           id, group_id, synthesis_type, title, content, key_points,

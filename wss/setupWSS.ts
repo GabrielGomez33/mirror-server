@@ -3,6 +3,7 @@
 // Phase 5.1: @Dina broadcast bridge via Redis pub/sub
 // Phase 5.2: last_active tracking on connect/disconnect
 // Phase 6: Robust connection management with native ping/pong
+// Phase 6.1: Analysis completion event bridge via Redis pub/sub
 
 import { WebSocketServer, WebSocket } from 'ws';
 import { IncomingMessage } from 'http';
@@ -149,7 +150,7 @@ export function SetupWebSocket(
     console.error('Failed to initialize chat WebSocket handler:', err);
   });
 
-  // Subscribe to @Dina broadcast channel (bridges separate processor → chat WebSocket)
+  // Subscribe to @Dina broadcast channel (bridges separate processor -> chat WebSocket)
   mirrorRedis.subscribe(DINA_BROADCAST_CHANNEL, (message: string) => {
     try {
       const { groupId, payload } = JSON.parse(message);
@@ -162,6 +163,53 @@ export function SetupWebSocket(
     }
   });
 
+  // Subscribe to analysis completion events (bridges AnalysisQueueProcessor -> group WebSockets)
+  // When group analysis completes, the AnalysisQueueProcessor publishes to 'mirror:analysis:events'.
+  // This subscription forwards those events to connected group members via their WebSocket connections.
+  mirrorRedis.subscribe('mirror:analysis:events', async (message: string) => {
+    try {
+      const event = JSON.parse(message);
+      console.log(`[ANALYSIS-BRIDGE] Received ${event.type} for group ${event.groupId}`);
+
+      if (!event.groupId) return;
+
+      // Get all members of this group to notify them
+      const [memberRows]: any = await DB.query(
+        `SELECT user_id FROM mirror_group_members WHERE group_id = ? AND status = 'active'`,
+        [event.groupId]
+      );
+
+      if (!memberRows || memberRows.length === 0) return;
+
+      // Build the WebSocket message matching what the client expects
+      const wsMessage = JSON.stringify({
+        type: event.type, // 'analysis:completed' - matches client's EventHandlers key
+        payload: {
+          groupId: event.groupId,
+          analysisId: event.analysisId,
+          status: event.status,
+          timestamp: event.timestamp
+        }
+      });
+
+      // Send to all connected group members via their WebSocket connections
+      let deliveredCount = 0;
+      for (const row of memberRows) {
+        const userId = String(row.user_id);
+        if (groupNotifications) {
+          const sent = await groupNotifications.sendDirectWebSocketMessage(userId, wsMessage);
+          if (sent) {
+            deliveredCount++;
+          }
+        }
+      }
+
+      console.log(`[ANALYSIS-BRIDGE] Delivered ${event.type} to ${deliveredCount} client(s) in group ${event.groupId}`);
+    } catch (err) {
+      console.error('[ANALYSIS-BRIDGE] Failed to relay analysis event:', err);
+    }
+  });
+
   // Single WebSocket server - no path specified
   const wss = new WebSocketServer({
     server
@@ -171,7 +219,7 @@ export function SetupWebSocket(
   // Server-side heartbeat sweep: ping all connections, terminate dead ones
   // --------------------------------------------------------------------------
   // This runs at PING_INTERVAL. On each sweep:
-  //   1. Any connection that hasn't responded to the PREVIOUS ping is dead → terminate it.
+  //   1. Any connection that hasn't responded to the PREVIOUS ping is dead -> terminate it.
   //   2. All surviving connections get a new ping frame sent.
   // The ws library's native ping/pong uses WebSocket control frames (opcode 0x9/0xA).
   // Browsers respond to these automatically at the protocol level - no client JS needed.

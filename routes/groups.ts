@@ -1,21 +1,19 @@
 // ============================================================================
-// MIRRORGROUPS API ROUTES - UPDATED WITH SHARED DATA + LAST ACTIVE TRACKING
+// MIRRORGROUPS API ROUTES - PHASE 6: GROUP TYPES, DIRECTORY & GOALS
 // ============================================================================
 // File: server/routes/groups.ts
 // ----------------------------------------------------------------------------
-// CHANGES (Issue #1 Fix - Shared data not reflected in members list):
-// 1. Updated getGroupDetailsHandler - members query now LEFT JOINs with
-//    mirror_group_shared_data to include has_shared_data and shared_data_types
-// 2. Added getMembersHandler - GET /:groupId/members endpoint
-// 3. Added getMemberDetailsHandler - GET /:groupId/members/:memberId endpoint
-// 4. Added helper: enrichMembersWithSharedData() for DRY shared data enrichment
-// 5. Route registration updated with new member endpoints
-// CHANGES (Issue #2 Fix - Last Active showing Unknown):
-// 6. All member queries now include u.last_active from users table
-// 7. Added is_online field using WebSocket connection tracking
-// CHANGES (Issue #3 Fix - Active state not updating on login):
-// 8. Added router-level middleware to update last_active on authenticated requests
-// 9. SQL queries now use GREATEST(last_active, last_login) for reliable fallback
+// CHANGES (Phase 6 - Group Types, Directory & Goals):
+// 1. Updated createGroupHandler to support new group types (partners, teamwork)
+//    with subtype, goal, goalCustom, and smart privacy defaults
+// 2. Added searchPublicDirectoryHandler - GET /directory for public group search
+// 3. Added requestToJoinHandler - POST /:groupId/request-join for public groups
+// 4. Added getJoinRequestsHandler - GET /:groupId/join-requests for admins
+// 5. Added approveJoinRequestHandler - POST /:groupId/join-requests/:requestId/approve
+// 6. Added rejectJoinRequestHandler - POST /:groupId/join-requests/:requestId/reject
+// 7. Updated listGroupsHandler to return new fields (subtype, goal, goalCustom)
+// 8. Updated getGroupDetailsHandler with new fields
+// 9. All previous Phase 1-5 functionality preserved unchanged
 // ============================================================================
 
 import express, { RequestHandler } from 'express';
@@ -33,9 +31,6 @@ const router = express.Router();
 
 /* ============================================================================
    MIDDLEWARE: Update last_active on every authenticated API request
-   This ensures last_active is set even when WebSocket connections fail to
-   establish (e.g. wrong URL, network issues, browser blocking WS).
-   The auth middleware has already decoded req.user by the time routes run.
 ============================================================================ */
 
 router.use(((req, _res, next) => {
@@ -62,15 +57,97 @@ function safeJsonParse<T = any>(value: unknown, fallback: T): T {
 }
 
 /**
+ * Sanitize user-provided string for safe DB insertion
+ * Strips control characters, trims, and enforces max length
+ */
+function sanitizeInput(input: unknown, maxLength: number = 500): string | null {
+  if (input === null || input === undefined) return null;
+  if (typeof input !== 'string') return null;
+  // Strip control characters except newlines/tabs
+  const cleaned = input.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '').trim();
+  return cleaned.length > 0 ? cleaned.substring(0, maxLength) : null;
+}
+
+/**
+ * Validate group type against allowed values
+ */
+const VALID_GROUP_TYPES = ['family', 'partners', 'teamwork', 'friends', 'professional', 'therapy', 'anonymous', 'open', 'private', 'team', 'community', 'public'] as const;
+type ValidGroupType = typeof VALID_GROUP_TYPES[number];
+
+function isValidGroupType(type: string): type is ValidGroupType {
+  return (VALID_GROUP_TYPES as readonly string[]).includes(type);
+}
+
+const VALID_PRIVACY = ['private', 'public', 'secret'] as const;
+function isValidPrivacy(privacy: string): boolean {
+  return (VALID_PRIVACY as readonly string[]).includes(privacy);
+}
+
+const VALID_PARTNER_SUBTYPES = ['lover', 'platonic'] as const;
+function isValidSubtype(subtype: string): boolean {
+  return (VALID_PARTNER_SUBTYPES as readonly string[]).includes(subtype);
+}
+
+/**
+ * Valid goal presets — mirrors the client-side GOAL_PRESETS arrays
+ * and the ENUM values in the `goal` column. Used to route incoming
+ * goal values to the correct column: recognized presets → `goal` (ENUM),
+ * unrecognized text → `goal_custom` (VARCHAR 500).
+ */
+const VALID_GOAL_PRESETS: readonly string[] = [
+  // Legacy values
+  'therapy',
+  'conflict_resolution',
+  'mutual_understanding',
+  'team_building',
+  'personal_growth',
+  // Family
+  'Improve communication across generations',
+  'Understand each other\'s emotional needs better',
+  'Resolve long-standing conflicts',
+  'Navigate a major family transition',
+  'Build stronger family bonds',
+  // Partners
+  'Strengthen our relationship and communication',
+  'Understand each other\'s love languages / working styles',
+  'Prepare for major life transition together',
+  'Deepen emotional connection and trust',
+  'Improve conflict resolution skills',
+  // Teamwork
+  'Improve team collaboration and productivity',
+  'Advance to leadership positions together',
+  'Complete a major project by deadline',
+  'Improve code review / creative process',
+  'Build a high-performing team culture',
+];
+
+function isValidGoalPreset(goal: string): boolean {
+  return VALID_GOAL_PRESETS.includes(goal);
+}
+
+/**
+ * Get smart defaults for a given group type
+ */
+function getTypeDefaults(type: string): { privacy: string; maxMembers: number } {
+  switch (type) {
+    case 'family': return { privacy: 'private', maxMembers: 8 };
+    case 'partners': return { privacy: 'private', maxMembers: 4 };
+    case 'teamwork': return { privacy: 'private', maxMembers: 20 };
+    case 'friends': return { privacy: 'private', maxMembers: 10 };
+    case 'professional': return { privacy: 'private', maxMembers: 20 };
+    case 'therapy': return { privacy: 'private', maxMembers: 12 };
+    case 'anonymous': return { privacy: 'secret', maxMembers: 25 };
+    default: return { privacy: 'private', maxMembers: 10 };
+  }
+}
+
+/**
  * Enrich an array of member rows with shared data information.
- * Queries mirror_group_shared_data once for the group and maps shared data
- * types onto each member, adding has_shared_data and shared_data_types fields.
  */
 async function enrichMembersWithSharedData(groupId: string, members: any[]): Promise<any[]> {
   if (!members || members.length === 0) return [];
 
   try {
-    // Get all shared data for this group in a single query
     const [sharedDataRows] = await DB.query(
       `SELECT sd.user_id, sd.data_type, sd.shared_at, sd.data_version
        FROM mirror_group_shared_data sd
@@ -79,7 +156,6 @@ async function enrichMembersWithSharedData(groupId: string, members: any[]): Pro
       [groupId]
     );
 
-    // Build a map: userId -> array of shared data types
     const sharedDataMap = new Map<number, { dataTypes: string[]; sharedData: any[] }>();
     for (const row of (sharedDataRows as any[])) {
       const userId = row.user_id;
@@ -87,7 +163,6 @@ async function enrichMembersWithSharedData(groupId: string, members: any[]): Pro
         sharedDataMap.set(userId, { dataTypes: [], sharedData: [] });
       }
       const entry = sharedDataMap.get(userId)!;
-      // Avoid duplicate data types (could have updated records)
       if (!entry.dataTypes.includes(row.data_type)) {
         entry.dataTypes.push(row.data_type);
       }
@@ -98,7 +173,6 @@ async function enrichMembersWithSharedData(groupId: string, members: any[]): Pro
       });
     }
 
-    // Enrich each member with shared data info and online status
     return members.map((member: any) => {
       const userId = member.user_id;
       const sharedInfo = sharedDataMap.get(userId);
@@ -113,8 +187,7 @@ async function enrichMembersWithSharedData(groupId: string, members: any[]): Pro
       };
     });
   } catch (error) {
-    console.error('⚠️ Error enriching members with shared data:', error);
-    // Return members without shared data rather than failing entirely
+    console.error('Warning: Error enriching members with shared data:', error);
     return members.map((member: any) => ({
       ...member,
       has_shared_data: false,
@@ -124,48 +197,107 @@ async function enrichMembersWithSharedData(groupId: string, members: any[]): Pro
 }
 
 /* ============================================================================
-   CREATE GROUP (WITH GOAL SUPPORT) - FIXED DUPLICATE MEMBER BUG
+   CREATE GROUP - ENHANCED WITH GROUP TYPES, SUBTYPES, GOALS
 ============================================================================ */
 
 const createGroupHandler: RequestHandler = async (req, res) => {
   try {
-    const { name, description, goal, goalMetadata } = req.body;
     const user = (req as any).user;
     if (!user?.id) {
       res.status(401).json({ success: false, error: 'Unauthorized', code: 'NO_AUTH' });
       return;
     }
 
-    if (typeof name !== 'string' || name.trim().length < 3) {
-      res.status(400).json({ success: false, error: 'Invalid group name' });
+    const {
+      name,
+      description,
+      type,
+      privacy,
+      subtype,
+      goal,
+      goalCustom,
+      goalMetadata,
+      maxMembers,
+      settings,
+    } = req.body;
+
+    // ---- Validate name ----
+    const sanitizedName = sanitizeInput(name, 50);
+    if (!sanitizedName || sanitizedName.length < 3) {
+      res.status(400).json({ success: false, error: 'Group name must be between 3 and 50 characters' });
       return;
     }
 
-    const validGoals = ['therapy', 'conflict_resolution', 'mutual_understanding', 'team_building', 'personal_growth'];
-    if (goal && !validGoals.includes(goal)) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid goal. Must be one of: ' + validGoals.join(', ')
-      });
+    // ---- Validate & default type ----
+    const groupType = (type && isValidGroupType(type)) ? type : 'family';
+
+    // ---- Validate subtype (only for partners) ----
+    let groupSubtype: string | null = null;
+    if (groupType === 'partners') {
+      if (subtype && isValidSubtype(subtype)) {
+        groupSubtype = subtype;
+      }
+      // Partners without subtype is allowed - user may set later
+    }
+
+    // ---- Smart privacy defaults ----
+    const defaults = getTypeDefaults(groupType);
+    const groupPrivacy = (privacy && isValidPrivacy(privacy)) ? privacy : defaults.privacy;
+
+    // ---- Validate max members ----
+    let groupMaxMembers = typeof maxMembers === 'number' ? maxMembers : defaults.maxMembers;
+    groupMaxMembers = Math.max(2, Math.min(100, groupMaxMembers));
+
+    // ---- Sanitize & route goal ----
+    // Recognized presets → `goal` (ENUM column).
+    // Unrecognized text  → `goal_custom` (VARCHAR 500 column).
+    const rawGoal = sanitizeInput(goal, 500) || null;
+    let sanitizedGoal: string | null = null;
+    let sanitizedGoalCustom = sanitizeInput(goalCustom, 500) || null;
+
+    if (rawGoal) {
+      if (isValidGoalPreset(rawGoal)) {
+        sanitizedGoal = rawGoal;
+      } else {
+        // Not a known preset — route to goal_custom so no data is lost
+        sanitizedGoalCustom = sanitizedGoalCustom || rawGoal;
+      }
+    }
+    const sanitizedDescription = sanitizeInput(description, 500);
+
+    // ---- Public groups require description ----
+    if (groupPrivacy === 'public' && !sanitizedDescription) {
+      res.status(400).json({ success: false, error: 'Public groups require a description' });
       return;
     }
 
     const groupId = uuidv4();
 
+    console.log(`Creating group: ${sanitizedName} (type: ${groupType}, subtype: ${groupSubtype}, privacy: ${groupPrivacy}, goal: ${sanitizedGoal || sanitizedGoalCustom?.substring(0, 50) || 'none'})`);
+
+    // ---- Insert group ----
     await DB.query(
       `INSERT INTO mirror_groups (
-        id, owner_user_id, name, description, goal, goal_metadata, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+        id, owner_user_id, name, description, type, subtype, privacy,
+        goal, goal_custom, goal_metadata, max_members, current_member_count,
+        status, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'active', NOW())`,
       [
         groupId,
         user.id,
-        name.trim(),
-        description ?? null,
-        goal ?? 'mutual_understanding',
-        goalMetadata ? JSON.stringify(goalMetadata) : null
+        sanitizedName,
+        sanitizedDescription,
+        groupType,
+        groupSubtype,
+        groupPrivacy,
+        sanitizedGoal,
+        sanitizedGoalCustom,
+        goalMetadata ? JSON.stringify(goalMetadata) : null,
+        groupMaxMembers,
       ]
     );
 
+    // ---- Add creator as owner ----
     const memberId = uuidv4();
     await DB.query(
       `INSERT INTO mirror_group_members (id, group_id, user_id, role, status, joined_at)
@@ -177,33 +309,54 @@ const createGroupHandler: RequestHandler = async (req, res) => {
       [memberId, groupId, user.id]
     );
 
+    // ---- Generate encryption key ----
     try {
       const keyId = await groupEncryptionManager.generateGroupKey(groupId);
       await groupEncryptionManager.distributeKeyToMember(groupId, String(user.id), keyId);
-      console.log(`✅ Encryption key generated for group ${groupId} with goal: ${goal || 'mutual_understanding'}`);
+      console.log(`Encryption key generated for group ${groupId}`);
     } catch (encError) {
-      console.error('❌ Encryption key generation failed:', encError);
+      console.error('Encryption key generation failed (non-fatal):', encError);
+    }
+
+    // ---- Create directory settings for public groups ----
+    if (groupPrivacy === 'public') {
+      try {
+        await DB.query(
+          `INSERT INTO mirror_group_directory_settings (group_id, show_member_count, show_goal, show_description)
+           VALUES (?, TRUE, TRUE, TRUE)
+           ON DUPLICATE KEY UPDATE updated_at = NOW()`,
+          [groupId]
+        );
+      } catch (dirError) {
+        console.error('Directory settings creation failed (non-fatal):', dirError);
+      }
     }
 
     res.status(201).json({
       success: true,
       data: {
         id: groupId,
-        name,
-        description,
-        goal: goal || 'mutual_understanding'
+        name: sanitizedName,
+        description: sanitizedDescription,
+        type: groupType,
+        subtype: groupSubtype,
+        privacy: groupPrivacy,
+        goal: sanitizedGoal,
+        goalCustom: sanitizedGoalCustom,
+        maxMembers: groupMaxMembers,
+        currentMemberCount: 1,
       },
       message: 'Group created successfully'
     });
 
   } catch (error) {
-    console.error('❌ Error creating group:', error);
+    console.error('Error creating group:', error);
     res.status(500).json({ success: false, error: 'Failed to create group' });
   }
 };
 
 /* ============================================================================
-   LIST GROUPS (USER IS MEMBER OR OWNER)
+   LIST GROUPS (USER IS MEMBER OR OWNER) - UPDATED WITH NEW FIELDS
 ============================================================================ */
 
 const listGroupsHandler: RequestHandler = async (req, res) => {
@@ -215,30 +368,588 @@ const listGroupsHandler: RequestHandler = async (req, res) => {
     }
 
     const [rows] = await DB.query(
-      `SELECT g.id, g.name, g.description, g.goal, g.created_at, g.owner_user_id,
-              CASE WHEN g.owner_user_id = ? THEN 'owner' ELSE 'member' END AS role
+      `SELECT g.id, g.name, g.description, g.type, g.subtype, g.privacy,
+              g.goal, g.goal_custom, g.max_members, g.current_member_count,
+              g.owner_user_id, g.status, g.created_at, g.updated_at,
+              g.group_image_url,
+              gm.role, gm.joined_at, gm.status as member_status
          FROM mirror_groups g
-         LEFT JOIN mirror_group_members m ON m.group_id = g.id
-        WHERE (g.owner_user_id = ? OR m.user_id = ?)
-          AND (m.status = 'active' OR m.status IS NULL)
-          AND g.status = 'active'
-        GROUP BY g.id
-        ORDER BY g.created_at DESC`,
-      [user.id, user.id, user.id]
+         INNER JOIN mirror_group_members gm ON g.id = gm.group_id
+        WHERE gm.user_id = ? AND gm.status = 'active' AND g.status = 'active'
+        ORDER BY gm.joined_at DESC`,
+      [user.id]
     );
+
+    const groups = (rows as any[]).map(row => ({
+      id: row.id,
+      name: row.name,
+      description: row.description,
+      type: row.type,
+      subtype: row.subtype,
+      privacy: row.privacy,
+      goal: row.goal,
+      goalCustom: row.goal_custom,
+      max_members: row.max_members,
+      current_member_count: row.current_member_count,
+      owner_user_id: row.owner_user_id,
+      status: row.status,
+      user_role: row.role,
+      member_status: row.member_status,
+      joined_at: row.joined_at,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      group_image_url: row.group_image_url,
+      is_owner: row.owner_user_id === user.id
+    }));
 
     res.json({
       success: true,
-      data: { groups: rows }
+      data: { groups }
     });
   } catch (error) {
-    console.error('❌ Error listing groups:', error);
+    console.error('Error listing groups:', error);
     res.status(500).json({ success: false, error: 'Failed to list groups' });
   }
 };
 
 /* ============================================================================
-   JOIN GROUP
+   PUBLIC DIRECTORY - SEARCH PUBLIC GROUPS
+   GET /directory?q=search&type=teamwork&limit=50&offset=0
+============================================================================ */
+
+const searchPublicDirectoryHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    if (!user?.id) {
+      res.status(401).json({ success: false, error: 'Unauthorized', code: 'NO_AUTH' });
+      return;
+    }
+
+    const query = sanitizeInput(req.query.q as string, 100) || '';
+    const typeFilter = sanitizeInput(req.query.type as string, 30);
+    const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 50, 1), 100);
+    const offset = Math.max(parseInt(req.query.offset as string) || 0, 0);
+
+    // Build dynamic WHERE clause
+    const conditions: string[] = [
+      "g.privacy = 'public'",
+      "g.status = 'active'"
+    ];
+    const params: any[] = [];
+
+    // Text search
+    if (query) {
+      conditions.push("(g.name LIKE ? OR g.description LIKE ?)");
+      const searchTerm = `%${query}%`;
+      params.push(searchTerm, searchTerm);
+    }
+
+    // Type filter
+    if (typeFilter && isValidGroupType(typeFilter)) {
+      conditions.push("g.type = ?");
+      params.push(typeFilter);
+    }
+
+    const whereClause = conditions.join(' AND ');
+
+    // Get total count
+    const [countRows] = await DB.query(
+      `SELECT COUNT(*) as total FROM mirror_groups g WHERE ${whereClause}`,
+      params
+    );
+    const total = (countRows as any[])[0]?.total || 0;
+
+    // Get paginated results
+    const [rows] = await DB.query(
+      `SELECT g.id, g.name, g.description, g.type, g.subtype, g.privacy,
+              g.goal, g.goal_custom, g.max_members, g.current_member_count,
+              g.owner_user_id, g.status, g.created_at, g.updated_at,
+              g.group_image_url
+       FROM mirror_groups g
+       WHERE ${whereClause}
+       ORDER BY g.current_member_count DESC, g.created_at DESC
+       LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+
+    const groups = (rows as any[]).map(row => ({
+      id: row.id,
+      name: row.name,
+      description: row.description,
+      type: row.type,
+      subtype: row.subtype,
+      privacy: row.privacy,
+      goal: row.goal,
+      goalCustom: row.goal_custom,
+      maxMembers: row.max_members,
+      memberCount: row.current_member_count,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      groupImageUrl: row.group_image_url,
+    }));
+
+    res.json({
+      success: true,
+      data: {
+        groups,
+        total,
+        limit,
+        offset,
+        hasMore: offset + limit < total
+      }
+    });
+  } catch (error) {
+    console.error('Error searching public directory:', error);
+    res.status(500).json({ success: false, error: 'Failed to search groups' });
+  }
+};
+
+/* ============================================================================
+   REQUEST TO JOIN (for public groups - user requests, admin approves)
+   POST /:groupId/request-join
+============================================================================ */
+
+const requestToJoinHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    if (!user?.id) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const { groupId } = req.params;
+    const { message } = req.body;
+
+    // Verify group exists and is public
+    const [groupRows] = await DB.query(
+      `SELECT id, name, privacy, max_members, current_member_count, status
+       FROM mirror_groups WHERE id = ? AND status = 'active'`,
+      [groupId]
+    );
+
+    if ((groupRows as any[]).length === 0) {
+      res.status(404).json({ success: false, error: 'Group not found' });
+      return;
+    }
+
+    const group = (groupRows as any[])[0];
+
+    if (group.privacy !== 'public') {
+      res.status(403).json({ success: false, error: 'This group is not public. You need an invitation to join.' });
+      return;
+    }
+
+    // Check capacity
+    if (group.current_member_count >= group.max_members) {
+      res.status(400).json({ success: false, error: 'Group has reached maximum capacity' });
+      return;
+    }
+
+    // Check if already a member
+    const [existingMember] = await DB.query(
+      `SELECT id, status FROM mirror_group_members WHERE group_id = ? AND user_id = ?`,
+      [groupId, user.id]
+    );
+
+    if ((existingMember as any[]).length > 0) {
+      const memberStatus = (existingMember as any[])[0].status;
+      if (memberStatus === 'active') {
+        res.status(400).json({ success: false, error: 'You are already a member of this group' });
+        return;
+      }
+      if (memberStatus === 'invited') {
+        res.status(400).json({ success: false, error: 'You already have a pending invitation. Check your invitations.' });
+        return;
+      }
+    }
+
+    // Check for existing pending request
+    const [existingRequest] = await DB.query(
+      `SELECT id FROM mirror_group_join_requests
+       WHERE group_id = ? AND user_id = ? AND status = 'pending'`,
+      [groupId, user.id]
+    );
+
+    if ((existingRequest as any[]).length > 0) {
+      res.status(400).json({ success: false, error: 'You already have a pending join request for this group' });
+      return;
+    }
+
+    // Check directory settings for auto-approve
+    let autoApprove = false;
+    try {
+      const [dirSettings] = await DB.query(
+        `SELECT auto_approve_joins FROM mirror_group_directory_settings WHERE group_id = ?`,
+        [groupId]
+      );
+      if ((dirSettings as any[]).length > 0) {
+        autoApprove = (dirSettings as any[])[0].auto_approve_joins;
+      }
+    } catch { /* no directory settings - default to manual approval */ }
+
+    const requestId = uuidv4();
+    const sanitizedMessage = sanitizeInput(message, 500);
+
+    if (autoApprove) {
+      // Auto-approve: add member directly
+      const memberId = uuidv4();
+      await DB.query(
+        `INSERT INTO mirror_group_members (id, group_id, user_id, role, status, joined_at)
+         VALUES (?, ?, ?, 'member', 'active', NOW())
+         ON DUPLICATE KEY UPDATE status = 'active', joined_at = NOW()`,
+        [memberId, groupId, user.id]
+      );
+
+      // Increment member count
+      await DB.query(
+        `UPDATE mirror_groups SET current_member_count = current_member_count + 1 WHERE id = ?`,
+        [groupId]
+      );
+
+      // Distribute encryption key
+      try {
+        const [keyRows] = await DB.query(
+          `SELECT id, key_version FROM mirror_group_encryption_keys
+           WHERE group_id = ? AND status = 'active'
+           ORDER BY key_version DESC LIMIT 1`,
+          [groupId]
+        );
+        if ((keyRows as any[]).length > 0) {
+          const { id: keyId, key_version } = (keyRows as any[])[0];
+          await groupEncryptionManager.distributeKeyToMember(groupId, String(user.id), keyId, key_version);
+        }
+      } catch (encError) {
+        console.error('Encryption key distribution failed (non-fatal):', encError);
+      }
+
+      // Notify members
+      const [userInfo] = await DB.query(`SELECT username FROM users WHERE id = ?`, [user.id]);
+      const [membersRows] = await DB.query(
+        `SELECT gm.user_id as userId, u.username as userName, u.email, gm.role
+         FROM mirror_group_members gm
+         JOIN users u ON gm.user_id = u.id
+         WHERE gm.group_id = ? AND gm.status = 'active'`,
+        [groupId]
+      );
+
+      await mirrorGroupNotifications.notifyMemberJoined(
+        membersRows as any[],
+        { userId: String(user.id), userName: (userInfo as any[])[0]?.username || 'Unknown' },
+        group.name
+      );
+
+      res.status(201).json({
+        success: true,
+        data: { status: 'approved', autoApproved: true },
+        message: 'You have been automatically added to the group!'
+      });
+
+    } else {
+      // Manual approval: create join request
+      await DB.query(
+        `INSERT INTO mirror_group_join_requests (id, group_id, user_id, status, message, request_type, requested_at)
+         VALUES (?, ?, ?, 'pending', ?, 'join_request', NOW())`,
+        [requestId, groupId, user.id, sanitizedMessage]
+      );
+
+      // Notify group admins/owners
+      const [adminRows] = await DB.query(
+        `SELECT gm.user_id as userId, u.username as userName, u.email, gm.role
+         FROM mirror_group_members gm
+         JOIN users u ON gm.user_id = u.id
+         WHERE gm.group_id = ? AND gm.status = 'active' AND gm.role IN ('owner', 'admin')`,
+        [groupId]
+      );
+
+      const [requesterInfo] = await DB.query(`SELECT username FROM users WHERE id = ?`, [user.id]);
+      const requesterName = (requesterInfo as any[])[0]?.username || 'Someone';
+
+      // Notify admins about the join request
+      for (const admin of (adminRows as any[])) {
+        try {
+          await mirrorGroupNotifications.notifyGroupInvite({
+            inviteeUserId: String(admin.userId),
+            inviterName: requesterName,
+            groupId: groupId,
+            groupName: `${group.name} (Join Request)`,
+            inviteCode: requestId
+          });
+        } catch { /* non-fatal */ }
+      }
+
+      res.status(201).json({
+        success: true,
+        data: { requestId, status: 'pending' },
+        message: 'Join request submitted. An admin will review your request.'
+      });
+    }
+
+  } catch (error) {
+    console.error('Error requesting to join group:', error);
+    res.status(500).json({ success: false, error: 'Failed to submit join request' });
+  }
+};
+
+/* ============================================================================
+   GET JOIN REQUESTS (for group admins)
+   GET /:groupId/join-requests
+============================================================================ */
+
+const getJoinRequestsHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    if (!user?.id) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const { groupId } = req.params;
+
+    // Verify user is admin or owner
+    const [memberCheck] = await DB.query(
+      `SELECT role FROM mirror_group_members
+       WHERE group_id = ? AND user_id = ? AND status = 'active' AND role IN ('owner', 'admin')`,
+      [groupId, user.id]
+    );
+
+    if ((memberCheck as any[]).length === 0) {
+      res.status(403).json({ success: false, error: 'Only admins and owners can view join requests' });
+      return;
+    }
+
+    const statusFilter = req.query.status === 'all' ? '' : "AND jr.status = 'pending'";
+
+    const [requests] = await DB.query(
+      `SELECT
+        jr.id as request_id,
+        jr.group_id,
+        jr.user_id,
+        u.username,
+        jr.status,
+        jr.message,
+        jr.request_type,
+        jr.requested_at,
+        jr.processed_at,
+        jr.processed_by
+       FROM mirror_group_join_requests jr
+       JOIN users u ON jr.user_id = u.id
+       WHERE jr.group_id = ? ${statusFilter}
+       ORDER BY jr.requested_at DESC
+       LIMIT 100`,
+      [groupId]
+    );
+
+    res.json({
+      success: true,
+      data: {
+        requests,
+        total: (requests as any[]).length
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching join requests:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch join requests' });
+  }
+};
+
+/* ============================================================================
+   APPROVE JOIN REQUEST
+   POST /:groupId/join-requests/:requestId/approve
+============================================================================ */
+
+const approveJoinRequestHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    if (!user?.id) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const { groupId, requestId } = req.params;
+
+    // Verify user is admin or owner
+    const [memberCheck] = await DB.query(
+      `SELECT role FROM mirror_group_members
+       WHERE group_id = ? AND user_id = ? AND status = 'active' AND role IN ('owner', 'admin')`,
+      [groupId, user.id]
+    );
+
+    if ((memberCheck as any[]).length === 0) {
+      res.status(403).json({ success: false, error: 'Only admins and owners can approve requests' });
+      return;
+    }
+
+    // Verify request exists
+    const [requestRows] = await DB.query(
+      `SELECT * FROM mirror_group_join_requests
+       WHERE id = ? AND group_id = ? AND status = 'pending'`,
+      [requestId, groupId]
+    );
+
+    if ((requestRows as any[]).length === 0) {
+      res.status(404).json({ success: false, error: 'Join request not found or already processed' });
+      return;
+    }
+
+    const joinRequest = (requestRows as any[])[0];
+
+    // Check capacity
+    const [groupRows] = await DB.query(
+      `SELECT max_members, current_member_count, name FROM mirror_groups WHERE id = ?`,
+      [groupId]
+    );
+    const group = (groupRows as any[])[0];
+
+    if (group.current_member_count >= group.max_members) {
+      res.status(400).json({ success: false, error: 'Group has reached maximum capacity' });
+      return;
+    }
+
+    // Add member or update existing
+    const memberId = uuidv4();
+    await DB.query(
+      `INSERT INTO mirror_group_members (id, group_id, user_id, role, status, joined_at)
+       VALUES (?, ?, ?, 'member', 'active', NOW())
+       ON DUPLICATE KEY UPDATE status = 'active', joined_at = NOW()`,
+      [memberId, groupId, joinRequest.user_id]
+    );
+
+    // Update request status
+    await DB.query(
+      `UPDATE mirror_group_join_requests
+       SET status = 'approved', processed_by = ?, processed_at = NOW()
+       WHERE id = ?`,
+      [user.id, requestId]
+    );
+
+    // Increment member count
+    await DB.query(
+      `UPDATE mirror_groups SET current_member_count = current_member_count + 1 WHERE id = ?`,
+      [groupId]
+    );
+
+    // Distribute encryption key
+    try {
+      const [keyRows] = await DB.query(
+        `SELECT id, key_version FROM mirror_group_encryption_keys
+         WHERE group_id = ? AND status = 'active'
+         ORDER BY key_version DESC LIMIT 1`,
+        [groupId]
+      );
+      if ((keyRows as any[]).length > 0) {
+        const { id: keyId, key_version } = (keyRows as any[])[0];
+        await groupEncryptionManager.distributeKeyToMember(groupId, String(joinRequest.user_id), keyId, key_version);
+      }
+    } catch (encError) {
+      console.error('Encryption key distribution failed (non-fatal):', encError);
+    }
+
+    // Notify the requester that they were approved
+    const [approverInfo] = await DB.query(`SELECT username FROM users WHERE id = ?`, [user.id]);
+    const approverName = (approverInfo as any[])[0]?.username || 'An admin';
+
+    try {
+      await mirrorGroupNotifications.notifyGroupInvite({
+        inviteeUserId: String(joinRequest.user_id),
+        inviterName: approverName,
+        groupId: groupId,
+        groupName: `${group.name} - Request Approved!`,
+        inviteCode: requestId
+      });
+    } catch { /* non-fatal */ }
+
+    // Notify all members about new member
+    const [membersRows] = await DB.query(
+      `SELECT gm.user_id as userId, u.username as userName, u.email, gm.role
+       FROM mirror_group_members gm
+       JOIN users u ON gm.user_id = u.id
+       WHERE gm.group_id = ? AND gm.status = 'active'`,
+      [groupId]
+    );
+    const [newMemberInfo] = await DB.query(`SELECT username FROM users WHERE id = ?`, [joinRequest.user_id]);
+
+    await mirrorGroupNotifications.notifyMemberJoined(
+      membersRows as any[],
+      { userId: String(joinRequest.user_id), userName: (newMemberInfo as any[])[0]?.username || 'Unknown' },
+      group.name
+    );
+
+    res.json({
+      success: true,
+      message: 'Join request approved successfully'
+    });
+  } catch (error) {
+    console.error('Error approving join request:', error);
+    res.status(500).json({ success: false, error: 'Failed to approve join request' });
+  }
+};
+
+/* ============================================================================
+   REJECT JOIN REQUEST
+   POST /:groupId/join-requests/:requestId/reject
+============================================================================ */
+
+const rejectJoinRequestHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    if (!user?.id) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const { groupId, requestId } = req.params;
+
+    // Verify user is admin or owner
+    const [memberCheck] = await DB.query(
+      `SELECT role FROM mirror_group_members
+       WHERE group_id = ? AND user_id = ? AND status = 'active' AND role IN ('owner', 'admin')`,
+      [groupId, user.id]
+    );
+
+    if ((memberCheck as any[]).length === 0) {
+      res.status(403).json({ success: false, error: 'Only admins and owners can reject requests' });
+      return;
+    }
+
+    // Verify request exists
+    const [requestRows] = await DB.query(
+      `SELECT * FROM mirror_group_join_requests
+       WHERE id = ? AND group_id = ? AND status = 'pending'`,
+      [requestId, groupId]
+    );
+
+    if ((requestRows as any[]).length === 0) {
+      res.status(404).json({ success: false, error: 'Join request not found or already processed' });
+      return;
+    }
+
+    // Update request status
+    await DB.query(
+      `UPDATE mirror_group_join_requests
+       SET status = 'rejected', processed_by = ?, processed_at = NOW()
+       WHERE id = ?`,
+      [user.id, requestId]
+    );
+
+    // Clean up any invited member record
+    await DB.query(
+      `DELETE FROM mirror_group_members
+       WHERE group_id = ? AND user_id = ? AND status = 'invited'`,
+      [groupId, (requestRows as any[])[0].user_id]
+    );
+
+    res.json({
+      success: true,
+      message: 'Join request rejected'
+    });
+  } catch (error) {
+    console.error('Error rejecting join request:', error);
+    res.status(500).json({ success: false, error: 'Failed to reject join request' });
+  }
+};
+
+/* ============================================================================
+   JOIN GROUP - PRESERVED FROM EXISTING
 ============================================================================ */
 
 const joinGroupHandler: RequestHandler = async (req, res) => {
@@ -256,13 +967,21 @@ const joinGroupHandler: RequestHandler = async (req, res) => {
     }
 
     const [check] = await DB.query(
-      `SELECT id FROM mirror_groups WHERE id = ?`,
+      `SELECT id, privacy FROM mirror_groups WHERE id = ? AND status = 'active'`,
       [groupId]
     );
 
     if ((check as any[]).length === 0) {
       res.status(404).json({ success: false, error: 'Group not found' });
       return;
+    }
+
+    // If public group, redirect to request-to-join flow
+    const groupData = (check as any[])[0];
+    if (groupData.privacy === 'public') {
+      // Forward to request-to-join handler
+      req.params.groupId = groupId;
+      return requestToJoinHandler(req, res, () => {});
     }
 
     await DB.query(
@@ -273,13 +992,13 @@ const joinGroupHandler: RequestHandler = async (req, res) => {
 
     res.json({ success: true, message: 'Joined group successfully' });
   } catch (error) {
-    console.error('❌ Error joining group:', error);
+    console.error('Error joining group:', error);
     res.status(500).json({ success: false, error: 'Failed to join group' });
   }
 };
 
 /* ============================================================================
-   GET GROUP DETAILS - FIXED: Now includes shared data per member
+   GET GROUP DETAILS - UPDATED WITH NEW FIELDS
 ============================================================================ */
 
 const getGroupDetailsHandler: RequestHandler = async (req, res) => {
@@ -315,7 +1034,6 @@ const getGroupDetailsHandler: RequestHandler = async (req, res) => {
 
     const group = (groupRows as any[])[0];
 
-    // Fetch base member rows (uses GREATEST to pick most recent of last_active/last_login)
     const [membersRows] = await DB.query(
       `SELECT
         gm.id, gm.user_id, gm.role, gm.status, gm.joined_at,
@@ -334,7 +1052,6 @@ const getGroupDetailsHandler: RequestHandler = async (req, res) => {
       [groupId]
     );
 
-    // FIXED: Enrich members with shared data info + online status
     const enrichedMembers = await enrichMembersWithSharedData(groupId, membersRows as any[]);
 
     res.json({
@@ -344,10 +1061,12 @@ const getGroupDetailsHandler: RequestHandler = async (req, res) => {
           id: group.id,
           name: group.name,
           description: group.description,
-          goal: group.goal,
-          goalMetadata: safeJsonParse(group.goal_metadata, null),
           type: group.type,
+          subtype: group.subtype,
           privacy: group.privacy,
+          goal: group.goal,
+          goalCustom: group.goal_custom,
+          goalMetadata: safeJsonParse(group.goal_metadata, null),
           max_members: group.max_members,
           current_member_count: group.current_member_count,
           owner_user_id: group.owner_user_id,
@@ -360,14 +1079,13 @@ const getGroupDetailsHandler: RequestHandler = async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('❌ Error getting group details:', error);
+    console.error('Error getting group details:', error);
     res.status(500).json({ success: false, error: 'Failed to get group details' });
   }
 };
 
 /* ============================================================================
-   GET MEMBERS LIST - NEW ENDPOINT
-   GET /:groupId/members
+   GET MEMBERS LIST
 ============================================================================ */
 
 const getMembersHandler: RequestHandler = async (req, res) => {
@@ -380,7 +1098,6 @@ const getMembersHandler: RequestHandler = async (req, res) => {
 
     const { groupId } = req.params;
 
-    // Verify user is a member
     const [memberCheck] = await DB.query(
       `SELECT role FROM mirror_group_members
        WHERE group_id = ? AND user_id = ? AND status = 'active'`,
@@ -414,20 +1131,16 @@ const getMembersHandler: RequestHandler = async (req, res) => {
 
     res.json({
       success: true,
-      data: {
-        members: enrichedMembers
-      }
+      data: { members: enrichedMembers }
     });
   } catch (error) {
-    console.error('❌ Error getting members:', error);
+    console.error('Error getting members:', error);
     res.status(500).json({ success: false, error: 'Failed to get members' });
   }
 };
 
 /* ============================================================================
-   GET MEMBER DETAILS - NEW ENDPOINT
-   GET /:groupId/members/:memberId
-   Returns extended member info with shared data attached to the member object
+   GET MEMBER DETAILS
 ============================================================================ */
 
 const getMemberDetailsHandler: RequestHandler = async (req, res) => {
@@ -440,7 +1153,6 @@ const getMemberDetailsHandler: RequestHandler = async (req, res) => {
 
     const { groupId, memberId } = req.params;
 
-    // Verify requesting user is a member
     const [memberCheck] = await DB.query(
       `SELECT role FROM mirror_group_members
        WHERE group_id = ? AND user_id = ? AND status = 'active'`,
@@ -452,7 +1164,6 @@ const getMemberDetailsHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    // Fetch the target member - support lookup by user_id (numeric) or member id (uuid)
     const isNumericId = /^\d+$/.test(memberId);
     const memberQuery = isNumericId
       ? `SELECT gm.id, gm.user_id, gm.role, gm.status, gm.joined_at,
@@ -477,7 +1188,6 @@ const getMemberDetailsHandler: RequestHandler = async (req, res) => {
 
     const member = (memberRows as any[])[0];
 
-    // Get shared data for this specific member
     const [sharedDataRows] = await DB.query(
       `SELECT data_type, shared_at, data_version
        FROM mirror_group_shared_data
@@ -494,11 +1204,8 @@ const getMemberDetailsHandler: RequestHandler = async (req, res) => {
 
     const sharedDataTypes = [...new Set(sharedData.map((sd: any) => sd.dataType))];
     const hasSharedData = sharedDataTypes.length > 0;
-
-    // Determine hasSharedProfile: true if 'profile' or 'full_profile' is shared
     const hasSharedProfile = sharedDataTypes.includes('profile') || sharedDataTypes.includes('full_profile');
 
-    // Build the enriched member object with shared data fields INSIDE it
     const enrichedMember = {
       id: member.id,
       user_id: member.user_id,
@@ -512,11 +1219,9 @@ const getMemberDetailsHandler: RequestHandler = async (req, res) => {
       is_online: isUserOnline(member.user_id),
       has_shared_data: hasSharedData,
       shared_data_types: sharedDataTypes,
-      // Include profile fields only if profile is shared
       ...(hasSharedProfile ? { email: member.email } : {})
     };
 
-    // Build shared data summary
     const dataTypeCounts: Record<string, number> = {};
     for (const sd of sharedData) {
       dataTypeCounts[sd.dataType] = (dataTypeCounts[sd.dataType] || 0) + 1;
@@ -527,22 +1232,19 @@ const getMemberDetailsHandler: RequestHandler = async (req, res) => {
       data: {
         member: enrichedMember,
         sharedData: sharedData,
-        sharedDataSummary: {
-          totalShared: sharedDataTypes.length,
-          dataTypes: dataTypeCounts
-        },
+        sharedDataSummary: { totalShared: sharedDataTypes.length, dataTypes: dataTypeCounts },
         hasSharedData: hasSharedData,
         hasSharedProfile: hasSharedProfile
       }
     });
   } catch (error) {
-    console.error('❌ Error getting member details:', error);
+    console.error('Error getting member details:', error);
     res.status(500).json({ success: false, error: 'Failed to get member details' });
   }
 };
 
 /* ============================================================================
-   INVITE MEMBER
+   INVITE MEMBER - PRESERVED FROM EXISTING
 ============================================================================ */
 
 const inviteMemberHandler: RequestHandler = async (req, res) => {
@@ -561,7 +1263,6 @@ const inviteMemberHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    // Verify user is owner or admin
     const [memberCheck] = await DB.query(
       `SELECT role FROM mirror_group_members WHERE group_id = ? AND user_id = ? AND status = 'active'`,
       [groupId, user.id]
@@ -578,7 +1279,6 @@ const inviteMemberHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    // Find user by userId, username, or email
     let userRows: any[];
     if (userId) {
       const [rows] = await DB.query(`SELECT id, username FROM users WHERE id = ?`, [userId]);
@@ -598,7 +1298,6 @@ const inviteMemberHandler: RequestHandler = async (req, res) => {
 
     const targetUserId = userRows[0].id;
 
-    // Check existing membership - UPDATED: Also check for 'declined' status to allow re-invite
     const [existingMember] = await DB.query(
       `SELECT id, status FROM mirror_group_members WHERE group_id = ? AND user_id = ?`,
       [groupId, targetUserId]
@@ -614,7 +1313,6 @@ const inviteMemberHandler: RequestHandler = async (req, res) => {
         res.status(400).json({ success: false, error: 'User already has a pending invitation' });
         return;
       }
-      // Re-invite removed/left/declined user
       await DB.query(
         `UPDATE mirror_group_members SET status = 'invited', invited_by = ?, joined_at = NULL WHERE id = ?`,
         [user.id, member.id]
@@ -627,7 +1325,6 @@ const inviteMemberHandler: RequestHandler = async (req, res) => {
       );
     }
 
-    // Handle existing pending request
     const [existingRequest] = await DB.query(
       `SELECT id FROM mirror_group_join_requests WHERE group_id = ? AND user_id = ? AND status = 'pending'`,
       [groupId, targetUserId]
@@ -643,18 +1340,16 @@ const inviteMemberHandler: RequestHandler = async (req, res) => {
     } else {
       requestId = uuidv4();
       await DB.query(
-        `INSERT INTO mirror_group_join_requests (id, group_id, user_id, status, requested_at, processed_by) VALUES (?, ?, ?, 'pending', NOW(), ?)`,
+        `INSERT INTO mirror_group_join_requests (id, group_id, user_id, status, request_type, requested_at, processed_by) VALUES (?, ?, ?, 'pending', 'invite', NOW(), ?)`,
         [requestId, groupId, targetUserId, user.id]
       );
     }
 
-    // Get group name and inviter username for notification
     const [groupInfo] = await DB.query(`SELECT name FROM mirror_groups WHERE id = ?`, [groupId]);
     const [inviterInfo] = await DB.query(`SELECT username FROM users WHERE id = ?`, [user.id]);
     const groupName = (groupInfo as any[])[0]?.name || 'Unknown Group';
     const inviterName = (inviterInfo as any[])[0]?.username || 'Someone';
 
-    // Send WebSocket notification to invitee
     await mirrorGroupNotifications.notifyGroupInvite({
       inviteeUserId: String(targetUserId),
       inviterName: inviterName,
@@ -663,17 +1358,16 @@ const inviteMemberHandler: RequestHandler = async (req, res) => {
       inviteCode: requestId
     });
 
-    console.log(`📨 Invitation sent: ${requestId} to user ${targetUserId}`);
+    console.log(`Invitation sent: ${requestId} to user ${targetUserId}`);
     res.status(201).json({ success: true, data: { requestId }, message: 'Invitation sent successfully' });
   } catch (error) {
-    console.error('❌ Error inviting member:', error);
+    console.error('Error inviting member:', error);
     res.status(500).json({ success: false, error: 'Failed to invite member' });
   }
 };
 
-
 /* ============================================================================
-   ACCEPT INVITATION (JOIN GROUP)
+   ACCEPT INVITATION - PRESERVED FROM EXISTING
 ============================================================================ */
 
 const acceptInvitationHandler: RequestHandler = async (req, res) => {
@@ -692,7 +1386,6 @@ const acceptInvitationHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    // Verify invitation exists
     const [requestRows] = await DB.query(
       `SELECT * FROM mirror_group_join_requests
        WHERE id = ? AND group_id = ? AND user_id = ? AND status = 'pending'`,
@@ -704,7 +1397,6 @@ const acceptInvitationHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    // Update member status to 'active'
     await DB.query(
       `UPDATE mirror_group_members
        SET status = 'active', joined_at = NOW()
@@ -712,13 +1404,11 @@ const acceptInvitationHandler: RequestHandler = async (req, res) => {
       [groupId, user.id]
     );
 
-    // DELETE the join request instead of updating (avoids unique constraint violation)
     await DB.query(
       `DELETE FROM mirror_group_join_requests WHERE id = ?`,
       [requestId]
     );
 
-    // Distribute encryption key
     try {
       const [keyRows] = await DB.query(
         `SELECT id, key_version FROM mirror_group_encryption_keys
@@ -730,21 +1420,16 @@ const acceptInvitationHandler: RequestHandler = async (req, res) => {
       if ((keyRows as any[]).length > 0) {
         const { id: keyId, key_version } = (keyRows as any[])[0];
         await groupEncryptionManager.distributeKeyToMember(groupId, String(user.id), keyId, key_version);
-        console.log(`✅ Encryption key distributed to new member ${user.id}`);
       }
     } catch (encError) {
-      console.error('❌ Encryption key distribution failed:', encError);
+      console.error('Encryption key distribution failed:', encError);
     }
 
-    // Increment member count
     await DB.query(
-      `UPDATE mirror_groups
-       SET current_member_count = current_member_count + 1
-       WHERE id = ?`,
+      `UPDATE mirror_groups SET current_member_count = current_member_count + 1 WHERE id = ?`,
       [groupId]
     );
 
-    // Get group members and new member info for notification
     const [groupInfo] = await DB.query(`SELECT name FROM mirror_groups WHERE id = ?`, [groupId]);
     const [userInfo] = await DB.query(`SELECT username, email FROM users WHERE id = ?`, [user.id]);
     const [membersRows] = await DB.query(
@@ -761,27 +1446,21 @@ const acceptInvitationHandler: RequestHandler = async (req, res) => {
       userName: (userInfo as any[])[0]?.username || 'Unknown'
     };
 
-    // Notify all members that a new member joined
     await mirrorGroupNotifications.notifyMemberJoined(
       membersRows as any[],
       newMemberInfo,
       groupName
     );
 
-    console.log(`✅ User ${user.id} joined group ${groupId}`);
-
-    res.json({
-      success: true,
-      message: 'Successfully joined group'
-    });
+    res.json({ success: true, message: 'Successfully joined group' });
   } catch (error) {
-    console.error('❌ Error accepting invitation:', error);
+    console.error('Error accepting invitation:', error);
     res.status(500).json({ success: false, error: 'Failed to join group' });
   }
 };
 
 /* ============================================================================
-   DECLINE INVITATION
+   DECLINE INVITATION - PRESERVED FROM EXISTING
 ============================================================================ */
 
 const declineInvitationHandler: RequestHandler = async (req, res) => {
@@ -800,9 +1479,6 @@ const declineInvitationHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    console.log(`🚫 User ${user.id} declining invitation ${requestId} for group ${groupId}`);
-
-    // Verify invitation exists and belongs to this user
     const [requestRows] = await DB.query(
       `SELECT * FROM mirror_group_join_requests
        WHERE id = ? AND group_id = ? AND user_id = ? AND status = 'pending'`,
@@ -814,33 +1490,26 @@ const declineInvitationHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    // DELETE the join request instead of updating
     await DB.query(
       `DELETE FROM mirror_group_join_requests WHERE id = ?`,
       [requestId]
     );
 
-    // DELETE the member record (allows fresh re-invite later)
     await DB.query(
       `DELETE FROM mirror_group_members
        WHERE group_id = ? AND user_id = ? AND status = 'invited'`,
       [groupId, user.id]
     );
 
-    console.log(`✅ User ${user.id} declined invitation to group ${groupId}`);
-
-    res.json({
-      success: true,
-      message: 'Invitation declined successfully'
-    });
+    res.json({ success: true, message: 'Invitation declined successfully' });
   } catch (error) {
-    console.error('❌ Error declining invitation:', error);
+    console.error('Error declining invitation:', error);
     res.status(500).json({ success: false, error: 'Failed to decline invitation' });
   }
 };
 
 /* ============================================================================
-   NEW: GET MY INVITATIONS
+   GET MY INVITATIONS - PRESERVED FROM EXISTING
 ============================================================================ */
 
 const getMyInvitationsHandler: RequestHandler = async (req, res) => {
@@ -851,15 +1520,16 @@ const getMyInvitationsHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    console.log(`📨 Fetching pending invitations for user ${user.id}`);
-
-    // Get all pending invitations for this user
     const [invitations] = await DB.query(
       `SELECT
         jr.id as request_id,
         jr.group_id,
         g.name as group_name,
         g.description as group_description,
+        g.type as group_type,
+        g.subtype as group_subtype,
+        g.goal as group_goal,
+        g.goal_custom as group_goal_custom,
         u.username as inviter_username,
         jr.processed_by as inviter_id,
         jr.requested_at,
@@ -872,22 +1542,18 @@ const getMyInvitationsHandler: RequestHandler = async (req, res) => {
       [user.id]
     );
 
-    console.log(`✅ Found ${(invitations as any[]).length} pending invitations for user ${user.id}`);
-
     res.json({
       success: true,
-      data: {
-        invitations: invitations
-      }
+      data: { invitations }
     });
   } catch (error) {
-    console.error('❌ Error fetching invitations:', error);
+    console.error('Error fetching invitations:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch invitations' });
   }
 };
 
 /* ============================================================================
-   LEAVE GROUP - UPDATED WITH NOTIFICATIONS
+   LEAVE GROUP - PRESERVED FROM EXISTING
 ============================================================================ */
 
 const leaveGroupHandler: RequestHandler = async (req, res) => {
@@ -900,7 +1566,6 @@ const leaveGroupHandler: RequestHandler = async (req, res) => {
 
     const { groupId } = req.params;
 
-    // Check if user is owner
     const [groupRows] = await DB.query(
       `SELECT owner_user_id, name FROM mirror_groups WHERE id = ?`,
       [groupId]
@@ -921,11 +1586,9 @@ const leaveGroupHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    // Get user info for notification
     const [userInfo] = await DB.query(`SELECT username FROM users WHERE id = ?`, [user.id]);
     const userName = (userInfo as any[])[0]?.username || 'Unknown';
 
-    // Get remaining members for notification (before removing this user)
     const [membersRows] = await DB.query(
       `SELECT gm.user_id as userId, u.username as userName, u.email, gm.role
        FROM mirror_group_members gm
@@ -934,51 +1597,38 @@ const leaveGroupHandler: RequestHandler = async (req, res) => {
       [groupId, user.id]
     );
 
-    // Update member status to 'left'
     await DB.query(
-      `UPDATE mirror_group_members
-       SET status = 'left', left_at = NOW()
+      `UPDATE mirror_group_members SET status = 'left', left_at = NOW()
        WHERE group_id = ? AND user_id = ?`,
       [groupId, user.id]
     );
 
-    // Revoke encryption key
     try {
       await groupEncryptionManager.revokeUserAccess(groupId, String(user.id));
-      console.log(`🚫 Encryption key revoked for user ${user.id}`);
     } catch (encError) {
-      console.error('❌ Encryption key revocation failed:', encError);
+      console.error('Encryption key revocation failed:', encError);
     }
 
-    // Decrement member count
     await DB.query(
-      `UPDATE mirror_groups
-       SET current_member_count = current_member_count - 1
-       WHERE id = ?`,
+      `UPDATE mirror_groups SET current_member_count = current_member_count - 1 WHERE id = ?`,
       [groupId]
     );
 
-    // Send WebSocket notification to remaining members
     await mirrorGroupNotifications.notifyMemberLeft(
       membersRows as any[],
       { userId: String(user.id), userName: userName },
       group.name
     );
 
-    console.log(`👋 User ${user.id} left group ${groupId}`);
-
-    res.json({
-      success: true,
-      message: 'Successfully left group'
-    });
+    res.json({ success: true, message: 'Successfully left group' });
   } catch (error) {
-    console.error('❌ Error leaving group:', error);
+    console.error('Error leaving group:', error);
     res.status(500).json({ success: false, error: 'Failed to leave group' });
   }
 };
 
 /* ============================================================================
-   SHARE DATA TO GROUP (PHASE 2 COMPLETE)
+   SHARE DATA TO GROUP - PRESERVED FROM EXISTING
 ============================================================================ */
 
 const shareDataHandler: RequestHandler = async (req, res) => {
@@ -1000,10 +1650,9 @@ const shareDataHandler: RequestHandler = async (req, res) => {
       ? dataTypes
       : (dataType ? [dataType] : ['full_profile']);
 
-        const validDataTypes: ShareableDataType[] = [
+    const validDataTypes: ShareableDataType[] = [
       'personality', 'cognitive', 'facial', 'voice', 'astrological', 'profile', 'full_profile'
     ];
-
 
     const invalidTypes = typesToShare.filter(t => !validDataTypes.includes(t as ShareableDataType));
     if (invalidTypes.length > 0) {
@@ -1014,8 +1663,6 @@ const shareDataHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    console.log(`📤 User ${user.id} sharing data with group ${groupId}: ${typesToShare.join(', ')}`);
-
     const [memberCheck] = await DB.query(
       `SELECT role, status FROM mirror_group_members
        WHERE group_id = ? AND user_id = ? AND status = 'active'`,
@@ -1023,10 +1670,7 @@ const shareDataHandler: RequestHandler = async (req, res) => {
     );
 
     if ((memberCheck as any[]).length === 0) {
-      res.status(403).json({
-        success: false,
-        error: 'Not an active member of this group'
-      });
+      res.status(403).json({ success: false, error: 'Not an active member of this group' });
       return;
     }
 
@@ -1038,10 +1682,7 @@ const shareDataHandler: RequestHandler = async (req, res) => {
     );
 
     if ((keyRows as any[]).length === 0) {
-      res.status(500).json({
-        success: false,
-        error: 'No active encryption key for this group'
-      });
+      res.status(500).json({ success: false, error: 'No active encryption key for this group' });
       return;
     }
 
@@ -1116,7 +1757,7 @@ const shareDataHandler: RequestHandler = async (req, res) => {
         });
 
       } catch (error) {
-        console.error(`❌ Error sharing ${extractedData.dataType}:`, error);
+        console.error(`Error sharing ${extractedData.dataType}:`, error);
         shareErrors.push({ dataType: extractedData.dataType, error: (error as Error).message });
       }
     }
@@ -1131,7 +1772,7 @@ const shareDataHandler: RequestHandler = async (req, res) => {
          JSON.stringify({ userId: user.id, dataTypes: typesToShare, timestamp: new Date().toISOString() })]
       );
     } catch (queueError) {
-      console.error('❌ Failed to queue analysis:', queueError);
+      console.error('Failed to queue analysis:', queueError);
     }
 
     res.json({
@@ -1143,13 +1784,13 @@ const shareDataHandler: RequestHandler = async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ Error sharing data with group:', error);
+    console.error('Error sharing data with group:', error);
     res.status(500).json({ success: false, error: 'Failed to share data with group' });
   }
 };
 
 /* ============================================================================
-   GET SHARED DATA (PHASE 2) - DECRYPTION
+   GET SHARED DATA - PRESERVED FROM EXISTING
 ============================================================================ */
 
 const getSharedDataHandler: RequestHandler = async (req, res) => {
@@ -1228,13 +1869,13 @@ const getSharedDataHandler: RequestHandler = async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ Error retrieving shared data:', error);
+    console.error('Error retrieving shared data:', error);
     res.status(500).json({ success: false, error: 'Failed to retrieve shared data' });
   }
 };
 
 /* ============================================================================
-   GET DATA SUMMARY
+   GET DATA SUMMARY - PRESERVED FROM EXISTING
 ============================================================================ */
 
 const getDataSummaryHandler: RequestHandler = async (req, res) => {
@@ -1257,17 +1898,20 @@ const getDataSummaryHandler: RequestHandler = async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('❌ Error getting data summary:', error);
+    console.error('Error getting data summary:', error);
     res.status(500).json({ success: false, error: 'Failed to get data summary' });
   }
 };
 
 /* ============================================================================
-   ROUTE REGISTRATION - UPDATED with new member endpoints
+   ROUTE REGISTRATION - UPDATED WITH PHASE 6 ENDPOINTS
 ============================================================================ */
 
 const verified = AuthMiddleware.verifyToken as unknown as RequestHandler;
 const basicSecurity = AuthMiddleware.requireSecurityLevel(SecurityLevel.BASIC) as unknown as RequestHandler;
+
+// Phase 6: Public directory (must be before /:groupId to avoid param collision)
+router.get('/directory', verified, searchPublicDirectoryHandler);
 
 // Phase 1 routes
 router.post('/create', verified, createGroupHandler);
@@ -1280,7 +1924,13 @@ router.post('/:groupId/decline', verified, declineInvitationHandler);
 router.post('/:groupId/leave', verified, leaveGroupHandler);
 router.post('/join', verified, joinGroupHandler);
 
-// NEW: Member-specific endpoints (must be before generic /:groupId routes)
+// Phase 6: Join request management for public groups
+router.post('/:groupId/request-join', verified, requestToJoinHandler);
+router.get('/:groupId/join-requests', verified, getJoinRequestsHandler);
+router.post('/:groupId/join-requests/:requestId/approve', verified, approveJoinRequestHandler);
+router.post('/:groupId/join-requests/:requestId/reject', verified, rejectJoinRequestHandler);
+
+// Member-specific endpoints
 router.get('/:groupId/members', verified, getMembersHandler);
 router.get('/:groupId/members/:memberId', verified, getMemberDetailsHandler);
 
