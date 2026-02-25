@@ -1628,6 +1628,83 @@ const leaveGroupHandler: RequestHandler = async (req, res) => {
 };
 
 /* ============================================================================
+   DELETE GROUP (OWNER ONLY)
+   DELETE /:groupId
+============================================================================ */
+
+const deleteGroupHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    if (!user?.id) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+
+    const { groupId } = req.params;
+
+    // Verify group exists and user is the owner
+    const [groupRows] = await DB.query(
+      `SELECT id, name, owner_user_id FROM mirror_groups WHERE id = ?`,
+      [groupId]
+    );
+
+    if ((groupRows as any[]).length === 0) {
+      res.status(404).json({ success: false, error: 'Group not found' });
+      return;
+    }
+
+    const group = (groupRows as any[])[0];
+
+    if (group.owner_user_id !== user.id) {
+      res.status(403).json({ success: false, error: 'Only the group owner can delete the group' });
+      return;
+    }
+
+    // Revoke all encryption keys before deleting
+    try {
+      const [memberRows] = await DB.query(
+        `SELECT user_id FROM mirror_group_members WHERE group_id = ?`,
+        [groupId]
+      );
+      for (const member of (memberRows as any[])) {
+        try {
+          await groupEncryptionManager.revokeUserAccess(groupId, String(member.user_id));
+        } catch { /* non-fatal per member */ }
+      }
+    } catch (encError) {
+      console.error('Encryption cleanup failed (non-fatal):', encError);
+    }
+
+    // Delete all related data in dependency order
+    const cleanupQueries = [
+      `DELETE FROM mirror_group_join_requests WHERE group_id = ?`,
+      `DELETE FROM mirror_group_directory_settings WHERE group_id = ?`,
+      `DELETE FROM mirror_group_shared_data WHERE group_id = ?`,
+      `DELETE FROM mirror_group_encryption_keys WHERE group_id = ?`,
+      `DELETE FROM mirror_group_members WHERE group_id = ?`,
+    ];
+
+    for (const query of cleanupQueries) {
+      try {
+        await DB.query(query, [groupId]);
+      } catch (cleanupErr) {
+        console.error(`Cleanup query failed (non-fatal): ${query}`, cleanupErr);
+      }
+    }
+
+    // Delete the group itself
+    await DB.query(`DELETE FROM mirror_groups WHERE id = ?`, [groupId]);
+
+    console.log(`Group deleted: ${group.name} (${groupId}) by user ${user.id}`);
+
+    res.json({ success: true, message: 'Group deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting group:', error);
+    res.status(500).json({ success: false, error: 'Failed to delete group' });
+  }
+};
+
+/* ============================================================================
    SHARE DATA TO GROUP - PRESERVED FROM EXISTING
 ============================================================================ */
 
@@ -1922,6 +1999,7 @@ router.post('/:groupId/invite', verified, inviteMemberHandler);
 router.post('/:groupId/accept', verified, acceptInvitationHandler);
 router.post('/:groupId/decline', verified, declineInvitationHandler);
 router.post('/:groupId/leave', verified, leaveGroupHandler);
+router.delete('/:groupId', verified, deleteGroupHandler);
 router.post('/join', verified, joinGroupHandler);
 
 // Phase 6: Join request management for public groups
