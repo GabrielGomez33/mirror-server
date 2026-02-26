@@ -103,8 +103,8 @@ export async function updateUserEmail(userId: string, newEmail: string): Promise
   await DB.query('UPDATE users SET email = ? WHERE id = ?', [newEmail, userId]);
 }
 
-export async function fetchUserInfo(email: string): Promise<{ id: number; email: string; username: string }> {
-  const [rows] = await DB.query('SELECT id, email, username FROM users WHERE email = ?', [email]);
+export async function fetchUserInfo(email: string): Promise<{ id: number; email: string; username: string; intakeCompleted: boolean }> {
+  const [rows] = await DB.query('SELECT id, email, username, intake_completed FROM users WHERE email = ?', [email]);
   const users = rows as any[];
 
   if (users.length === 0) {
@@ -114,7 +114,8 @@ export async function fetchUserInfo(email: string): Promise<{ id: number; email:
   return {
     id: users[0].id,
     email: users[0].email,
-    username: users[0].username
+    username: users[0].username,
+    intakeCompleted: Boolean(users[0].intake_completed)
   };
 }
 

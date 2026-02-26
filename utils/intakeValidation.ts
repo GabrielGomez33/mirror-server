@@ -1,6 +1,10 @@
 // utils/intakeValidation.ts
 // Validation and processing utilities for hybrid intake data
 // Designed for the hybrid approach with file references + structured metadata
+//
+// UPDATED: Enhanced audio MIME type validation to support codec-qualified types
+// from cross-browser MediaRecorder (e.g., 'audio/webm;codecs=opus', 'audio/mp4')
+// and improved voice metadata validation for mobile device diversity.
 
 import crypto from 'crypto';
 
@@ -71,8 +75,6 @@ export interface HybridIntakeData {
       fearful: number;
       disgusted: number;
       surprised: number;
-      // If you extend with more keys at runtime, we'll normalize via Record<string, number>
-      // but the base schema is above.
     };
   };
 
@@ -178,6 +180,50 @@ export interface HybridIntakeData {
 }
 
 // ============================================================================
+// AUDIO MIME TYPE UTILITIES (cross-browser support)
+// ============================================================================
+
+/**
+ * Extracts the base MIME type from a potentially codec-qualified MIME string.
+ * e.g., 'audio/webm;codecs=opus' -> 'audio/webm'
+ *       'audio/mp4' -> 'audio/mp4'
+ */
+function getBaseMimeType(mimeType: string): string {
+  return mimeType.split(';')[0].trim().toLowerCase();
+}
+
+// Allowed base audio MIME types for voice recordings
+const VALID_AUDIO_BASE_TYPES = new Set([
+  'audio/webm',
+  'audio/mpeg',
+  'audio/mp4',
+  'audio/wav',
+  'audio/ogg',
+  'audio/x-wav',
+  'audio/aac',
+  'audio/x-m4a',
+  'audio/mp4a-latm',
+]);
+
+// Allowed image MIME types for photos
+const VALID_IMAGE_TYPES = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/heic',
+  'image/heif',
+]);
+
+/**
+ * Validates an audio MIME type, handling codec-qualified types from MediaRecorder.
+ * Returns true if the base type is in the allowed list.
+ */
+function isValidAudioMimeType(mimeType: string): boolean {
+  const base = getBaseMimeType(mimeType);
+  return VALID_AUDIO_BASE_TYPES.has(base);
+}
+
+// ============================================================================
 // VALIDATION FUNCTIONS FOR HYBRID APPROACH
 // ============================================================================
 
@@ -268,6 +314,7 @@ export class IntakeDataValidator {
 
   /**
    * Validate file reference structure
+   * UPDATED: Uses base MIME type extraction for codec-qualified audio types
    */
   private static validateFileReference(fileRef: any, type: 'photo' | 'voice'): string[] {
     const errors: string[] = [];
@@ -297,7 +344,7 @@ export class IntakeDataValidator {
       errors.push('Voice file reference missing duration');
     }
 
-    // Validate expected tiers (warnings)
+    // Validate expected tiers (warnings only, not errors)
     if (type === 'photo' && fileRef.tier !== 'tier1') {
       console.warn('Photo files should typically be in tier1');
     }
@@ -306,17 +353,17 @@ export class IntakeDataValidator {
     }
 
     // Validate MIME types
-    if (type === 'photo') {
-      const validImageTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'];
-      if (!validImageTypes.includes(fileRef.mimetype)) {
+    if (type === 'photo' && fileRef.mimetype) {
+      if (!VALID_IMAGE_TYPES.has(fileRef.mimetype)) {
         errors.push(`Invalid photo MIME type: ${fileRef.mimetype}`);
       }
     }
 
-    if (type === 'voice') {
-      const validAudioTypes = ['audio/webm', 'audio/mpeg', 'audio/mp4', 'audio/wav', 'audio/ogg'];
-      if (!validAudioTypes.includes(fileRef.mimetype)) {
-        errors.push(`Invalid voice MIME type: ${fileRef.mimetype}`);
+    if (type === 'voice' && fileRef.mimetype) {
+      // Use base MIME extraction to handle codec-qualified types
+      // (e.g., 'audio/webm;codecs=opus' from Chrome, 'audio/mp4' from iOS Safari)
+      if (!isValidAudioMimeType(fileRef.mimetype)) {
+        errors.push(`Invalid voice MIME type: ${fileRef.mimetype}. Allowed base types: ${[...VALID_AUDIO_BASE_TYPES].join(', ')}`);
       }
     }
 
@@ -376,6 +423,7 @@ export class IntakeDataValidator {
 
   /**
    * Validate voice metadata structure
+   * UPDATED: More lenient deviceInfo validation for cross-browser compatibility
    */
   private static validateVoiceMetadata(voiceMetadata: any): string[] {
     const errors: string[] = [];
@@ -390,10 +438,15 @@ export class IntakeDataValidator {
 
     if (!voiceMetadata.mimeType || typeof voiceMetadata.mimeType !== 'string') {
       errors.push('Voice mimeType is required');
+    } else if (!isValidAudioMimeType(voiceMetadata.mimeType)) {
+      // Warn but don't error — the metadata mimeType comes from the browser's
+      // MediaRecorder and may contain codec qualifiers or uncommon types
+      console.warn(`[IntakeValidation] Unusual voice metadata mimeType: ${voiceMetadata.mimeType}`);
     }
 
+    // DeviceInfo: warn if missing but don't hard-fail (older clients may not send it)
     if (!voiceMetadata.deviceInfo) {
-      errors.push('Voice device info is missing');
+      console.warn('[IntakeValidation] Voice device info is missing — older client version?');
     }
 
     return errors;
@@ -508,6 +561,7 @@ export class IntakeDataValidator {
 
   /**
    * Sanitize and normalize hybrid intake data
+   * UPDATED: Normalizes codec-qualified MIME types in voice references
    */
   static sanitizeIntakeData(data: any): HybridIntakeData {
     // Deep clone to avoid modifying original
@@ -537,6 +591,28 @@ export class IntakeDataValidator {
       sanitized.voiceFileRef.tier = String(
         sanitized.voiceFileRef.tier || ''
       ).toLowerCase() as TierType;
+
+      // Normalize MIME type: strip codec qualifiers for storage consistency
+      // but preserve original in a separate field for downstream processors
+      if (sanitized.voiceFileRef.mimetype) {
+        const raw = sanitized.voiceFileRef.mimetype;
+        sanitized.voiceFileRef.mimetype = getBaseMimeType(raw);
+        // Preserve full codec-qualified type as originalMimetype for dina-server processing
+        (sanitized.voiceFileRef as any).originalMimetype = raw;
+      }
+
+      // Normalize deviceInfo
+      if (sanitized.voiceFileRef.deviceInfo) {
+        sanitized.voiceFileRef.deviceInfo.isMobile = Boolean(sanitized.voiceFileRef.deviceInfo.isMobile);
+        sanitized.voiceFileRef.deviceInfo.platform = String(sanitized.voiceFileRef.deviceInfo.platform || 'Unknown');
+        sanitized.voiceFileRef.deviceInfo.browser = String(sanitized.voiceFileRef.deviceInfo.browser || 'Unknown');
+      }
+    }
+
+    // Normalize voice metadata MIME type
+    if (sanitized.voiceMetadata?.mimeType) {
+      const raw = sanitized.voiceMetadata.mimeType;
+      sanitized.voiceMetadata.mimeType = getBaseMimeType(raw);
     }
 
     // Normalize expression scores to [0,1]
@@ -794,6 +870,15 @@ export class IntakeDataValidator {
       const metaSize = data.voiceMetadata.size;
       if (Math.abs(fileSize - metaSize) > 1024) {
         issues.push(`Voice size mismatch: file=${fileSize}bytes, metadata=${metaSize}bytes`);
+      }
+    }
+
+    // Check MIME type consistency between file ref and metadata
+    if (data.voiceFileRef && data.voiceMetadata) {
+      const fileBase = getBaseMimeType(data.voiceFileRef.mimetype || '');
+      const metaBase = getBaseMimeType(data.voiceMetadata.mimeType || '');
+      if (fileBase && metaBase && fileBase !== metaBase) {
+        issues.push(`Voice MIME type mismatch: fileRef=${fileBase}, metadata=${metaBase}`);
       }
     }
 

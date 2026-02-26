@@ -711,6 +711,9 @@ export const storeIntakeDataHandler: RequestHandler = async (req, res) => {
 
     const result = await IntakeDataManager.storeIntakeData(uidStr, intakeData, context);
 
+    // Mark user's intake as completed so auth endpoints return intakeCompleted: true
+    await DB.query('UPDATE users SET intake_completed = TRUE WHERE id = ?', [uidNum]);
+
     res.json({
       success: true,
       intakeId: result.intakeId,

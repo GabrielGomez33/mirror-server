@@ -1,14 +1,15 @@
 // mirror-server/systems/mirrorGroupNotifications.ts
 /**
- * MIRROR GROUP NOTIFICATION SYSTEM
+ * MIRROR NOTIFICATION SYSTEM
  *
- * Handles all group-related notifications:
+ * Handles all Mirror notifications:
  * - Group invitations
  * - Peer reviews
  * - Video call notifications
  * - Member activity alerts
  * - Admin role changes
  * - Analysis completion events
+ * - TruthStream events (reviews, classifications, analysis, dialogue, queue, milestones)
  *
  * Delivery channels:
  * - WebSocket (real-time in-app)
@@ -19,6 +20,7 @@
  * - Added 'analysis_completed' template in TEMPLATES
  * - Added sendDirectWebSocketMessage() for raw WebSocket sends (preserves event type)
  * - Added notifyAnalysisCompleted() for sending to group members
+ * - Added TruthStream notification types and convenience methods
  */
 
 import { EventEmitter } from 'events';
@@ -72,6 +74,13 @@ function isValidGroupNotificationType(type: any): type is GroupNotificationType 
     'dina_processing_started',
     // Phase 6: Analysis completion
     'analysis_completed',
+    // TruthStream
+    'ts_review_received',
+    'ts_review_classified',
+    'ts_analysis_complete',
+    'ts_dialogue_message',
+    'ts_queue_assigned',
+    'ts_milestone_earned',
   ];
   return typeof type === 'string' && validTypes.includes(type as GroupNotificationType);
 }
@@ -133,7 +142,14 @@ export type GroupNotificationType =
   | 'chat_mention'
   |	'dina_processing_started'
   // Phase 6: Analysis completion
-  | 'analysis_completed';
+  | 'analysis_completed'
+  // TruthStream
+  | 'ts_review_received'
+  | 'ts_review_classified'
+  | 'ts_analysis_complete'
+  | 'ts_dialogue_message'
+  | 'ts_queue_assigned'
+  | 'ts_milestone_earned';
 
 // ============================================================================
 // TYPE ALIASES
@@ -300,6 +316,46 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
       priority: 'immediate',
       channels: ['websocket']
     },
+
+    // ========================================================================
+    // TRUTHSTREAM
+    // ========================================================================
+    ts_review_received: {
+      title: () => `New TruthStream Review`,
+      message: () => `Someone just reviewed your Truth Card`,
+      priority: 'immediate',
+      channels: ['websocket', 'push']
+    },
+    ts_review_classified: {
+      title: () => `Review Analyzed`,
+      message: (data) => `Your review has been analyzed: ${data.classification || 'complete'}`,
+      priority: 'normal',
+      channels: ['websocket']
+    },
+    ts_analysis_complete: {
+      title: () => `Truth Mirror Report Ready`,
+      message: (data) => `Your ${data.analysisType === 'perception_gap' ? 'Perception Gap Analysis' : 'Truth Mirror Report'} is ready`,
+      priority: 'immediate',
+      channels: ['websocket', 'push']
+    },
+    ts_dialogue_message: {
+      title: () => `New Anonymous Message`,
+      message: (data) => `New message in your anonymous conversation (from ${data.authorRole || 'someone'})`,
+      priority: 'immediate',
+      channels: ['websocket', 'push']
+    },
+    ts_queue_assigned: {
+      title: () => `New Review Queue`,
+      message: (data) => `${data.itemCount || 'New'} profiles ready for review`,
+      priority: 'normal',
+      channels: ['websocket', 'push']
+    },
+    ts_milestone_earned: {
+      title: () => `Milestone Earned!`,
+      message: (data) => `You earned: ${data.milestoneName || 'a new milestone'}!`,
+      priority: 'normal',
+      channels: ['websocket', 'push']
+    },
   };
 
   constructor() {
@@ -417,7 +473,7 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
   }
 
   // ============================================================================
-  // NOTIFICATION METHODS
+  // GROUP NOTIFICATION METHODS
   // ============================================================================
 
   async notifyGroupInvite(data: {
@@ -596,6 +652,69 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
     }
 
     return results;
+  }
+
+  // ============================================================================
+  // TRUTHSTREAM NOTIFICATION METHODS
+  // ============================================================================
+
+  async notifyTruthStreamReviewReceived(userId: number, reviewId: string): Promise<boolean> {
+    return this.sendNotification('ts_review_received', String(userId), {
+      reviewId,
+    });
+  }
+
+  async notifyTruthStreamReviewClassified(
+    userId: number,
+    reviewId: string,
+    classification: string
+  ): Promise<boolean> {
+    return this.sendNotification('ts_review_classified', String(userId), {
+      reviewId,
+      classification,
+    });
+  }
+
+  async notifyTruthStreamAnalysisComplete(
+    userId: number,
+    analysisId: string,
+    analysisType: string
+  ): Promise<boolean> {
+    return this.sendNotification('ts_analysis_complete', String(userId), {
+      analysisId,
+      analysisType,
+    });
+  }
+
+  async notifyTruthStreamDialogueMessage(
+    userId: number,
+    reviewId: string,
+    authorRole: string
+  ): Promise<boolean> {
+    return this.sendNotification('ts_dialogue_message', String(userId), {
+      reviewId,
+      authorRole,
+    });
+  }
+
+  async notifyTruthStreamQueueAssigned(
+    userId: number,
+    batchNumber: number,
+    itemCount: number
+  ): Promise<boolean> {
+    return this.sendNotification('ts_queue_assigned', String(userId), {
+      batchNumber,
+      itemCount,
+    });
+  }
+
+  async notifyTruthStreamMilestoneEarned(
+    userId: number,
+    milestoneName: string
+  ): Promise<boolean> {
+    return this.sendNotification('ts_milestone_earned', String(userId), {
+      milestoneName,
+    });
   }
 
   // ============================================================================

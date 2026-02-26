@@ -404,6 +404,7 @@ export const loginUser: RequestHandler = async (req, res) => {
         id: userInfo.id,
         username: userInfo.username,
         email: userInfo.email,
+        intakeCompleted: userInfo.intakeCompleted,
         lastLogin: new Date().toISOString()
       },
       tokens: {
@@ -624,12 +625,25 @@ export const verifyToken: RequestHandler = async (req, res) => {
       return; // Keep return to prevent further execution
     }
 
+    // Fetch intake_completed from DB (not in JWT payload)
+    let intakeCompleted = false;
+    try {
+      const [rows] = await DB.query('SELECT intake_completed FROM users WHERE id = ?', [decoded.id]);
+      const users = rows as any[];
+      if (users.length > 0) {
+        intakeCompleted = Boolean(users[0].intake_completed);
+      }
+    } catch (dbErr) {
+      console.error('[verifyToken] Failed to fetch intake_completed:', dbErr);
+    }
+
     res.status(200).json({ // Removed 'return' here
       valid: true,
       user: {
         id: decoded.id,
         email: decoded.email,
-        username: decoded.username
+        username: decoded.username,
+        intakeCompleted
       },
       expiresAt: new Date(decoded.exp! * 1000).toISOString()
     });
