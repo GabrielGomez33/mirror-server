@@ -1432,3 +1432,126 @@ function roundToNearestHour(date: Date | string): Date {
   d.setMinutes(0, 0, 0);
   return d;
 }
+
+// ============================================================================
+// ANALYSIS TRENDS HANDLER
+// ============================================================================
+
+/**
+ * GET /analysis/trends — Get temporal trend analysis
+ * Returns the most recent temporal_trend analysis for the user.
+ */
+export async function getAnalysisTrends(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const userId = req.user!.id;
+
+    const [rows] = await DB.query(
+      `SELECT id, analysis_type, analysis_data, confidence_level, created_at
+       FROM truth_stream_analyses
+       WHERE user_id = ? AND analysis_type = 'temporal_trend'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [userId]
+    ) as any[];
+
+    if (!rows || rows.length === 0) {
+      res.json({ success: true, data: null, message: 'No trend analysis generated yet' });
+      return;
+    }
+
+    const analysis = rows[0];
+    res.json({
+      success: true,
+      data: {
+        id: analysis.id,
+        userId,
+        analysisType: analysis.analysis_type,
+        analysisData: safeJsonParse(analysis.analysis_data, {}),
+        confidenceLevel: analysis.confidence_level,
+        createdAt: analysis.created_at,
+      },
+    });
+  } catch (error: any) {
+    console.error('Error getting analysis trends:', error.message);
+    res.status(500).json({ error: 'Failed to get trend analysis', code: 'SERVER_ERROR' });
+  }
+}
+
+// ============================================================================
+// USER DELETION CASCADE
+// ============================================================================
+// This is the PRIMARY mechanism for cleaning up TruthStream data when a user
+// deletes their account. The DB trigger (009b_truthstream_trigger_admin.sql)
+// is a safety net — this function handles the nuanced logic.
+//
+// Call this BEFORE deleting the user row from the users table.
+// The CASCADE foreign keys on user_id will handle the rest (profile,
+// received reviews, analyses, milestones, feedback requests, etc.).
+// ============================================================================
+
+/**
+ * Clean up TruthStream data for a user BEFORE their account is deleted.
+ *
+ * Preserves reviews this user wrote for others (sets reviewer_id to NULL)
+ * so the reviewee doesn't lose valuable feedback. Everything owned by
+ * this user is cleaned up by CASCADE after the users row is deleted.
+ *
+ * @param userId - The ID of the user being deleted
+ * @returns true if cleanup succeeded, false if it failed (non-blocking)
+ */
+export async function cleanupUserTruthStreamData(userId: number): Promise<boolean> {
+  const connection = await DB.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    // 1. Preserve reviews this user wrote for other people
+    //    Nullify reviewer_id so the review content remains for the reviewee
+    await connection.query(
+      'UPDATE truth_stream_reviews SET reviewer_id = NULL WHERE reviewer_id = ?',
+      [userId]
+    );
+
+    // 2. Cancel incomplete queue assignments where this user was reviewer
+    //    Completed queue items will be cleaned up by CASCADE on reviewee side
+    await connection.query(
+      `DELETE FROM truth_stream_queue
+       WHERE reviewer_id = ? AND status IN ('pending', 'in_progress')`,
+      [userId]
+    );
+
+    // 3. Mark dialogues from this user as system messages (identity removed)
+    await connection.query(
+      `UPDATE truth_stream_dialogues
+       SET author_user_id = NULL,
+           content = CONCAT('[This user has deleted their account] ', content),
+           is_system_message = 1
+       WHERE author_user_id = ?`,
+      [userId]
+    );
+
+    // 4. Cancel any pending processing jobs for this user
+    await connection.query(
+      `UPDATE truth_stream_processing_queue
+       SET status = 'failed', error_message = 'User account deleted'
+       WHERE user_id = ? AND status IN ('pending', 'processing')`,
+      [userId]
+    );
+
+    // 5. Remove hostility log entries where this user was the reviewer
+    //    (audit trail for their own reviews is no longer meaningful)
+    await connection.query(
+      'DELETE FROM truth_stream_hostility_log WHERE reviewer_id = ?',
+      [userId]
+    );
+
+    await connection.commit();
+    console.log(`TruthStream cleanup completed for user ${userId}`);
+    return true;
+  } catch (error: any) {
+    await connection.rollback();
+    console.error(`TruthStream cleanup failed for user ${userId}:`, error.message);
+    return false;
+  } finally {
+    connection.release();
+  }
+}

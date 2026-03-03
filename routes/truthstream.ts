@@ -30,6 +30,7 @@ import {
   getAnalysis,
   generateAnalysis,
   getPerceptionGap,
+  getAnalysisTrends,
   createFeedbackRequest,
   getMyFeedbackRequests,
   getFeedbackRequestsFeed,
@@ -97,6 +98,7 @@ router.post('/reviews/:reviewId/flag', flagReview as RequestHandler);
 router.get('/analysis', getAnalysis as RequestHandler);
 router.post('/analysis/generate', generateAnalysis as RequestHandler);
 router.get('/analysis/perception-gap', getPerceptionGap as RequestHandler);
+router.get('/analysis/trends', getAnalysisTrends as RequestHandler);
 
 // ============================================================================
 // FEEDBACK REQUESTS
