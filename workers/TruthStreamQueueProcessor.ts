@@ -10,8 +10,16 @@
 // Start: npx ts-node workers/TruthStreamQueueProcessor.ts
 // Or via PM2: pm2 start workers/TruthStreamQueueProcessor.ts --name ts-processor
 //
-// Pattern follows: AnalysisQueueProcessor.ts (DB polling + Redis pub/sub)
-// All Dina calls route through mirror module via HTTP
+// Pattern follows: DinaChatQueueProcessor.ts (enterprise patterns)
+// All Dina calls route through mirror module's DUMP-compliant endpoints via HTTP
+//
+// Enterprise features (matching DinaChatQueueProcessor):
+//   - 3-state circuit breaker (closed/open/half-open) with env var config
+//   - Client-side rate limiter (sliding window, per-user)
+//   - Input sanitizer (null bytes, whitespace normalization, length caps)
+//   - Retry with exponential backoff + jitter (thundering herd prevention)
+//   - ProcessorStats + periodic stats logging (observability)
+//   - isShuttingDown flag (defensive shutdown)
 // ============================================================================
 
 import crypto from 'crypto';
@@ -44,6 +52,28 @@ interface ProcessorConfig {
   shutdownTimeout: number;
   dinaEndpoint: string;
   dinaServiceKey: string;
+  // Circuit breaker (configurable via env)
+  circuitBreakerThreshold: number;
+  circuitBreakerResetMs: number;
+  // Rate limiter (configurable via env)
+  rateLimitPerUser: number;
+  rateLimitWindowMs: number;
+  // Input sanitizer
+  maxInputLength: number;
+  // Timeouts
+  dinaTimeoutMs: number;
+}
+
+interface ProcessorStats {
+  processed: number;
+  succeeded: number;
+  failed: number;
+  retried: number;
+  averageProcessingTimeMs: number;
+  lastProcessedAt: Date | null;
+  circuitBreakerState: 'closed' | 'open' | 'half-open';
+  pollCount: number;
+  lastPollAt: Date | null;
 }
 
 // ============================================================================
@@ -59,6 +89,179 @@ function safeJsonParse<T = any>(value: unknown, fallback: T): T {
 }
 
 // ============================================================================
+// CIRCUIT BREAKER - 3-State Resilience Pattern
+// ============================================================================
+// Matches DinaChatQueueProcessor's CircuitBreaker class exactly:
+//   closed    → all requests pass through
+//   open      → all requests rejected immediately
+//   half-open → one probe request allowed; success closes, failure re-opens
+// ============================================================================
+
+class CircuitBreaker {
+  private failureCount: number = 0;
+  private lastFailureTime: number = 0;
+  private state: 'closed' | 'open' | 'half-open' = 'closed';
+  private readonly threshold: number;
+  private readonly resetTimeMs: number;
+  private readonly logger: Logger;
+
+  constructor(threshold: number, resetTimeMs: number, logger: Logger) {
+    this.threshold = threshold;
+    this.resetTimeMs = resetTimeMs;
+    this.logger = logger;
+  }
+
+  canExecute(): boolean {
+    if (this.state === 'closed') return true;
+
+    if (this.state === 'open') {
+      const timeSinceLastFailure = Date.now() - this.lastFailureTime;
+      if (timeSinceLastFailure >= this.resetTimeMs) {
+        this.state = 'half-open';
+        this.logger.info('Circuit breaker entering half-open state');
+        return true;
+      }
+      return false;
+    }
+
+    // half-open: allow one probe request
+    return true;
+  }
+
+  recordSuccess(): void {
+    if (this.state === 'half-open') {
+      this.logger.info('Circuit breaker closing after successful request');
+    }
+    this.failureCount = 0;
+    this.state = 'closed';
+  }
+
+  recordFailure(): void {
+    this.failureCount++;
+    this.lastFailureTime = Date.now();
+
+    if (this.state === 'half-open') {
+      this.state = 'open';
+      this.logger.warn('Circuit breaker re-opened after failure in half-open state');
+    } else if (this.failureCount >= this.threshold) {
+      this.state = 'open';
+      this.logger.warn('Circuit breaker opened', {
+        failureCount: this.failureCount,
+        threshold: this.threshold,
+      });
+    }
+  }
+
+  getState(): 'closed' | 'open' | 'half-open' {
+    // Check for timeout-based transition to half-open
+    if (this.state === 'open') {
+      const timeSinceLastFailure = Date.now() - this.lastFailureTime;
+      if (timeSinceLastFailure >= this.resetTimeMs) {
+        return 'half-open';
+      }
+    }
+    return this.state;
+  }
+
+  reset(): void {
+    this.failureCount = 0;
+    this.state = 'closed';
+    this.logger.info('Circuit breaker manually reset');
+  }
+}
+
+// ============================================================================
+// RATE LIMITER - Per-User Sliding Window
+// ============================================================================
+// Matches DinaChatQueueProcessor's RateLimiter class exactly.
+// Prevents thundering herd from a single user flooding the Dina service.
+// ============================================================================
+
+class RateLimiter {
+  private userRequests: Map<number, number[]> = new Map();
+  private readonly limit: number;
+  private readonly windowMs: number;
+
+  constructor(limit: number, windowMs: number) {
+    this.limit = limit;
+    this.windowMs = windowMs;
+  }
+
+  canProcess(userId: number): boolean {
+    const now = Date.now();
+    const requests = this.userRequests.get(userId) || [];
+    const recentRequests = requests.filter(time => now - time < this.windowMs);
+
+    if (recentRequests.length >= this.limit) {
+      return false;
+    }
+
+    recentRequests.push(now);
+    this.userRequests.set(userId, recentRequests);
+    return true;
+  }
+
+  cleanup(): void {
+    const now = Date.now();
+    for (const [userId, requests] of this.userRequests.entries()) {
+      const recentRequests = requests.filter(time => now - time < this.windowMs);
+      if (recentRequests.length === 0) {
+        this.userRequests.delete(userId);
+      } else {
+        this.userRequests.set(userId, recentRequests);
+      }
+    }
+  }
+}
+
+// ============================================================================
+// INPUT SANITIZER - First-Line Defense
+// ============================================================================
+// Matches DinaChatQueueProcessor's InputSanitizer class:
+//   - Null byte removal
+//   - Whitespace normalization
+//   - Length enforcement
+// The dina-server TruthStreamSynthesizer has prompt injection defense,
+// but this provides defense-in-depth on the mirror-server side.
+// ============================================================================
+
+class InputSanitizer {
+  private readonly maxLength: number;
+
+  constructor(maxLength: number) {
+    this.maxLength = maxLength;
+  }
+
+  sanitize(input: string): string {
+    if (!input || typeof input !== 'string') return '';
+
+    let sanitized = input
+      .replace(/\0/g, '')        // Remove null bytes
+      .replace(/\s+/g, ' ')     // Normalize whitespace
+      .trim();
+
+    if (sanitized.length > this.maxLength) {
+      sanitized = sanitized.substring(0, this.maxLength);
+    }
+
+    return sanitized;
+  }
+
+  sanitizeObject(obj: Record<string, any>, fieldLimits?: Record<string, number>): Record<string, any> {
+    const sanitized: Record<string, any> = {};
+    for (const [key, value] of Object.entries(obj)) {
+      if (typeof value === 'string') {
+        const limit = fieldLimits?.[key] || this.maxLength;
+        sanitized[key] = this.sanitize(value).substring(0, limit);
+      } else {
+        sanitized[key] = value;
+      }
+    }
+    return sanitized;
+  }
+}
+
+// ============================================================================
 // QUEUE PROCESSOR CLASS
 // ============================================================================
 
@@ -66,8 +269,20 @@ export class TruthStreamQueueProcessor {
   private logger: Logger;
   private config: ProcessorConfig;
   private isRunning: boolean = false;
+  private isShuttingDown: boolean = false;
   private currentJobs: Set<string> = new Set();
   private pollTimer: NodeJS.Timeout | null = null;
+  private cleanupTimer: NodeJS.Timeout | null = null;
+  private statusTimer: NodeJS.Timeout | null = null;
+
+  // Enterprise components (matching DinaChatQueueProcessor)
+  private readonly circuitBreaker: CircuitBreaker;
+  private readonly rateLimiter: RateLimiter;
+  private readonly sanitizer: InputSanitizer;
+  private readonly stats: ProcessorStats;
+
+  // Processing time tracking for averageProcessingTimeMs
+  private processingTimes: number[] = [];
 
   constructor(config?: Partial<ProcessorConfig>) {
     this.logger = new Logger('TruthStreamQueueProcessor');
@@ -77,16 +292,57 @@ export class TruthStreamQueueProcessor {
       maxConcurrentJobs: parseInt(process.env.TRUTHSTREAM_MAX_CONCURRENT || '3', 10),
       maxRetries: parseInt(process.env.TRUTHSTREAM_MAX_RETRIES || '3', 10),
       retryDelay: parseInt(process.env.TRUTHSTREAM_RETRY_DELAY || '10000', 10),
-      shutdownTimeout: 30000,
-      dinaEndpoint: process.env.DINA_ENDPOINT || 'http://localhost:7777',
+      shutdownTimeout: parseInt(process.env.TRUTHSTREAM_SHUTDOWN_TIMEOUT || '30000', 10),
+      dinaEndpoint: process.env.DINA_ENDPOINT || 'http://localhost:8445/dina/api/v1',
       dinaServiceKey: process.env.DINA_SERVICE_KEY || process.env.DINA_API_KEY || '',
+      // Circuit breaker (matching DinaChatQueueProcessor env var names)
+      circuitBreakerThreshold: parseInt(process.env.TS_CIRCUIT_BREAKER_THRESHOLD || '5', 10),
+      circuitBreakerResetMs: parseInt(process.env.TS_CIRCUIT_BREAKER_RESET || '60000', 10),
+      // Rate limiter
+      rateLimitPerUser: parseInt(process.env.TS_RATE_LIMIT_PER_USER || '10', 10),
+      rateLimitWindowMs: parseInt(process.env.TS_RATE_LIMIT_WINDOW || '60000', 10),
+      // Input sanitizer
+      maxInputLength: parseInt(process.env.TS_MAX_INPUT_LENGTH || '10000', 10),
+      // Timeouts
+      dinaTimeoutMs: parseInt(process.env.TS_DINA_TIMEOUT || '120000', 10),
       ...config,
+    };
+
+    // Initialize enterprise components
+    this.circuitBreaker = new CircuitBreaker(
+      this.config.circuitBreakerThreshold,
+      this.config.circuitBreakerResetMs,
+      this.logger
+    );
+
+    this.rateLimiter = new RateLimiter(
+      this.config.rateLimitPerUser,
+      this.config.rateLimitWindowMs
+    );
+
+    this.sanitizer = new InputSanitizer(this.config.maxInputLength);
+
+    this.stats = {
+      processed: 0,
+      succeeded: 0,
+      failed: 0,
+      retried: 0,
+      averageProcessingTimeMs: 0,
+      lastProcessedAt: null,
+      circuitBreakerState: 'closed',
+      pollCount: 0,
+      lastPollAt: null,
     };
 
     this.logger.info('TruthStreamQueueProcessor initialized', {
       pollInterval: this.config.pollInterval,
       maxConcurrentJobs: this.config.maxConcurrentJobs,
       maxRetries: this.config.maxRetries,
+      circuitBreakerThreshold: this.config.circuitBreakerThreshold,
+      circuitBreakerResetMs: this.config.circuitBreakerResetMs,
+      rateLimitPerUser: this.config.rateLimitPerUser,
+      dinaEndpoint: this.config.dinaEndpoint.replace(/key.*$/i, 'key=***'),
+      dinaTimeoutMs: this.config.dinaTimeoutMs,
     });
   }
 
@@ -101,6 +357,7 @@ export class TruthStreamQueueProcessor {
     }
 
     this.isRunning = true;
+    this.isShuttingDown = false;
     this.logger.info('Starting TruthStreamQueueProcessor');
 
     try {
@@ -109,6 +366,16 @@ export class TruthStreamQueueProcessor {
 
       // Start polling for pending jobs (fallback)
       this.startPolling();
+
+      // Start periodic cleanup (rate limiter eviction)
+      this.cleanupTimer = setInterval(() => {
+        this.rateLimiter.cleanup();
+      }, 60000);
+
+      // Start periodic stats logging
+      this.statusTimer = setInterval(() => {
+        this.logStats();
+      }, 60000);
 
       // Setup graceful shutdown
       this.setupShutdownHandlers();
@@ -128,11 +395,21 @@ export class TruthStreamQueueProcessor {
       currentJobs: this.currentJobs.size,
     });
 
+    this.isShuttingDown = true;
     this.isRunning = false;
 
+    // Clear all timers
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
+    }
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
+    }
+    if (this.statusTimer) {
+      clearInterval(this.statusTimer);
+      this.statusTimer = null;
     }
 
     // Wait for current jobs
@@ -154,7 +431,46 @@ export class TruthStreamQueueProcessor {
       // Ignore unsubscribe errors during shutdown
     }
 
+    // Log final stats
+    this.logStats();
+
     this.logger.info('TruthStreamQueueProcessor stopped');
+  }
+
+  // ==========================================================================
+  // OBSERVABILITY (matches DinaChatQueueProcessor getStats pattern)
+  // ==========================================================================
+
+  getStats(): ProcessorStats {
+    return {
+      ...this.stats,
+      circuitBreakerState: this.circuitBreaker.getState(),
+    };
+  }
+
+  private logStats(): void {
+    const stats = this.getStats();
+    this.logger.info('Processor stats', {
+      processed: stats.processed,
+      succeeded: stats.succeeded,
+      failed: stats.failed,
+      retried: stats.retried,
+      averageProcessingTimeMs: Math.round(stats.averageProcessingTimeMs),
+      circuitBreaker: stats.circuitBreakerState,
+      currentJobs: this.currentJobs.size,
+      pollCount: stats.pollCount,
+      lastProcessedAt: stats.lastProcessedAt?.toISOString() || null,
+    });
+  }
+
+  private recordProcessingTime(durationMs: number): void {
+    this.processingTimes.push(durationMs);
+    // Keep last 100 entries for rolling average
+    if (this.processingTimes.length > 100) {
+      this.processingTimes.shift();
+    }
+    this.stats.averageProcessingTimeMs =
+      this.processingTimes.reduce((sum, t) => sum + t, 0) / this.processingTimes.length;
   }
 
   // ==========================================================================
@@ -164,7 +480,7 @@ export class TruthStreamQueueProcessor {
   private async subscribeToQueue(): Promise<void> {
     try {
       await mirrorRedis.subscribe('mirror:truthstream:queue', async () => {
-        if (this.isRunning) {
+        if (this.isRunning && !this.isShuttingDown) {
           await this.processNextJobs();
         }
       });
@@ -178,7 +494,9 @@ export class TruthStreamQueueProcessor {
 
   private startPolling(): void {
     this.pollTimer = setInterval(async () => {
-      if (this.isRunning) {
+      if (this.isRunning && !this.isShuttingDown) {
+        this.stats.pollCount++;
+        this.stats.lastPollAt = new Date();
         await this.processNextJobs();
       }
     }, this.config.pollInterval);
@@ -188,6 +506,7 @@ export class TruthStreamQueueProcessor {
 
   private async processNextJobs(): Promise<void> {
     if (this.currentJobs.size >= this.config.maxConcurrentJobs) return;
+    if (this.isShuttingDown) return;
 
     try {
       const available = this.config.maxConcurrentJobs - this.currentJobs.size;
@@ -247,7 +566,33 @@ export class TruthStreamQueueProcessor {
   // ==========================================================================
 
   private async processJob(job: ProcessingJob): Promise<void> {
+    // Defensive: don't process during shutdown
+    if (this.isShuttingDown) {
+      this.logger.warn('Skipping job due to shutdown', { jobId: job.id });
+      // Re-queue the job
+      await DB.query(
+        `UPDATE truth_stream_processing_queue SET status = 'pending', started_at = NULL WHERE id = ?`,
+        [job.id]
+      );
+      return;
+    }
+
+    // Rate limit check
+    if (!this.rateLimiter.canProcess(job.user_id)) {
+      this.logger.warn('Rate limited - re-queuing job', {
+        jobId: job.id,
+        userId: job.user_id,
+      });
+      const retryAt = new Date(Date.now() + 30000); // Wait 30s
+      await DB.query(
+        `UPDATE truth_stream_processing_queue SET status = 'pending', next_retry_at = ? WHERE id = ?`,
+        [retryAt, job.id]
+      );
+      return;
+    }
+
     const inputData = safeJsonParse(job.input_data, {});
+    const startTime = Date.now();
 
     this.logger.info('Processing job', {
       jobId: job.id,
@@ -276,8 +621,24 @@ export class TruthStreamQueueProcessor {
         [job.id]
       );
 
-      this.logger.info('Job completed', { jobId: job.id, type: job.job_type });
+      // Update stats
+      const duration = Date.now() - startTime;
+      this.stats.processed++;
+      this.stats.succeeded++;
+      this.stats.lastProcessedAt = new Date();
+      this.recordProcessingTime(duration);
+
+      this.logger.info('Job completed', {
+        jobId: job.id,
+        type: job.job_type,
+        durationMs: duration,
+      });
     } catch (error: any) {
+      // Update stats
+      this.stats.processed++;
+      this.stats.failed++;
+      this.recordProcessingTime(Date.now() - startTime);
+
       await this.handleJobFailure(job, error);
     }
   }
@@ -289,15 +650,18 @@ export class TruthStreamQueueProcessor {
   private async processClassification(job: ProcessingJob, inputData: any): Promise<void> {
     const { reviewId, reviewText, responses, reviewTone, revieweeGoal, qualityMetrics } = inputData;
 
-    // Call Dina mirror module for classification
-    const result = await this.callDinaEndpoint('/mirror/truthstream/classify-review', {
+    // Sanitize text inputs (defense-in-depth: dina-server also sanitizes)
+    const sanitizedBody = {
       reviewId,
-      reviewText: String(reviewText || '').substring(0, 10000),
+      reviewText: this.sanitizer.sanitize(String(reviewText || '')),
       responses,
-      reviewTone,
+      reviewTone: reviewTone ? this.sanitizer.sanitize(String(reviewTone)).substring(0, 100) : undefined,
       revieweeGoal,
       qualityMetrics,
-    });
+    };
+
+    // Call Dina mirror module for classification
+    const result = await this.callDinaEndpoint('/mirror/truthstream/classify-review', sanitizedBody);
 
     if (!result.success || !result.data) {
       throw new Error(result.error || 'Classification returned unsuccessful response');
@@ -396,7 +760,7 @@ export class TruthStreamQueueProcessor {
     let selfAssessmentData: any = null;
     try {
       const [intakeRows] = await DB.query(
-        'SELECT intake_data FROM user_intake WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
+        'SELECT intake_data FROM intake_data WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
         [userId]
       ) as any[];
 
@@ -442,15 +806,21 @@ export class TruthStreamQueueProcessor {
       // Non-critical
     }
 
+    // Sanitize text fields before sending to Dina
+    const sanitizedGoal = this.sanitizer.sanitize(String(profile.goal || ''));
+    const sanitizedSelfStatement = profile.self_statement
+      ? this.sanitizer.sanitize(String(profile.self_statement))
+      : undefined;
+
     // Call Dina mirror module for analysis
     const result = await this.callDinaEndpoint('/mirror/truthstream/generate-analysis', {
       userId,
       analysisType: analysisType || 'truth_mirror_report',
       reviews,
       selfAssessmentData,
-      goal: profile.goal,
+      goal: sanitizedGoal,
       goalCategory: profile.goal_category,
-      selfStatement: profile.self_statement,
+      selfStatement: sanitizedSelfStatement,
       totalReviewCount: reviewRows.length,
       previousAnalysis,
     });
@@ -557,52 +927,123 @@ export class TruthStreamQueueProcessor {
   // ==========================================================================
   // DINA MIRROR MODULE HTTP CALL
   // ==========================================================================
+  // Enterprise patterns (matching DinaChatQueueProcessor + DINALLMConnector):
+  //   - 3-state circuit breaker (closed/open/half-open)
+  //   - Retry with exponential backoff + jitter (thundering herd prevention)
+  //   - Proper headers (Authorization, User-Agent, X-Request-Attempt)
+  //   - Retryable error detection (5xx, timeout, network; NOT 4xx)
+  // ==========================================================================
 
   /**
-   * Call a dina-server mirror module endpoint.
-   * Routes ALL TruthStream Dina interactions through the mirror module.
+   * Call a dina-server mirror module endpoint with circuit breaker and retry.
+   * Routes ALL TruthStream Dina interactions through the mirror module's
+   * DUMP-compliant endpoints.
    */
   private async callDinaEndpoint(path: string, body: any): Promise<any> {
+    // Circuit breaker check
+    if (!this.circuitBreaker.canExecute()) {
+      const error = new Error(
+        `Dina service unavailable: Circuit breaker ${this.circuitBreaker.getState().toUpperCase()}.`
+      );
+      this.logger.error('Circuit breaker rejecting request', {
+        state: this.circuitBreaker.getState(),
+      });
+      throw error;
+    }
+
+    const maxRetries = 3;
+    const baseDelays = [1000, 2000, 4000];
+    let lastError: any = null;
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        const url = this.buildDinaEndpointUrl(path);
+
+        this.logger.debug('Calling Dina mirror module', {
+          url,
+          path,
+          attempt: attempt + 1,
+        });
+
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${this.config.dinaServiceKey}`,
+            'User-Agent': 'MirrorTruthStream/1.0',
+            'X-Request-Attempt': String(attempt + 1),
+          },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(this.config.dinaTimeoutMs),
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text().catch(() => 'Unknown error');
+          throw new Error(
+            `Dina mirror module error: ${response.status} ${response.statusText} - ${errorText.substring(0, 200)}`
+          );
+        }
+
+        const result = await response.json();
+
+        if (!result.success) {
+          throw new Error(result.error || 'Dina returned unsuccessful response');
+        }
+
+        // Success — record with circuit breaker
+        this.circuitBreaker.recordSuccess();
+        return result;
+
+      } catch (error: any) {
+        lastError = error;
+        const isLastAttempt = attempt === maxRetries - 1;
+        const isRetryable = this.isRetryableError(error);
+
+        if (!isLastAttempt && isRetryable) {
+          // Exponential backoff + jitter (prevents thundering herd)
+          const baseDelay = baseDelays[attempt];
+          const jitter = Math.floor(Math.random() * baseDelay * 0.3); // Up to 30% jitter
+          const delay = baseDelay + jitter;
+          this.logger.warn(`Retry attempt ${attempt + 1}/${maxRetries} after ${delay}ms`, {
+            error: error.message,
+            path,
+            baseDelay,
+            jitter,
+          });
+          await this.sleep(delay);
+        } else {
+          break;
+        }
+      }
+    }
+
+    // All retries exhausted — record failure with circuit breaker
+    this.circuitBreaker.recordFailure();
+    this.stats.retried++;
+    throw lastError;
+  }
+
+  /**
+   * Build the full URL for a Dina mirror module endpoint.
+   * Matches DINALLMConnector.buildMirrorSynthesisEndpoint() pattern.
+   */
+  private buildDinaEndpointUrl(path: string): string {
     const baseUrl = this.config.dinaEndpoint.replace(/\/$/, '');
 
-    // Build the full URL (follows DINALLMConnector pattern)
-    let url: string;
     try {
       const parsed = new URL(baseUrl);
       if (parsed.pathname.endsWith('/api/v1')) {
-        url = baseUrl.replace(/\/api\/v1$/, '') + '/api/v1' + path;
+        return baseUrl.replace(/\/api\/v1$/, '') + '/api/v1' + path;
       } else if (parsed.pathname.includes('/dina')) {
-        url = baseUrl + '/api/v1' + path;
+        return baseUrl + '/api/v1' + path;
       } else if (parsed.pathname === '' || parsed.pathname === '/') {
-        url = baseUrl + '/dina/api/v1' + path;
+        return baseUrl + '/dina/api/v1' + path;
       } else {
-        url = baseUrl + path;
+        return baseUrl + path;
       }
     } catch {
-      url = `${baseUrl}/dina/api/v1${path}`;
+      return `${baseUrl}/dina/api/v1${path}`;
     }
-
-    this.logger.debug('Calling Dina mirror module', { url, path });
-
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${this.config.dinaServiceKey}`,
-        'User-Agent': 'MirrorTruthStream/1.0',
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(120000),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => 'Unknown error');
-      throw new Error(
-        `Dina mirror module error: ${response.status} ${response.statusText} - ${errorText.substring(0, 200)}`
-      );
-    }
-
-    return response.json();
   }
 
   // ==========================================================================
@@ -622,6 +1063,7 @@ export class TruthStreamQueueProcessor {
     });
 
     if (canRetry) {
+      this.stats.retried++;
       const nextRetryAt = new Date(Date.now() + this.config.retryDelay * Math.pow(2, retryCount - 1));
       await DB.query(
         `UPDATE truth_stream_processing_queue
@@ -695,6 +1137,12 @@ function roundToNearestHour(date: Date | string): Date {
 if (require.main === module) {
   console.log('╔══════════════════════════════════════════════════════╗');
   console.log('║    TruthStream Queue Processor - Standalone Mode    ║');
+  console.log('╠══════════════════════════════════════════════════════╣');
+  console.log('║  Circuit Breaker: 3-state (closed/open/half-open)  ║');
+  console.log('║  Rate Limiter:    Per-user sliding window          ║');
+  console.log('║  Input Sanitizer: Null byte + whitespace defense   ║');
+  console.log('║  Retry:           Exponential backoff + jitter     ║');
+  console.log('║  DUMP Compliant:  Routes through Core Orchestrator ║');
   console.log('╚══════════════════════════════════════════════════════╝');
 
   const processor = new TruthStreamQueueProcessor();
@@ -705,4 +1153,10 @@ if (require.main === module) {
     console.error('Failed to start:', error);
     process.exit(1);
   });
+
+  // Log stats periodically (matches AnalysisQueueProcessor pattern)
+  setInterval(() => {
+    const stats = processor.getStats();
+    console.log('[TruthStream Stats]', JSON.stringify(stats));
+  }, 60000);
 }

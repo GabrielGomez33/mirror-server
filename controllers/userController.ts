@@ -9,6 +9,7 @@ import { ResultSetHeader, FieldPacket } from 'mysql2/promise';
 import { DB } from '../db';
 import { generateUserKeys } from './encryptionController';
 import { createUserDirectories, deleteUserDirectories, DataAccessContext } from './directoryController';
+import { cleanupUserTruthStreamData } from './truthstreamController';
 const basePath = path.join(process.env.MIRRORSTORAGE!);
 const storagePath = path.join(basePath, 'users');
 const SALT_ROUNDS = 10;
@@ -55,6 +56,17 @@ export async function deleteUserFromDB(userId: string, adminUserId: number): Pro
 
     // Delete user directories with proper context
     await deleteUserDirectories(userId, context);
+
+    // Clean up TruthStream data BEFORE deleting the user row.
+    // This preserves reviews the user wrote for others (sets reviewer_id to NULL)
+    // while allowing CASCADE to clean up everything owned by the user.
+    try {
+      await cleanupUserTruthStreamData(parseInt(userId, 10));
+      console.log(`[DeleteUserFromDB]: TruthStream data cleaned up for user ${userId}`);
+    } catch (tsError) {
+      // Log but don't block user deletion — the DB trigger is a safety net
+      console.warn(`[DeleteUserFromDB]: TruthStream cleanup warning for user ${userId}:`, tsError);
+    }
 
     // Delete user from database
     await DB.query('DELETE FROM users WHERE id = ?', [userId]);

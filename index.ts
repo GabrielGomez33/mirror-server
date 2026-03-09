@@ -1,5 +1,5 @@
-// index.ts - Mirror Server with MirrorGroups Phase 3.5 Integration + @Dina Chat
-// Includes: Existing routes, Redis, Notifications, Encryption, Group APIs, WebSocket signaling, Group Analysis, DINA LLM, @Dina Chat
+// index.ts - Mirror Server with MirrorGroups Phase 3.5 Integration + @Dina Chat + TruthStream
+// Includes: Existing routes, Redis, Notifications, Encryption, Group APIs, WebSocket signaling, Group Analysis, DINA LLM, @Dina Chat, TruthStream
 
 import https from 'https';
 import fs from 'fs';
@@ -48,6 +48,11 @@ import sessionInsightsRoutes from './routes/sessionInsights';
 // ============================================================================
 import groupChatRoutes, { setBroadcastFunction as setChatBroadcast } from './routes/groupChat';
 import { chatMessageManager } from './managers/ChatMessageManager';
+
+// ============================================================================
+// TRUTHSTREAM (Anonymous Peer Review System)
+// ============================================================================
+import truthstreamRoutes from './routes/truthstream';
 
 // ============================================================================
 // MIRRORGROUPS PHASE 3 (Group Analysis System)
@@ -189,6 +194,13 @@ APP.use('/mirror/api/groups', groupChatRoutes);
 console.log('📍 MirrorGroups Chat routes mounted at /mirror/api/groups/:groupId/chat');
 
 // ============================================================================
+// MOUNT TRUTHSTREAM ROUTES
+// ============================================================================
+
+APP.use('/mirror/api/truthstream', truthstreamRoutes);
+console.log('📍 TruthStream routes mounted at /mirror/api/truthstream');
+
+// ============================================================================
 // @DINA CHAT - Processor runs as SEPARATE PROCESS (via PM2/systemd)
 // ============================================================================
 // Stats endpoint removed - query the processor directly when running separately
@@ -207,7 +219,7 @@ APP.get('/mirror/api/health', async (req, res) => {
     status: 'healthy',
     service: 'mirror-server',
     timestamp: new Date().toISOString(),
-    version: '3.6.0', // Bumped for @Dina chat integration
+    version: '3.7.0', // Bumped for TruthStream integration
     features: {
       authentication: 'enabled',
       redis: mirrorRedis.isConnected() ? 'connected' : 'disconnected',
@@ -217,6 +229,7 @@ APP.get('/mirror/api/health', async (req, res) => {
       groupAnalysis: 'enabled',
       dinaIntegration: 'enabled',
       llmSynthesis: 'enabled',
+      truthstream: 'enabled',
       dinaChatProcessor: 'separate_process', // Runs via PM2/systemd
       websocket: wsHealth.status
     },
@@ -288,6 +301,12 @@ APP.get('/mirror/api/health', async (req, res) => {
         }
       }
     },
+    truthStream: {
+      status: 'active',
+      queueProcessor: 'separate_process',
+      command: 'npx ts-node workers/TruthStreamQueueProcessor.ts',
+      endpoints: '/mirror/api/truthstream/*'
+    },
     endpoints: {
       auth: '/mirror/api/auth',
       user: '/mirror/api/user',
@@ -300,6 +319,7 @@ APP.get('/mirror/api/health', async (req, res) => {
       votes: '/mirror/api/groups/:groupId/votes',
       sessions: '/mirror/api/groups/:groupId/sessions/:sessionId',
       chat: '/mirror/api/groups/:groupId/chat',
+      truthstream: '/mirror/api/truthstream/*',
       websocket: 'wss://theundergroundrailroad.world:8444/mirror/groups/ws',
       chatWebsocket: 'wss://theundergroundrailroad.world:8444/mirror/groups/chat'
     }
@@ -665,6 +685,7 @@ async function startServer(): Promise<void> {
       console.log(`   Intake:    /mirror/api/intake/*`);
       console.log(`   Dashboard: /mirror/api/dashboard/*`);
       console.log(`   Journal:   /mirror/api/journal/*`);
+      console.log(`   TruthStrm: /mirror/api/truthstream/*`);
       console.log(`   Groups:    /mirror/api/groups/* (Phase 1-3)`);
       console.log(`   Insights:  /mirror/api/groups/:groupId/insights (Phase 3.5)`);
       console.log(`   @Dina Stats: /mirror/api/dina/chat/stats`);

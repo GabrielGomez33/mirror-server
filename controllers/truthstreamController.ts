@@ -53,6 +53,11 @@ const MAX_DIALOGUE_MESSAGES = parseInt(process.env.TRUTHSTREAM_MAX_DIALOGUE_MESS
 
 /**
  * POST /profile — Create a Truth Card
+ *
+ * Accepts the frontend's minimal payload (selfStatement, feedbackAreas, sharedDataTypes)
+ * and auto-derives remaining fields (displayAlias, goal, goalCategory) from the
+ * authenticated user's existing data. This keeps the UX lightweight while the
+ * database schema stays rich for future features.
  */
 export async function createProfile(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
@@ -68,12 +73,12 @@ export async function createProfile(req: AuthenticatedRequest, res: Response): P
       return;
     }
 
-    // Check intake completion (user must have at least one intake submission)
+    // Check intake completion via users table flag (consistent with authController/intakeController)
     const [intakeCheck] = await DB.query(
-      'SELECT id FROM user_intake WHERE user_id = ? LIMIT 1',
+      'SELECT intake_completed FROM users WHERE id = ? LIMIT 1',
       [userId]
     ) as any[];
-    if (!intakeCheck || intakeCheck.length === 0) {
+    if (!intakeCheck || intakeCheck.length === 0 || !intakeCheck[0].intake_completed) {
       res.status(403).json({ error: 'Complete Mirror intake first', code: 'INTAKE_REQUIRED' });
       return;
     }
@@ -84,42 +89,7 @@ export async function createProfile(req: AuthenticatedRequest, res: Response): P
       selfStatement, feedbackAreas, sharedDataTypes,
     } = req.body;
 
-    // Validate required fields
-    if (!displayAlias || !ageRange || !goal || !goalCategory || !sharedDataTypes) {
-      res.status(400).json({
-        error: 'Missing required fields: displayAlias, ageRange, goal, goalCategory, sharedDataTypes',
-        code: 'VALIDATION_ERROR',
-      });
-      return;
-    }
-
-    // Validate alias uniqueness
-    const sanitizedAlias = sanitizeInput(displayAlias, 50);
-    if (!sanitizedAlias || sanitizedAlias.length < 3) {
-      res.status(400).json({ error: 'Display alias must be 3-50 characters', code: 'VALIDATION_ERROR' });
-      return;
-    }
-
-    const [aliasCheck] = await DB.query(
-      'SELECT id FROM truth_stream_profiles WHERE display_alias = ?',
-      [sanitizedAlias]
-    ) as any[];
-    if (aliasCheck && aliasCheck.length > 0) {
-      res.status(409).json({ error: 'Display name already taken', code: 'ALIAS_CONFLICT' });
-      return;
-    }
-
-    // Validate alias doesn't match any real username
-    const [usernameCheck] = await DB.query(
-      'SELECT id FROM users WHERE LOWER(username) = LOWER(?)',
-      [sanitizedAlias]
-    ) as any[];
-    if (usernameCheck && usernameCheck.length > 0) {
-      res.status(409).json({ error: 'This display name is not available', code: 'ALIAS_CONFLICT' });
-      return;
-    }
-
-    // Validate shared data types minimum
+    // ---- Shared Data Types (always required from frontend) ----
     const validTypes = ['personality', 'cognitive', 'facial', 'voice', 'astrological', 'profile'];
     const validSharedTypes = Array.isArray(sharedDataTypes)
       ? sharedDataTypes.filter((t: string) => validTypes.includes(t))
@@ -133,12 +103,128 @@ export async function createProfile(req: AuthenticatedRequest, res: Response): P
       return;
     }
 
-    // Calculate profile completeness
+    // ---- Self-Statement (required from frontend) ----
+    const sanitizedStatement = sanitizeInput(selfStatement, 2000);
+    if (!sanitizedStatement || sanitizedStatement.length < 20) {
+      res.status(400).json({
+        error: 'Self-statement must be at least 20 characters',
+        code: 'VALIDATION_ERROR',
+      });
+      return;
+    }
+
+    // ---- Feedback Areas (required from frontend, at least 1) ----
+    const validFeedbackAreas = Array.isArray(feedbackAreas)
+      ? feedbackAreas.slice(0, 10).map((a: string) => sanitizeInput(a, 100)).filter(Boolean)
+      : [];
+    if (validFeedbackAreas.length < 1) {
+      res.status(400).json({
+        error: 'Select at least 1 feedback area',
+        code: 'VALIDATION_ERROR',
+      });
+      return;
+    }
+
+    // ---- Display Alias (auto-derive if not provided) ----
+    // Generate an anonymous alias from username + random suffix to preserve anonymity
+    let resolvedAlias: string;
+    if (displayAlias) {
+      const sanitizedAlias = sanitizeInput(displayAlias, 50);
+      if (!sanitizedAlias || sanitizedAlias.length < 3) {
+        res.status(400).json({ error: 'Display alias must be 3-50 characters', code: 'VALIDATION_ERROR' });
+        return;
+      }
+      resolvedAlias = sanitizedAlias;
+    } else {
+      // Auto-generate: "Mirror_" + first 4 chars of UUID for anonymity
+      const suffix = crypto.randomUUID().replace(/-/g, '').substring(0, 8);
+      resolvedAlias = `Mirror_${suffix}`;
+    }
+
+    // Check alias uniqueness in truth_stream_profiles
+    const [aliasCheck] = await DB.query(
+      'SELECT id FROM truth_stream_profiles WHERE display_alias = ?',
+      [resolvedAlias]
+    ) as any[];
+    if (aliasCheck && aliasCheck.length > 0) {
+      // If auto-generated alias collides (extremely unlikely), regenerate
+      if (!displayAlias) {
+        const fallback = crypto.randomUUID().replace(/-/g, '').substring(0, 10);
+        resolvedAlias = `Mirror_${fallback}`;
+      } else {
+        res.status(409).json({ error: 'Display name already taken', code: 'ALIAS_CONFLICT' });
+        return;
+      }
+    }
+
+    // Validate alias doesn't match any real username
+    const [usernameCheck] = await DB.query(
+      'SELECT id FROM users WHERE LOWER(username) = LOWER(?)',
+      [resolvedAlias]
+    ) as any[];
+    if (usernameCheck && usernameCheck.length > 0) {
+      if (!displayAlias) {
+        const fallback = crypto.randomUUID().replace(/-/g, '').substring(0, 10);
+        resolvedAlias = `Mirror_${fallback}`;
+      } else {
+        res.status(409).json({ error: 'This display name is not available', code: 'ALIAS_CONFLICT' });
+        return;
+      }
+    }
+
+    // ---- Goal Category (auto-derive from first feedback area if not provided) ----
+    const validGoalCategories = [
+      'personal_growth', 'dating_readiness', 'professional_image',
+      'social_skills', 'first_impressions', 'leadership',
+      'communication', 'authenticity', 'confidence', 'custom',
+    ];
+    const feedbackToGoalMap: Record<string, string> = {
+      'First Impressions': 'first_impressions',
+      'Communication Style': 'communication',
+      'Social Presence': 'social_skills',
+      'Dating Readiness': 'dating_readiness',
+      'Professional Image': 'professional_image',
+      'Emotional Intelligence': 'personal_growth',
+      'Leadership Potential': 'leadership',
+      'Authenticity': 'authenticity',
+      'Confidence': 'confidence',
+    };
+
+    let resolvedGoalCategory: string;
+    if (goalCategory && validGoalCategories.includes(goalCategory)) {
+      resolvedGoalCategory = goalCategory;
+    } else {
+      // Map the first selected feedback area to a goal category
+      const firstArea = validFeedbackAreas[0] as string;
+      resolvedGoalCategory = feedbackToGoalMap[firstArea] || 'personal_growth';
+    }
+
+    // ---- Goal (auto-derive from selfStatement / feedbackAreas if not provided) ----
+    let resolvedGoal: string;
+    if (goal) {
+      resolvedGoal = sanitizeInput(goal, 1000) || `Seeking honest feedback on ${validFeedbackAreas.join(', ')}`;
+    } else {
+      resolvedGoal = `Seeking honest feedback on ${validFeedbackAreas.join(', ')}`;
+    }
+
+    // ---- Age Range (required) ----
+    const validAgeRanges = ['18-24', '25-34', '35-44', '45-54', '55+'];
+    if (!ageRange || !validAgeRanges.includes(ageRange)) {
+      res.status(400).json({
+        error: 'Valid age range is required',
+        code: 'VALIDATION_ERROR',
+        data: { validRanges: validAgeRanges },
+      });
+      return;
+    }
+    const resolvedAgeRange = ageRange;
+
+    // ---- Calculate profile completeness ----
     let completeness = 0.4; // Base (alias + goal + data types = required)
     if (photoPath) completeness += 0.2;
     if (vocalSalutationPath) completeness += 0.15;
-    if (selfStatement) completeness += 0.15;
-    if (feedbackAreas && Array.isArray(feedbackAreas) && feedbackAreas.length > 0) completeness += 0.1;
+    if (sanitizedStatement) completeness += 0.15;
+    if (validFeedbackAreas.length > 0) completeness += 0.1;
 
     const profileId = crypto.randomUUID();
 
@@ -149,17 +235,17 @@ export async function createProfile(req: AuthenticatedRequest, res: Response): P
         feedback_areas, shared_data_types, minimum_share_met, profile_completeness, is_active)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 1)`,
       [
-        profileId, userId, sanitizedAlias,
-        ageRange,
-        sanitizeInput(genderDisplay, 30),
-        sanitizeInput(pronouns, 20),
-        sanitizeInput(culturalContext, 200),
-        sanitizeInput(photoPath, 500),
-        sanitizeInput(vocalSalutationPath, 500),
-        sanitizeInput(goal, 1000),
-        goalCategory,
-        sanitizeInput(selfStatement, 2000),
-        JSON.stringify(Array.isArray(feedbackAreas) ? feedbackAreas.slice(0, 10).map((a: string) => sanitizeInput(a, 100)) : []),
+        profileId, userId, resolvedAlias,
+        resolvedAgeRange,
+        sanitizeInput(genderDisplay, 30) || null,
+        sanitizeInput(pronouns, 20) || null,
+        sanitizeInput(culturalContext, 200) || null,
+        sanitizeInput(photoPath, 500) || null,
+        sanitizeInput(vocalSalutationPath, 500) || null,
+        resolvedGoal,
+        resolvedGoalCategory,
+        sanitizedStatement,
+        JSON.stringify(validFeedbackAreas),
         JSON.stringify(validSharedTypes),
         completeness,
       ]
@@ -169,10 +255,13 @@ export async function createProfile(req: AuthenticatedRequest, res: Response): P
       success: true,
       data: {
         id: profileId,
-        displayAlias: sanitizedAlias,
-        goalCategory,
+        displayAlias: resolvedAlias,
+        goalCategory: resolvedGoalCategory,
+        goal: resolvedGoal,
         profileCompleteness: completeness,
         sharedDataTypes: validSharedTypes,
+        feedbackAreas: validFeedbackAreas,
+        selfStatement: sanitizedStatement,
       },
     });
   } catch (error: any) {
@@ -1359,13 +1448,13 @@ async function buildSharedIntakeData(userId: number, sharedTypes: string[]): Pro
 
   try {
     const [intakeRows] = await DB.query(
-      'SELECT intake_data FROM user_intake WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
+      'SELECT intake_data FROM intake_data WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
       [userId]
     ) as any[];
 
     if (!intakeRows || intakeRows.length === 0) return shared;
 
-    const intakeData = safeJsonParse(intakeRows[0].intake_data, {});
+    const intakeData: Record<string, any> = safeJsonParse(intakeRows[0].intake_data, {});
 
     if (sharedTypes.includes('personality') && intakeData.personalityResult) {
       shared.personality = {
