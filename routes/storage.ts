@@ -1,34 +1,52 @@
 // routes/storage.ts
-// routes/storage.ts
-// Following existing pattern from routes/auth.ts and routes/user.ts
+// Storage routes with query-token extraction for <img>/<audio> element authentication.
+// The retrieve endpoint is authenticated so files are not publicly accessible.
 
-import express from 'express';
+import express, { Request, Response, NextFunction, RequestHandler } from 'express';
 import {
   createDirectoriesHandler,
   storeDataHandler,
   retrieveDataHandler,
   listFilesHandler
 } from '../controllers/storageController';
-
-// ✅ Use the Multer instance you placed in utils/
+import AuthMiddleware from '../middleware/authMiddleware';
 import { upload } from '../utils/multer';
 
 const router = express.Router();
+const verified = AuthMiddleware.verifyToken as unknown as RequestHandler;
 
-// JSON body route (no multipart)
-router.post('/directories/create', createDirectoriesHandler);
+// ============================================================================
+// QUERY TOKEN EXTRACTION MIDDLEWARE
+// ============================================================================
+// HTML elements (<img>, <audio>) cannot send Authorization headers.
+// The client appends ?token=<JWT> to the URL instead.
+// This middleware promotes that query param to the Authorization header
+// so the standard verifyToken middleware can handle it.
+// ============================================================================
+function extractQueryToken(req: Request, _res: Response, next: NextFunction): void {
+  if (!req.headers.authorization && req.query.token && typeof req.query.token === 'string') {
+    req.headers.authorization = `Bearer ${req.query.token}`;
+  }
+  next();
+}
 
-// ✅ Multipart route: Multer must run here so req.body and req.file are populated
-// Field name must match client: "file"
+// ============================================================================
+// ROUTES
+// ============================================================================
+
+// Directory creation (requires auth)
+router.post('/directories/create', verified, createDirectoriesHandler);
+
+// File upload (requires auth, multipart)
 router.post(
   '/store',
+  verified,
   upload.fields([
     { name: 'file', maxCount: 1 },
     { name: 'data', maxCount: 1 },
   ]),
-  (req, res, next) => {
-    // Normalize to req.file so your controller can keep its logic minimal
-    // If controller already reads from req.files/req.file, you can skip this block.
+  (req: Request, _res: Response, next: NextFunction) => {
+    // Normalize to req.file so the controller can keep its logic minimal
     const f =
       (req as any).files?.['file']?.[0] ??
       (req as any).files?.['data']?.[0] ??
@@ -38,8 +56,16 @@ router.post(
   },
   storeDataHandler
 );
-// Retrieval / listing
-router.get('/retrieve/:userId/:tier/:filename', retrieveDataHandler);
-router.get('/list/:userId/:tier', listFilesHandler);
+
+// File retrieval (requires auth — supports ?token= for <img>/<audio> elements)
+router.get(
+  '/retrieve/:userId/:tier/:filename',
+  extractQueryToken,
+  verified,
+  retrieveDataHandler
+);
+
+// File listing (requires auth)
+router.get('/list/:userId/:tier', verified, listFilesHandler);
 
 export default router;

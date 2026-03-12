@@ -15,6 +15,8 @@ import { Request, Response } from 'express';
 import { DB } from '../db';
 import { truthStreamQueueManager } from '../services/TruthStreamQueueManager';
 import { truthStreamReviewScorer } from '../services/TruthStreamReviewScorer';
+import { IntakeDataManager } from '../controllers/intakeController';
+import type { DataAccessContext } from '../controllers/directoryController';
 
 // ============================================================================
 // TYPES (inline to avoid circular dependency)
@@ -103,6 +105,22 @@ export async function createProfile(req: AuthenticatedRequest, res: Response): P
       return;
     }
 
+    // ---- Shared type data consistency: if sharing facial/voice, the data must exist ----
+    if (validSharedTypes.includes('facial') && !photoPath) {
+      res.status(400).json({
+        error: 'Photo is required when sharing facial data',
+        code: 'VALIDATION_ERROR',
+      });
+      return;
+    }
+    if (validSharedTypes.includes('voice') && !vocalSalutationPath) {
+      res.status(400).json({
+        error: 'Voice recording is required when sharing voice data',
+        code: 'VALIDATION_ERROR',
+      });
+      return;
+    }
+
     // ---- Self-Statement (required from frontend) ----
     const sanitizedStatement = sanitizeInput(selfStatement, 2000);
     if (!sanitizedStatement || sanitizedStatement.length < 20) {
@@ -125,21 +143,17 @@ export async function createProfile(req: AuthenticatedRequest, res: Response): P
       return;
     }
 
-    // ---- Display Alias (auto-derive if not provided) ----
-    // Generate an anonymous alias from username + random suffix to preserve anonymity
-    let resolvedAlias: string;
-    if (displayAlias) {
-      const sanitizedAlias = sanitizeInput(displayAlias, 50);
-      if (!sanitizedAlias || sanitizedAlias.length < 3) {
-        res.status(400).json({ error: 'Display alias must be 3-50 characters', code: 'VALIDATION_ERROR' });
-        return;
-      }
-      resolvedAlias = sanitizedAlias;
-    } else {
-      // Auto-generate: "Mirror_" + first 4 chars of UUID for anonymity
-      const suffix = crypto.randomUUID().replace(/-/g, '').substring(0, 8);
-      resolvedAlias = `Mirror_${suffix}`;
+    // ---- Display Alias (required) ----
+    const sanitizedAlias = sanitizeInput(displayAlias, 50);
+    if (!sanitizedAlias || sanitizedAlias.length < 3) {
+      res.status(400).json({
+        error: 'Display name is required (3-50 characters)',
+        code: 'VALIDATION_ERROR',
+        data: { minLength: 3, maxLength: 50 },
+      });
+      return;
     }
+    const resolvedAlias = sanitizedAlias;
 
     // Check alias uniqueness in truth_stream_profiles
     const [aliasCheck] = await DB.query(
@@ -147,29 +161,18 @@ export async function createProfile(req: AuthenticatedRequest, res: Response): P
       [resolvedAlias]
     ) as any[];
     if (aliasCheck && aliasCheck.length > 0) {
-      // If auto-generated alias collides (extremely unlikely), regenerate
-      if (!displayAlias) {
-        const fallback = crypto.randomUUID().replace(/-/g, '').substring(0, 10);
-        resolvedAlias = `Mirror_${fallback}`;
-      } else {
-        res.status(409).json({ error: 'Display name already taken', code: 'ALIAS_CONFLICT' });
-        return;
-      }
+      res.status(409).json({ error: 'Display name already taken', code: 'ALIAS_CONFLICT' });
+      return;
     }
 
-    // Validate alias doesn't match any real username
+    // Validate alias doesn't match any real username (prevents impersonation)
     const [usernameCheck] = await DB.query(
       'SELECT id FROM users WHERE LOWER(username) = LOWER(?)',
       [resolvedAlias]
     ) as any[];
     if (usernameCheck && usernameCheck.length > 0) {
-      if (!displayAlias) {
-        const fallback = crypto.randomUUID().replace(/-/g, '').substring(0, 10);
-        resolvedAlias = `Mirror_${fallback}`;
-      } else {
-        res.status(409).json({ error: 'This display name is not available', code: 'ALIAS_CONFLICT' });
-        return;
-      }
+      res.status(409).json({ error: 'This display name is not available', code: 'ALIAS_CONFLICT' });
+      return;
     }
 
     // ---- Goal Category (auto-derive from first feedback area if not provided) ----
@@ -256,12 +259,20 @@ export async function createProfile(req: AuthenticatedRequest, res: Response): P
       data: {
         id: profileId,
         displayAlias: resolvedAlias,
+        ageRange: resolvedAgeRange,
         goalCategory: resolvedGoalCategory,
         goal: resolvedGoal,
-        profileCompleteness: completeness,
-        sharedDataTypes: validSharedTypes,
-        feedbackAreas: validFeedbackAreas,
         selfStatement: sanitizedStatement,
+        feedbackAreas: validFeedbackAreas,
+        sharedDataTypes: validSharedTypes,
+        photoPath: sanitizeInput(photoPath, 500) || null,
+        vocalSalutationPath: sanitizeInput(vocalSalutationPath, 500) || null,
+        profileCompleteness: completeness,
+        isActive: true,
+        totalReviewsReceived: 0,
+        totalReviewsGiven: 0,
+        reviewerQualityScore: 0,
+        perceptionGapScore: null,
       },
     });
   } catch (error: any) {
@@ -358,6 +369,56 @@ export async function updateProfile(req: AuthenticatedRequest, res: Response): P
       }
     }
 
+    // Handle display alias (requires uniqueness validation)
+    if (req.body.displayAlias !== undefined) {
+      const newAlias = sanitizeInput(req.body.displayAlias, 50);
+      if (!newAlias || newAlias.length < 3) {
+        res.status(400).json({
+          error: 'Display name must be 3-50 characters',
+          code: 'VALIDATION_ERROR',
+          data: { minLength: 3, maxLength: 50 },
+        });
+        return;
+      }
+      // Only check uniqueness if the alias is actually changing
+      if (newAlias !== existing[0].display_alias) {
+        const [aliasCheck] = await DB.query(
+          'SELECT id FROM truth_stream_profiles WHERE display_alias = ? AND user_id != ?',
+          [newAlias, userId]
+        ) as any[];
+        if (aliasCheck && aliasCheck.length > 0) {
+          res.status(409).json({ error: 'Display name already taken', code: 'ALIAS_CONFLICT' });
+          return;
+        }
+        const [usernameCheck] = await DB.query(
+          'SELECT id FROM users WHERE LOWER(username) = LOWER(?)',
+          [newAlias]
+        ) as any[];
+        if (usernameCheck && usernameCheck.length > 0) {
+          res.status(409).json({ error: 'This display name is not available', code: 'ALIAS_CONFLICT' });
+          return;
+        }
+        updates.push('display_alias = ?');
+        params.push(newAlias);
+      }
+    }
+
+    // Handle age range (ENUM field — requires whitelist validation)
+    if (req.body.ageRange !== undefined) {
+      const validAgeRanges = ['18-24', '25-34', '35-44', '45-54', '55+'];
+      if (validAgeRanges.includes(req.body.ageRange)) {
+        updates.push('age_range = ?');
+        params.push(req.body.ageRange);
+      } else {
+        res.status(400).json({
+          error: 'Valid age range is required',
+          code: 'VALIDATION_ERROR',
+          data: { validRanges: validAgeRanges },
+        });
+        return;
+      }
+    }
+
     // Handle JSON fields
     if (req.body.feedbackAreas !== undefined) {
       updates.push('feedback_areas = ?');
@@ -373,6 +434,30 @@ export async function updateProfile(req: AuthenticatedRequest, res: Response): P
       const validShared = Array.isArray(req.body.sharedDataTypes)
         ? req.body.sharedDataTypes.filter((t: string) => validTypes.includes(t))
         : [];
+
+      // Validate shared type data consistency against both payload and existing DB record
+      const [currentProfile] = await DB.query(
+        'SELECT photo_path, vocal_salutation_path FROM truth_stream_profiles WHERE user_id = ?',
+        [userId]
+      ) as any[];
+      const currentPhoto = req.body.photoPath ?? currentProfile?.[0]?.photo_path;
+      const currentVoice = req.body.vocalSalutationPath ?? currentProfile?.[0]?.vocal_salutation_path;
+
+      if (validShared.includes('facial') && !currentPhoto) {
+        res.status(400).json({
+          error: 'Photo is required when sharing facial data',
+          code: 'VALIDATION_ERROR',
+        });
+        return;
+      }
+      if (validShared.includes('voice') && !currentVoice) {
+        res.status(400).json({
+          error: 'Voice recording is required when sharing voice data',
+          code: 'VALIDATION_ERROR',
+        });
+        return;
+      }
+
       updates.push('shared_data_types = ?');
       params.push(JSON.stringify(validShared));
       updates.push('minimum_share_met = ?');
@@ -422,16 +507,18 @@ export async function getTruthCard(req: AuthenticatedRequest, res: Response): Pr
       return;
     }
 
-    // Verify the requester has this user in their queue
-    const [queueCheck] = await DB.query(
-      `SELECT id FROM truth_stream_queue
-       WHERE reviewer_id = ? AND reviewee_id = ? AND status IN ('pending', 'in_progress')`,
-      [req.user!.id, revieweeId]
-    ) as any[];
+    // Allow self-viewing; otherwise verify the requester has this user in their queue
+    if (revieweeId !== req.user!.id) {
+      const [queueCheck] = await DB.query(
+        `SELECT id FROM truth_stream_queue
+         WHERE reviewer_id = ? AND reviewee_id = ? AND status IN ('pending', 'in_progress')`,
+        [req.user!.id, revieweeId]
+      ) as any[];
 
-    if (!queueCheck || queueCheck.length === 0) {
-      res.status(403).json({ error: 'You can only view Truth Cards of users in your queue', code: 'NOT_IN_QUEUE' });
-      return;
+      if (!queueCheck || queueCheck.length === 0) {
+        res.status(403).json({ error: 'You can only view Truth Cards of users in your queue', code: 'NOT_IN_QUEUE' });
+        return;
+      }
     }
 
     const [rows] = await DB.query(
@@ -451,8 +538,13 @@ export async function getTruthCard(req: AuthenticatedRequest, res: Response): Pr
     const profile = rows[0];
 
     // Build shared data from intake (only shared types)
-    const sharedTypes = safeJsonParse(profile.shared_data_types, []);
+    const sharedTypes = safeJsonParse(profile.shared_data_types, [] as string[]);
     const sharedData = await buildSharedIntakeData(revieweeId, sharedTypes);
+
+    // Gate photo/voice paths by sharedDataTypes — only expose to reviewers if user opted in
+    const isSelfView = revieweeId === req.user!.id;
+    const showPhoto = isSelfView || (sharedTypes as string[]).includes('facial');
+    const showVoice = isSelfView || (sharedTypes as string[]).includes('voice');
 
     res.json({
       success: true,
@@ -462,12 +554,13 @@ export async function getTruthCard(req: AuthenticatedRequest, res: Response): Pr
         genderDisplay: profile.gender_display,
         pronouns: profile.pronouns,
         culturalContext: profile.cultural_context,
-        photoPath: profile.photo_path,
-        vocalSalutationPath: profile.vocal_salutation_path,
+        photoPath: showPhoto ? (profile.photo_path || null) : null,
+        vocalSalutationPath: showVoice ? (profile.vocal_salutation_path || null) : null,
         goal: profile.goal,
         goalCategory: profile.goal_category,
         selfStatement: profile.self_statement,
         feedbackAreas: safeJsonParse(profile.feedback_areas, []),
+        sharedDataTypes: sharedTypes,
         sharedData,
       },
     });
@@ -1447,14 +1540,22 @@ async function buildSharedIntakeData(userId: number, sharedTypes: string[]): Pro
   const shared: Record<string, any> = {};
 
   try {
-    const [intakeRows] = await DB.query(
-      'SELECT intake_data FROM intake_data WHERE user_id = ? ORDER BY created_at DESC LIMIT 1',
-      [userId]
-    ) as any[];
+    // Retrieve intake data via IntakeDataManager (file-based tiered storage)
+    const context: DataAccessContext = {
+      userId,
+      accessedBy: userId,
+      sessionId: 'truthstream',
+      reason: 'truth_card_shared_data',
+    };
 
-    if (!intakeRows || intakeRows.length === 0) return shared;
+    const result = await IntakeDataManager.getLatestIntakeData(
+      String(userId),
+      context,
+      false
+    );
 
-    const intakeData: Record<string, any> = safeJsonParse(intakeRows[0].intake_data, {});
+    const intakeData: Record<string, any> = result?.intakeData || {};
+    if (!intakeData || Object.keys(intakeData).length === 0) return shared;
 
     if (sharedTypes.includes('personality') && intakeData.personalityResult) {
       shared.personality = {
@@ -1475,9 +1576,21 @@ async function buildSharedIntakeData(userId: number, sharedTypes: string[]): Pro
     }
 
     if (sharedTypes.includes('facial') && intakeData.faceAnalysis) {
+      // face-api.js stores expressions as a flat record: { happy: 0.9, sad: 0.1, ... }
+      // Compute dominant expression from the raw scores
+      const expressions = intakeData.faceAnalysis.expressions;
+      let dominantExpression = 'neutral';
+      if (expressions && typeof expressions === 'object') {
+        const entries = Object.entries(expressions)
+          .filter(([, v]) => typeof v === 'number') as [string, number][];
+        if (entries.length > 0) {
+          entries.sort((a, b) => b[1] - a[1]);
+          dominantExpression = entries[0][0];
+        }
+      }
       shared.facial = {
-        dominantExpression: intakeData.faceAnalysis.expressions?.dominant,
-        expressionProfile: intakeData.faceAnalysis.expressions?.profile,
+        dominantExpression,
+        expressionProfile: expressions || {},
       };
     }
 
@@ -1487,11 +1600,14 @@ async function buildSharedIntakeData(userId: number, sharedTypes: string[]): Pro
       };
     }
 
-    if (sharedTypes.includes('astrological') && intakeData.astrologicalResult) {
+    // Support both legacy key "astrologicalResult" (client submit) and
+    // stored key "astrologicalData" (intake file section name)
+    const astroData = intakeData.astrologicalResult || intakeData.astrologicalData;
+    if (sharedTypes.includes('astrological') && astroData) {
       shared.astrological = {
-        westernSign: intakeData.astrologicalResult.western?.sunSign,
-        chineseSign: intakeData.astrologicalResult.chinese?.animal,
-        synthesis: intakeData.astrologicalResult.synthesis?.summary,
+        westernSign: astroData.western?.sunSign,
+        chineseSign: astroData.chinese?.animalSign,
+        synthesis: astroData.synthesis?.lifeDirection,
       };
     }
 

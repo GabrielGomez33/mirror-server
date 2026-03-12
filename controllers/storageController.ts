@@ -23,6 +23,22 @@ const TYPE_TO_TIER: Record<string, TierType> = {
   audio: 'tier2',
 };
 
+const MIME_FROM_EXT: Record<string, string> = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.webp': 'image/webp',
+  '.heic': 'image/heic',
+  '.heif': 'image/heif',
+  '.tiff': 'image/tiff',
+  '.gif': 'image/gif',
+  '.webm': 'audio/webm',
+  '.mp3': 'audio/mpeg',
+  '.m4a': 'audio/mp4',
+  '.ogg': 'audio/ogg',
+  '.wav': 'audio/wav',
+};
+
 const inferExtFromMime = (mime?: string): string => {
   if (!mime) return '';
   if (mime === 'image/jpeg') return '.jpg';
@@ -236,7 +252,7 @@ export const storeDataHandler: RequestHandler = async (req, res) => {
     const likelyBase64 = /^[A-Za-z0-9+/=\s]+$/.test(data) && data.length % 4 === 0;
     const dataBuffer = likelyBase64 ? Buffer.from(data, 'base64') : Buffer.from(data, 'utf8');
 	const userIdNumJson = resolveAccessedBy(userId);
-	
+
     const metadata = {
       // DataAccessContext required fields (numbers):
       userId: userIdNumJson,      // <-- number, not string
@@ -300,13 +316,18 @@ export const retrieveDataHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    const mime = (file as any).mime;
-    if (mime) res.setHeader('Content-Type', mime);
+    // Set Content-Type from filename extension (readFromTier returns a raw Buffer)
+    const ext = path.extname(String(filename)).toLowerCase();
+    const mime = MIME_FROM_EXT[ext] || 'application/octet-stream';
+    res.setHeader('Content-Type', mime);
 
     const safeName = safeBase(String(filename));
     res.setHeader('Content-Disposition', `inline; filename="${safeName}"`);
 
-    const buf: Buffer = (file as any).buffer ?? (file as Buffer);
+    // FIX: readFromTier returns a Buffer (which extends Uint8Array).
+    // The old code `(file as any).buffer` accessed Uint8Array's underlying ArrayBuffer,
+    // which Node's res.end() rejects. Ensure we always pass a proper Buffer.
+    const buf = Buffer.isBuffer(file) ? file : Buffer.from(file);
     res.end(buf);
     return;
   } catch (error) {
