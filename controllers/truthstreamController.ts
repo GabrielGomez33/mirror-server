@@ -1606,8 +1606,62 @@ async function buildSharedIntakeData(userId: number, sharedTypes: string[]): Pro
     if (sharedTypes.includes('astrological') && astroData) {
       shared.astrological = {
         westernSign: astroData.western?.sunSign,
-        chineseSign: astroData.chinese?.animalSign,
-        synthesis: astroData.synthesis?.lifeDirection,
+        chineseSign: astroData.chinese?.animal || astroData.chinese?.animalSign,
+        synthesis: astroData.synthesis?.summary || astroData.synthesis?.lifeDirection,
+        // Full western data
+        western: astroData.western ? {
+          sunSign: astroData.western.sunSign,
+          moonSign: astroData.western.moonSign,
+          risingSign: astroData.western.risingSign,
+          dominantElement: astroData.western.dominantElement,
+          modality: astroData.western.modality,
+          chartRuler: astroData.western.chartRuler,
+          houses: astroData.western.houses || null,
+          planetaryPlacements: astroData.western.planetaryPlacements || null,
+        } : null,
+        // Full chinese data
+        chinese: astroData.chinese ? {
+          animalSign: astroData.chinese.animalSign || astroData.chinese.animal,
+          element: astroData.chinese.element,
+          yinYang: astroData.chinese.yinYang,
+          innerAnimal: astroData.chinese.innerAnimal,
+          secretAnimal: astroData.chinese.secretAnimal,
+          luckyNumbers: astroData.chinese.luckyNumbers,
+          luckyColors: astroData.chinese.luckyColors,
+          personality: astroData.chinese.personality,
+          compatibility: astroData.chinese.compatibility,
+          lifePhase: astroData.chinese.lifePhase,
+        } : null,
+        // Full african data
+        african: astroData.african ? {
+          orishaGuardian: astroData.african.orishaGuardian,
+          ancestralSpirit: astroData.african.ancestralSpirit,
+          elementalForce: astroData.african.elementalForce,
+          sacredAnimal: astroData.african.sacredAnimal,
+          lifeDestiny: astroData.african.lifeDestiny,
+          spiritualGifts: astroData.african.spiritualGifts,
+          challenges: astroData.african.challenges,
+          ceremonies: astroData.african.ceremonies,
+          seasons: astroData.african.seasons,
+        } : null,
+        // Full numerology data
+        numerology: astroData.numerology ? {
+          lifePathNumber: astroData.numerology.lifePathNumber,
+          destinyNumber: astroData.numerology.destinyNumber,
+          soulUrgeNumber: astroData.numerology.soulUrgeNumber,
+          personalityNumber: astroData.numerology.personalityNumber,
+          birthDayNumber: astroData.numerology.birthDayNumber,
+          meanings: astroData.numerology.meanings,
+        } : null,
+        // Full synthesis
+        synthesisData: astroData.synthesis ? {
+          coreThemes: astroData.synthesis.coreThemes,
+          lifeDirection: astroData.synthesis.lifeDirection,
+          spiritualPath: astroData.synthesis.spiritualPath,
+          relationships: astroData.synthesis.relationships,
+          career: astroData.synthesis.career,
+          wellness: astroData.synthesis.wellness,
+        } : null,
       };
     }
 
@@ -1760,3 +1814,6 @@ export async function cleanupUserTruthStreamData(userId: number): Promise<boolea
     connection.release();
   }
 }
+
+
+
