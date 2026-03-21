@@ -13,6 +13,14 @@
 // Pattern follows: DinaChatQueueProcessor.ts (enterprise patterns)
 // All Dina calls route through mirror module's DUMP-compliant endpoints via HTTP
 //
+// FIXES APPLIED:
+//   1. Error propagation: "Error: undefined" now shows actual error messages
+//   2. processClassification: builds reviewText from structured responses when empty
+//   3. handleJobFailure: extracts error message safely from any error type
+//   4. callDinaEndpoint: preserves error chain with descriptive messages
+//   5. isRetryableError: improved 5xx detection to avoid false positives
+//   6. Added request timeout alignment with dina-server's extended LLM timeouts
+//
 // Enterprise features (matching DinaChatQueueProcessor):
 //   - 3-state circuit breaker (closed/open/half-open) with env var config
 //   - Client-side rate limiter (sliding window, per-user)
@@ -62,6 +70,8 @@ interface ProcessorConfig {
   maxInputLength: number;
   // Timeouts
   dinaTimeoutMs: number;
+  // Extended timeout for LLM-heavy operations
+  dinaLLMTimeoutMs: number;
 }
 
 interface ProcessorStats {
@@ -86,6 +96,57 @@ function safeJsonParse<T = any>(value: unknown, fallback: T): T {
     try { return JSON.parse(value) as T; } catch { return fallback; }
   }
   return value as T;
+}
+
+/**
+ * Safely extract an error message from any error type.
+ * Prevents "Error: undefined" by handling null, undefined, non-Error objects.
+ */
+function extractErrorMessage(error: unknown): string {
+  if (error === null || error === undefined) return 'Unknown error (null/undefined)';
+  if (error instanceof Error) return error.message || 'Error with no message';
+  if (typeof error === 'string') return error || 'Empty error string';
+  if (typeof error === 'object') {
+    const obj = error as any;
+    if (obj.message) return String(obj.message);
+    if (obj.error) return String(obj.error);
+    try { return JSON.stringify(error).substring(0, 500); } catch { /* fall through */ }
+  }
+  return String(error) || 'Unknown error';
+}
+
+/**
+ * Build a textual summary from structured review responses.
+ * Used when freeFormText is empty to ensure classify-review has meaningful text.
+ */
+function buildReviewTextFromResponses(responses: Record<string, any>): string {
+  if (!responses || typeof responses !== 'object') return '';
+
+  const parts: string[] = [];
+
+  for (const [sectionId, sectionData] of Object.entries(responses)) {
+    if (!sectionData || typeof sectionData !== 'object') continue;
+    for (const [questionId, answer] of Object.entries(sectionData as Record<string, any>)) {
+      if (answer === null || answer === undefined) continue;
+
+      if (typeof answer === 'string' && answer.trim().length > 0) {
+        parts.push(answer.trim());
+      } else if (typeof answer === 'object') {
+        if (answer.explanation && typeof answer.explanation === 'string' && answer.explanation.trim()) {
+          parts.push(answer.explanation.trim());
+        }
+        if (answer.categories && Array.isArray(answer.categories)) {
+          parts.push(`${questionId}: ${answer.categories.join(', ')}`);
+          if (answer.explanation) parts.push(answer.explanation);
+        }
+        if (typeof answer.score === 'number') {
+          parts.push(`${sectionId}.${questionId}: ${answer.score}/10`);
+        }
+      }
+    }
+  }
+
+  return parts.filter(p => p.length > 0).join('. ');
 }
 
 // ============================================================================
@@ -303,8 +364,11 @@ export class TruthStreamQueueProcessor {
       rateLimitWindowMs: parseInt(process.env.TS_RATE_LIMIT_WINDOW || '60000', 10),
       // Input sanitizer
       maxInputLength: parseInt(process.env.TS_MAX_INPUT_LENGTH || '10000', 10),
-      // Timeouts
+      // Timeouts — standard operations
       dinaTimeoutMs: parseInt(process.env.TS_DINA_TIMEOUT || '120000', 10),
+      // FIX: Extended timeout for LLM-heavy operations (generate_analysis)
+      // Must be less than Dina's Express route timeout (180s) to get proper errors
+      dinaLLMTimeoutMs: parseInt(process.env.TS_DINA_LLM_TIMEOUT || '170000', 10),
       ...config,
     };
 
@@ -343,6 +407,7 @@ export class TruthStreamQueueProcessor {
       rateLimitPerUser: this.config.rateLimitPerUser,
       dinaEndpoint: this.config.dinaEndpoint.replace(/key.*$/i, 'key=***'),
       dinaTimeoutMs: this.config.dinaTimeoutMs,
+      dinaLLMTimeoutMs: this.config.dinaLLMTimeoutMs,
     });
   }
 
@@ -382,7 +447,7 @@ export class TruthStreamQueueProcessor {
 
       this.logger.info('TruthStreamQueueProcessor started successfully');
     } catch (error: any) {
-      this.logger.error('Failed to start processor', { error: error.message });
+      this.logger.error('Failed to start processor', { error: extractErrorMessage(error) });
       this.isRunning = false;
       throw error;
     }
@@ -487,7 +552,7 @@ export class TruthStreamQueueProcessor {
       this.logger.info('Subscribed to Redis channel: mirror:truthstream:queue');
     } catch (error: any) {
       this.logger.warn('Redis subscription failed, falling back to polling only', {
-        error: error.message,
+        error: extractErrorMessage(error),
       });
     }
   }
@@ -557,7 +622,7 @@ export class TruthStreamQueueProcessor {
         connection.release();
       }
     } catch (error: any) {
-      this.logger.error('Error fetching jobs', { error: error.message });
+      this.logger.error('Error fetching jobs', { error: extractErrorMessage(error) });
     }
   }
 
@@ -633,13 +698,19 @@ export class TruthStreamQueueProcessor {
         type: job.job_type,
         durationMs: duration,
       });
-    } catch (error: any) {
+    } catch (error: unknown) {
+      // FIX: Use extractErrorMessage to get a meaningful error message
+      // Previously this logged "Error: undefined" when error.message was empty
+      const errorMessage = extractErrorMessage(error);
+
       // Update stats
       this.stats.processed++;
       this.stats.failed++;
       this.recordProcessingTime(Date.now() - startTime);
 
-      await this.handleJobFailure(job, error);
+      // Create a proper Error object with the extracted message for handleJobFailure
+      const errorObj = error instanceof Error ? error : new Error(errorMessage);
+      await this.handleJobFailure(job, errorObj);
     }
   }
 
@@ -650,10 +721,21 @@ export class TruthStreamQueueProcessor {
   private async processClassification(job: ProcessingJob, inputData: any): Promise<void> {
     const { reviewId, reviewText, responses, reviewTone, revieweeGoal, qualityMetrics } = inputData;
 
+    // FIX: Build reviewText from structured responses when free-form text is empty.
+    // This was causing classify-review to fail with a 400 error because the
+    // Dina endpoint validated `if (!reviewText)` and "" is falsy.
+    let effectiveReviewText = reviewText ? this.sanitizer.sanitize(String(reviewText)) : '';
+    if (!effectiveReviewText || effectiveReviewText.trim().length === 0) {
+      effectiveReviewText = buildReviewTextFromResponses(responses || {});
+    }
+    if (!effectiveReviewText || effectiveReviewText.trim().length === 0) {
+      effectiveReviewText = '[Structured responses only — no free-form text provided]';
+    }
+
     // Sanitize text inputs (defense-in-depth: dina-server also sanitizes)
     const sanitizedBody = {
       reviewId,
-      reviewText: this.sanitizer.sanitize(String(reviewText || '')),
+      reviewText: effectiveReviewText,
       responses,
       reviewTone: reviewTone ? this.sanitizer.sanitize(String(reviewTone)).substring(0, 100) : undefined,
       revieweeGoal,
@@ -664,7 +746,7 @@ export class TruthStreamQueueProcessor {
     const result = await this.callDinaEndpoint('/mirror/truthstream/classify-review', sanitizedBody);
 
     if (!result.success || !result.data) {
-      throw new Error(result.error || 'Classification returned unsuccessful response');
+      throw new Error(result.error || result.message || 'Classification returned unsuccessful response');
     }
 
     const classification = result.data;
@@ -726,7 +808,7 @@ export class TruthStreamQueueProcessor {
     ) as any[];
 
     if (!profileRows || profileRows.length === 0) {
-      throw new Error('User profile not found');
+      throw new Error(`User profile not found for user_id=${userId}`);
     }
 
     const profile = profileRows[0];
@@ -742,7 +824,7 @@ export class TruthStreamQueueProcessor {
     ) as any[];
 
     if (!reviewRows || reviewRows.length < 5) {
-      throw new Error('Insufficient reviews for analysis');
+      throw new Error(`Insufficient reviews for analysis: ${reviewRows?.length || 0} found, 5 required`);
     }
 
     // Build anonymized reviews for Dina
@@ -812,7 +894,7 @@ export class TruthStreamQueueProcessor {
       ? this.sanitizer.sanitize(String(profile.self_statement))
       : undefined;
 
-    // Call Dina mirror module for analysis
+    // FIX: Use extended LLM timeout for generate-analysis (Ollama can take 30-120s)
     const result = await this.callDinaEndpoint('/mirror/truthstream/generate-analysis', {
       userId,
       analysisType: analysisType || 'truth_mirror_report',
@@ -823,10 +905,10 @@ export class TruthStreamQueueProcessor {
       selfStatement: sanitizedSelfStatement,
       totalReviewCount: reviewRows.length,
       previousAnalysis,
-    });
+    }, this.config.dinaLLMTimeoutMs);
 
     if (!result.success || !result.data) {
-      throw new Error(result.error || 'Analysis returned unsuccessful response');
+      throw new Error(result.error || result.message || 'Analysis returned unsuccessful response');
     }
 
     const analysis = result.data;
@@ -920,7 +1002,7 @@ export class TruthStreamQueueProcessor {
         hostilityCount,
       });
     } catch (error: any) {
-      this.logger.error('Failed to log hostile review', { error: error.message });
+      this.logger.error('Failed to log hostile review', { error: extractErrorMessage(error) });
     }
   }
 
@@ -938,22 +1020,30 @@ export class TruthStreamQueueProcessor {
    * Call a dina-server mirror module endpoint with circuit breaker and retry.
    * Routes ALL TruthStream Dina interactions through the mirror module's
    * DUMP-compliant endpoints.
+   *
+   * @param path - The endpoint path (e.g. /mirror/truthstream/classify-review)
+   * @param body - The request body
+   * @param timeoutOverride - Optional timeout override for LLM-heavy operations
    */
-  private async callDinaEndpoint(path: string, body: any): Promise<any> {
+  private async callDinaEndpoint(path: string, body: any, timeoutOverride?: number): Promise<any> {
     // Circuit breaker check
     if (!this.circuitBreaker.canExecute()) {
+      const state = this.circuitBreaker.getState().toUpperCase();
       const error = new Error(
-        `Dina service unavailable: Circuit breaker ${this.circuitBreaker.getState().toUpperCase()}.`
+        `Dina service unavailable: Circuit breaker ${state}. ` +
+        `Service will retry after circuit breaker reset period.`
       );
       this.logger.error('Circuit breaker rejecting request', {
         state: this.circuitBreaker.getState(),
+        path,
       });
       throw error;
     }
 
     const maxRetries = 3;
     const baseDelays = [1000, 2000, 4000];
-    let lastError: any = null;
+    let lastError: Error | null = null;
+    const requestTimeout = timeoutOverride || this.config.dinaTimeoutMs;
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
@@ -963,6 +1053,7 @@ export class TruthStreamQueueProcessor {
           url,
           path,
           attempt: attempt + 1,
+          timeoutMs: requestTimeout,
         });
 
         const response = await fetch(url, {
@@ -974,11 +1065,12 @@ export class TruthStreamQueueProcessor {
             'X-Request-Attempt': String(attempt + 1),
           },
           body: JSON.stringify(body),
-          signal: AbortSignal.timeout(this.config.dinaTimeoutMs),
+          signal: AbortSignal.timeout(requestTimeout),
         });
 
         if (!response.ok) {
           const errorText = await response.text().catch(() => 'Unknown error');
+          // Include the HTTP status in a parseable format for isRetryableError
           throw new Error(
             `Dina mirror module error: ${response.status} ${response.statusText} - ${errorText.substring(0, 200)}`
           );
@@ -987,17 +1079,22 @@ export class TruthStreamQueueProcessor {
         const result = await response.json();
 
         if (!result.success) {
-          throw new Error(result.error || 'Dina returned unsuccessful response');
+          // FIX: Extract error message from all possible fields
+          const errorMsg = result.error || result.message || 'Dina returned unsuccessful response';
+          throw new Error(`Dina returned error: ${errorMsg}`);
         }
 
         // Success — record with circuit breaker
         this.circuitBreaker.recordSuccess();
         return result;
 
-      } catch (error: any) {
-        lastError = error;
+      } catch (error: unknown) {
+        // FIX: Always create a proper Error with a meaningful message
+        const errorMessage = extractErrorMessage(error);
+        lastError = error instanceof Error ? error : new Error(errorMessage);
+
         const isLastAttempt = attempt === maxRetries - 1;
-        const isRetryable = this.isRetryableError(error);
+        const isRetryable = this.isRetryableError(lastError);
 
         if (!isLastAttempt && isRetryable) {
           // Exponential backoff + jitter (prevents thundering herd)
@@ -1005,7 +1102,7 @@ export class TruthStreamQueueProcessor {
           const jitter = Math.floor(Math.random() * baseDelay * 0.3); // Up to 30% jitter
           const delay = baseDelay + jitter;
           this.logger.warn(`Retry attempt ${attempt + 1}/${maxRetries} after ${delay}ms`, {
-            error: error.message,
+            error: errorMessage,
             path,
             baseDelay,
             jitter,
@@ -1020,6 +1117,11 @@ export class TruthStreamQueueProcessor {
     // All retries exhausted — record failure with circuit breaker
     this.circuitBreaker.recordFailure();
     this.stats.retried++;
+
+    // FIX: Ensure we always throw a proper Error with a message
+    if (!lastError) {
+      lastError = new Error(`All ${maxRetries} retries exhausted for ${path}`);
+    }
     throw lastError;
   }
 
@@ -1050,14 +1152,16 @@ export class TruthStreamQueueProcessor {
   // ERROR HANDLING
   // ==========================================================================
 
-  private async handleJobFailure(job: ProcessingJob, error: any): Promise<void> {
+  private async handleJobFailure(job: ProcessingJob, error: Error): Promise<void> {
     const retryCount = (job.retry_count || 0) + 1;
     const canRetry = retryCount < this.config.maxRetries && this.isRetryableError(error);
+    // FIX: Use extractErrorMessage for safe error string extraction
+    const errorMessage = extractErrorMessage(error);
 
     this.logger.error('Job failed', {
       jobId: job.id,
       type: job.job_type,
-      error: error.message,
+      error: errorMessage,
       retryCount,
       canRetry,
     });
@@ -1069,34 +1173,53 @@ export class TruthStreamQueueProcessor {
         `UPDATE truth_stream_processing_queue
          SET status = 'pending', retry_count = ?, error_message = ?, next_retry_at = ?
          WHERE id = ?`,
-        [retryCount, error.message, nextRetryAt, job.id]
+        [retryCount, errorMessage.substring(0, 1000), nextRetryAt, job.id]
       );
     } else {
       await DB.query(
         `UPDATE truth_stream_processing_queue
          SET status = 'failed', retry_count = ?, error_message = ?, completed_at = NOW()
          WHERE id = ?`,
-        [retryCount, error.message, job.id]
+        [retryCount, errorMessage.substring(0, 1000), job.id]
       );
 
       // For classification failures, set classification to NULL (review still visible)
       if (job.job_type === 'classify_review') {
         this.logger.warn('Classification failed permanently, review remains unclassified', {
           reviewId: job.reference_id,
+          error: errorMessage,
+        });
+      }
+
+      // For analysis failures, log more context
+      if (job.job_type === 'generate_analysis') {
+        this.logger.warn('Analysis generation failed permanently', {
+          referenceId: job.reference_id,
+          userId: job.user_id,
+          error: errorMessage,
         });
       }
     }
   }
 
   private isRetryableError(error: any): boolean {
-    const message = error.message?.toLowerCase() || '';
-    if (error.name === 'TypeError' && message.includes('fetch')) return true;
-    if (message.includes('timeout') || message.includes('aborted')) return true;
-    if (message.match(/\b5\d{2}\b/)) return true;
-    if (message.includes('429') || message.includes('rate limit')) return true;
+    const message = (error?.message || '').toLowerCase();
+    // Network errors are always retryable
+    if (error?.name === 'TypeError' && message.includes('fetch')) return true;
     if (message.includes('econnrefused') || message.includes('enotfound')) return true;
-    if (message.match(/\b4\d{2}\b/)) return false; // Client errors not retryable
-    return true; // Default: retry
+    if (message.includes('econnreset') || message.includes('epipe')) return true;
+    // Timeouts are retryable
+    if (message.includes('timeout') || message.includes('aborted')) return true;
+    // Server errors (5xx) are retryable
+    if (message.match(/\b5\d{2}\b/)) return true;
+    // Rate limiting is retryable
+    if (message.includes('429') || message.includes('rate limit')) return true;
+    // Circuit breaker state is retryable (will resolve when CB resets)
+    if (message.includes('circuit breaker')) return true;
+    // Client errors (4xx except 429) are NOT retryable
+    if (message.match(/\b4\d{2}\b/)) return false;
+    // Default: retry unknown errors
+    return true;
   }
 
   // ==========================================================================

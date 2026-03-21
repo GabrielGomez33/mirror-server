@@ -1238,6 +1238,28 @@ export async function generateAnalysis(req: AuthenticatedRequest, res: Response)
     }
 
     // Check if analysis is already processing
+    // First, auto-fail any stale jobs stuck in 'processing' for over 5 minutes
+    // This prevents a failed queue processor from permanently blocking new requests
+    const STALE_JOB_MINUTES = 5;
+    const [staleJobs] = await DB.query(
+      `SELECT id FROM truth_stream_processing_queue
+       WHERE user_id = ? AND job_type = 'generate_analysis' AND status = 'processing'
+         AND started_at < DATE_SUB(NOW(), INTERVAL ? MINUTE)`,
+      [userId, STALE_JOB_MINUTES]
+    ) as any[];
+
+    if (staleJobs && staleJobs.length > 0) {
+      const staleIds = staleJobs.map((j: any) => j.id);
+      console.warn(`Auto-failing ${staleIds.length} stale generate_analysis job(s) for user ${userId}:`, staleIds);
+      await DB.query(
+        `UPDATE truth_stream_processing_queue
+         SET status = 'failed', error_message = 'Auto-failed: exceeded ${STALE_JOB_MINUTES}min processing timeout', completed_at = NOW()
+         WHERE id IN (${staleIds.map(() => '?').join(',')})`,
+        staleIds
+      );
+    }
+
+    // Now check for legitimately active jobs (pending or recently-started processing)
     const [pendingJobs] = await DB.query(
       `SELECT id FROM truth_stream_processing_queue
        WHERE user_id = ? AND job_type = 'generate_analysis' AND status IN ('pending', 'processing')`,
@@ -1814,6 +1836,5 @@ export async function cleanupUserTruthStreamData(userId: number): Promise<boolea
     connection.release();
   }
 }
-
 
 
