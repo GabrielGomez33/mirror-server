@@ -13,10 +13,67 @@
 import crypto from 'crypto';
 import { Request, Response } from 'express';
 import { DB } from '../db';
+import { Logger } from '../utils/logger';
 import { truthStreamQueueManager } from '../services/TruthStreamQueueManager';
 import { truthStreamReviewScorer } from '../services/TruthStreamReviewScorer';
 import { IntakeDataManager } from '../controllers/intakeController';
 import type { DataAccessContext } from '../controllers/directoryController';
+
+const logger = new Logger('TruthStreamController');
+
+// Import the existing notification system (used by groups, chat, etc.)
+// This delivers via WebSocket + push — the same infrastructure as Dina chat worker
+let mirrorGroupNotifications: {
+  notifyTruthStreamDialogueMessage: (userId: number, reviewId: string, authorRole: string) => Promise<boolean>;
+  notifyTruthStreamReviewReceived?: (userId: number, reviewId: string) => Promise<boolean>;
+  notifyTruthStreamHelpfulMarked?: (userId: number, reviewId: string) => Promise<boolean>;
+  notify: (userId: string | number, notification: { type: string; payload: Record<string, any> }) => Promise<boolean>;
+} | null = null;
+try {
+  const notifModule = require('../systems/mirrorGroupNotifications');
+  mirrorGroupNotifications = notifModule.mirrorGroupNotifications;
+} catch {
+  // Notification system unavailable — will fall back silently
+}
+
+/** Send a TruthStream notification via the existing notification infrastructure (best-effort) */
+function publishTSNotification(payload: {
+  type: string;
+  userId: number;
+  title?: string;
+  message?: string;
+  metadata?: Record<string, unknown>;
+}): void {
+  if (!mirrorGroupNotifications) return;
+  try {
+    // Use the dedicated methods when available, otherwise fall back to generic notify
+    if (payload.type === 'ts_dialogue_message' && payload.metadata?.reviewId) {
+      mirrorGroupNotifications.notifyTruthStreamDialogueMessage(
+        payload.userId,
+        payload.metadata.reviewId as string,
+        (payload.metadata.authorRole as string) || 'unknown'
+      ).catch(() => {});
+    } else if (payload.type === 'ts_review_received' && payload.metadata?.reviewId && mirrorGroupNotifications.notifyTruthStreamReviewReceived) {
+      mirrorGroupNotifications.notifyTruthStreamReviewReceived(
+        payload.userId,
+        payload.metadata.reviewId as string,
+      ).catch(() => {});
+    } else {
+      // Generic fallback for other notification types
+      // Include title/message so they reach the client via deliverRawWebSocketNotification
+      mirrorGroupNotifications.notify(payload.userId, {
+        type: payload.type,
+        payload: {
+          ...(payload.metadata || {}),
+          ...(payload.title ? { title: payload.title } : {}),
+          ...(payload.message ? { message: payload.message } : {}),
+        } as Record<string, any>,
+      }).catch(() => {});
+    }
+  } catch {
+    // Non-critical — user will see on next page load
+  }
+}
 
 // ============================================================================
 // TYPES (inline to avoid circular dependency)
@@ -45,9 +102,53 @@ function sanitizeInput(input: unknown, maxLength: number = 500): string | null {
   return cleaned.length > 0 ? cleaned.substring(0, maxLength) : null;
 }
 
+/** Validate UUID format (v4) to prevent malformed IDs in DB queries */
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function isValidUUID(id: unknown): id is string {
+  return typeof id === 'string' && UUID_REGEX.test(id);
+}
+
+/** Whitelist of valid analysis types — reject anything not in this set */
+const VALID_ANALYSIS_TYPES = new Set([
+  'truth_mirror_report', 'perception_gap', 'blind_spot',
+  'growth_recommendation', 'temporal_trend',
+]);
+
 const MIN_REVIEW_TIME = parseInt(process.env.TRUTHSTREAM_MIN_REVIEW_TIME || '45', 10);
 const MIN_REVIEWS_FOR_ANALYSIS = parseInt(process.env.TRUTHSTREAM_MIN_REVIEWS_FOR_ANALYSIS || '5', 10);
 const MAX_DIALOGUE_MESSAGES = parseInt(process.env.TRUTHSTREAM_MAX_DIALOGUE_MESSAGES || '50', 10);
+
+// Per-action sliding-window rate limiter (in-memory, keyed by userId:action)
+const actionRateLimits = new Map<string, number[]>();
+const ACTION_LIMITS: Record<string, { window: number; max: number }> = {
+  helpful:   { window: 60_000, max: 30 },   // 30 toggles/min
+  dialogue:  { window: 60_000, max: 10 },   // 10 messages/min
+  flag:      { window: 300_000, max: 5 },    // 5 flags/5min
+  analysis:  { window: 300_000, max: 3 },    // 3 analysis requests/5min
+  feedback:  { window: 60_000, max: 5 },     // 5 feedback requests/min
+};
+
+function checkActionRate(userId: number, action: string): boolean {
+  const config = ACTION_LIMITS[action];
+  if (!config) return true;
+  const key = `${userId}:${action}`;
+  const now = Date.now();
+  const timestamps = (actionRateLimits.get(key) || []).filter(t => now - t < config.window);
+  if (timestamps.length >= config.max) return false;
+  timestamps.push(now);
+  actionRateLimits.set(key, timestamps);
+  return true;
+}
+
+// Periodic cleanup of stale rate-limit entries (every 5 minutes)
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, timestamps] of actionRateLimits) {
+    const filtered = timestamps.filter(t => now - t < 300_000);
+    if (filtered.length === 0) actionRateLimits.delete(key);
+    else actionRateLimits.set(key, filtered);
+  }
+}, 300_000);
 
 // ============================================================================
 // PROFILE / TRUTH CARD HANDLERS
@@ -276,7 +377,7 @@ export async function createProfile(req: AuthenticatedRequest, res: Response): P
       },
     });
   } catch (error: any) {
-    console.error('Error creating Truth Card:', error.message);
+    logger.error('Error creating Truth Card:', error.message);
     res.status(500).json({ error: 'Failed to create Truth Card', code: 'SERVER_ERROR' });
   }
 }
@@ -327,7 +428,7 @@ export async function getProfile(req: AuthenticatedRequest, res: Response): Prom
       },
     });
   } catch (error: any) {
-    console.error('Error getting profile:', error.message);
+    logger.error('Error getting profile:', error.message);
     res.status(500).json({ error: 'Failed to get profile', code: 'SERVER_ERROR' });
   }
 }
@@ -491,7 +592,7 @@ export async function updateProfile(req: AuthenticatedRequest, res: Response): P
 
     res.json({ success: true, message: 'Truth Card updated' });
   } catch (error: any) {
-    console.error('Error updating profile:', error.message);
+    logger.error('Error updating profile:', error.message);
     res.status(500).json({ error: 'Failed to update profile', code: 'SERVER_ERROR' });
   }
 }
@@ -502,7 +603,7 @@ export async function updateProfile(req: AuthenticatedRequest, res: Response): P
 export async function getTruthCard(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     const revieweeId = parseInt(req.params.userId, 10);
-    if (isNaN(revieweeId)) {
+    if (isNaN(revieweeId) || revieweeId <= 0 || !Number.isInteger(revieweeId)) {
       res.status(400).json({ error: 'Invalid user ID', code: 'VALIDATION_ERROR' });
       return;
     }
@@ -565,7 +666,7 @@ export async function getTruthCard(req: AuthenticatedRequest, res: Response): Pr
       },
     });
   } catch (error: any) {
-    console.error('Error getting Truth Card:', error.message);
+    logger.error('Error getting Truth Card:', error.message);
     res.status(500).json({ error: 'Failed to get Truth Card', code: 'SERVER_ERROR' });
   }
 }
@@ -607,7 +708,7 @@ export async function getQueue(req: AuthenticatedRequest, res: Response): Promis
 
     res.json({ success: true, data: batch });
   } catch (error: any) {
-    console.error('Error getting queue:', error.message);
+    logger.error('Error getting queue:', error.message);
     res.status(500).json({ error: 'Failed to get review queue', code: 'SERVER_ERROR' });
   }
 }
@@ -637,10 +738,23 @@ export async function completeQueueItem(req: AuthenticatedRequest, res: Response
   try {
     const userId = req.user!.id;
     const queueId = req.params.queueId;
+
+    if (!isValidUUID(queueId)) {
+      res.status(400).json({ error: 'Invalid queue item ID format', code: 'VALIDATION_ERROR' });
+      return;
+    }
+
     const { responses, timeSpentSeconds } = req.body;
 
-    if (!responses || typeof responses !== 'object') {
+    if (!responses || typeof responses !== 'object' || Array.isArray(responses)) {
       res.status(400).json({ error: 'Responses are required', code: 'VALIDATION_ERROR' });
+      return;
+    }
+
+    // Guard against oversized payloads (max 100KB serialized)
+    const responsesJson = JSON.stringify(responses);
+    if (responsesJson.length > 100_000) {
+      res.status(400).json({ error: 'Response data exceeds maximum size', code: 'PAYLOAD_TOO_LARGE' });
       return;
     }
 
@@ -670,6 +784,13 @@ export async function completeQueueItem(req: AuthenticatedRequest, res: Response
     }
 
     const queueItem = queueRows[0];
+
+    // Defense-in-depth: prevent self-reviews even if queue assignment had a bug
+    if (queueItem.reviewee_id === userId) {
+      logger.warn('Self-review attempt blocked', { userId, queueId });
+      res.status(403).json({ error: 'You cannot review yourself', code: 'SELF_REVIEW' });
+      return;
+    }
 
     if (queueItem.status === 'completed') {
       res.status(409).json({ error: 'Review already submitted', code: 'DUPLICATE' });
@@ -781,6 +902,15 @@ export async function completeQueueItem(req: AuthenticatedRequest, res: Response
 
       await connection.commit();
 
+      // Notify reviewee that they received a new review
+      publishTSNotification({
+        type: 'ts_review_received',
+        userId: queueItem.reviewee_id,
+        title: 'New review received',
+        message: 'Someone has reviewed your Truth Card. Check your received reviews!',
+        metadata: { reviewId },
+      });
+
       res.status(201).json({
         success: true,
         data: {
@@ -799,10 +929,13 @@ export async function completeQueueItem(req: AuthenticatedRequest, res: Response
       connection.release();
     }
   } catch (error: any) {
-    console.error('Error submitting review:', error.message);
-    const statusCode = (error as any).statusCode || 500;
-    const code = (error as any).code || 'SERVER_ERROR';
-    res.status(statusCode).json({ error: error.message, code });
+    logger.error('Error submitting review:', error);
+    // Only surface known client-facing errors; mask internal details
+    if (error.statusCode && error.statusCode < 500) {
+      res.status(error.statusCode).json({ error: error.message, code: error.code || 'CLIENT_ERROR' });
+    } else {
+      res.status(500).json({ error: 'Failed to submit review', code: 'SERVER_ERROR' });
+    }
   }
 }
 
@@ -820,12 +953,16 @@ export async function getReceivedReviews(req: AuthenticatedRequest, res: Respons
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit as string, 10) || 20));
     const offset = (page - 1) * limit;
 
-    // Check if user has completed their batch (earn by giving)
-    const batchComplete = await truthStreamQueueManager.isBatchComplete(userId);
-    if (!batchComplete) {
+    // Gate: user must have given at least 1 review to view received reviews
+    const [givenRows] = await DB.query(
+      'SELECT total_reviews_given FROM truth_stream_profiles WHERE user_id = ?',
+      [userId]
+    ) as any[];
+    const totalGiven = givenRows[0]?.total_reviews_given || 0;
+    if (totalGiven < 1) {
       res.status(403).json({
-        error: 'Complete your current review batch to see your reviews',
-        code: 'BATCH_INCOMPLETE',
+        error: 'Give at least 1 review to unlock your received reviews',
+        code: 'REVIEWS_REQUIRED',
       });
       return;
     }
@@ -842,7 +979,8 @@ export async function getReceivedReviews(req: AuthenticatedRequest, res: Respons
               classification_reasoning, dina_counter_analysis,
               completeness_score, depth_score, quality_score,
               helpful_count, is_flagged, time_spent_seconds,
-              created_at
+              created_at,
+              (SELECT COUNT(*) FROM truth_stream_dialogues WHERE review_id = truth_stream_reviews.id) AS response_count
        FROM truth_stream_reviews
        WHERE reviewee_id = ?
        ORDER BY created_at DESC
@@ -864,6 +1002,7 @@ export async function getReceivedReviews(req: AuthenticatedRequest, res: Respons
       helpfulCount: r.helpful_count,
       isFlagged: !!r.is_flagged,
       timeSpentSeconds: r.time_spent_seconds,
+      responseCount: r.response_count ?? 0,
       // Round timestamp to nearest hour for anonymity
       createdAt: roundToNearestHour(r.created_at),
     }));
@@ -879,7 +1018,7 @@ export async function getReceivedReviews(req: AuthenticatedRequest, res: Respons
       },
     });
   } catch (error: any) {
-    console.error('Error getting received reviews:', error.message);
+    logger.error('Error getting received reviews:', error.message);
     res.status(500).json({ error: 'Failed to get reviews', code: 'SERVER_ERROR' });
   }
 }
@@ -901,13 +1040,17 @@ export async function getGivenReviews(req: AuthenticatedRequest, res: Response):
 
     const total = countRows[0]?.total || 0;
 
-    // Only return the review content, NOT the reviewee identity (edge case #54)
+    // Return review content + engagement metrics, NOT the reviewee identity (edge case #54)
     const [rows] = await DB.query(
-      `SELECT id, responses, classification, completeness_score, depth_score,
-              quality_score, time_spent_seconds, created_at
-       FROM truth_stream_reviews
-       WHERE reviewer_id = ?
-       ORDER BY created_at DESC
+      `SELECT r.id, r.responses, r.classification, r.classification_confidence,
+              r.classification_reasoning, r.dina_counter_analysis,
+              r.completeness_score, r.depth_score, r.quality_score,
+              r.helpful_count, r.is_flagged, r.time_spent_seconds,
+              r.created_at,
+              (SELECT COUNT(*) FROM truth_stream_dialogues WHERE review_id = r.id) AS response_count
+       FROM truth_stream_reviews r
+       WHERE r.reviewer_id = ?
+       ORDER BY r.created_at DESC
        LIMIT ? OFFSET ?`,
       [userId, limit, offset]
     ) as any[];
@@ -916,11 +1059,18 @@ export async function getGivenReviews(req: AuthenticatedRequest, res: Response):
       id: r.id,
       responses: safeJsonParse(r.responses, {}),
       classification: r.classification,
+      classificationConfidence: r.classification_confidence,
+      classificationReasoning: r.classification_reasoning,
+      dinaCounterAnalysis: r.dina_counter_analysis,
       completenessScore: r.completeness_score,
       depthScore: r.depth_score,
       qualityScore: r.quality_score,
+      helpfulCount: r.helpful_count ?? 0,
+      isFlagged: !!r.is_flagged,
       timeSpentSeconds: r.time_spent_seconds,
-      createdAt: r.created_at,
+      responseCount: r.response_count ?? 0,
+      // Anonymize timestamp consistently with getReceivedReviews
+      createdAt: roundToNearestHour(r.created_at),
     }));
 
     res.json({
@@ -928,7 +1078,7 @@ export async function getGivenReviews(req: AuthenticatedRequest, res: Response):
       data: { items: reviews, total, page, limit, totalPages: Math.ceil(total / limit) },
     });
   } catch (error: any) {
-    console.error('Error getting given reviews:', error.message);
+    logger.error('Error getting given reviews:', error.message);
     res.status(500).json({ error: 'Failed to get reviews', code: 'SERVER_ERROR' });
   }
 }
@@ -941,9 +1091,20 @@ export async function markHelpful(req: AuthenticatedRequest, res: Response): Pro
     const userId = req.user!.id;
     const reviewId = req.params.reviewId;
 
-    // Verify the review belongs to this user (is the reviewee)
+    if (!isValidUUID(reviewId)) {
+      res.status(400).json({ error: 'Invalid review ID format', code: 'VALIDATION_ERROR' });
+      return;
+    }
+
+    // Rate limit
+    if (!checkActionRate(userId, 'helpful')) {
+      res.status(429).json({ error: 'Too many requests. Please slow down.', code: 'RATE_LIMITED' });
+      return;
+    }
+
+    // Verify the review belongs to this user (is the reviewee) + get reviewer for notification
     const [reviewCheck] = await DB.query(
-      'SELECT id FROM truth_stream_reviews WHERE id = ? AND reviewee_id = ?',
+      'SELECT id, reviewer_id FROM truth_stream_reviews WHERE id = ? AND reviewee_id = ?',
       [reviewId, userId]
     ) as any[];
 
@@ -953,25 +1114,41 @@ export async function markHelpful(req: AuthenticatedRequest, res: Response): Pro
     }
 
     const voteId = crypto.randomUUID();
+    const connection = await DB.getConnection();
     try {
-      await DB.query(
+      await connection.beginTransaction();
+      await connection.query(
         'INSERT INTO truth_stream_helpful_votes (id, review_id, user_id) VALUES (?, ?, ?)',
         [voteId, reviewId, userId]
       );
-      await DB.query(
+      await connection.query(
         'UPDATE truth_stream_reviews SET helpful_count = helpful_count + 1 WHERE id = ?',
         [reviewId]
       );
+      await connection.commit();
+
+      // Notify reviewer that their review was marked helpful (non-blocking)
+      publishTSNotification({
+        type: 'ts_helpful_marked',
+        userId: reviewCheck[0].reviewer_id,
+        title: 'Someone appreciated your review',
+        message: 'A user found your review helpful and marked it with a heart!',
+        metadata: { reviewId },
+      });
+
       res.json({ success: true, message: 'Marked as helpful' });
     } catch (err: any) {
+      await connection.rollback();
       if (err.code === 'ER_DUP_ENTRY') {
         res.status(409).json({ error: 'Already marked as helpful', code: 'DUPLICATE' });
       } else {
         throw err;
       }
+    } finally {
+      connection.release();
     }
   } catch (error: any) {
-    console.error('Error marking helpful:', error.message);
+    logger.error('Error marking helpful:', error.message);
     res.status(500).json({ error: 'Failed to mark helpful', code: 'SERVER_ERROR' });
   }
 }
@@ -984,21 +1161,36 @@ export async function unmarkHelpful(req: AuthenticatedRequest, res: Response): P
     const userId = req.user!.id;
     const reviewId = req.params.reviewId;
 
-    const [result] = await DB.query(
-      'DELETE FROM truth_stream_helpful_votes WHERE review_id = ? AND user_id = ?',
-      [reviewId, userId]
-    ) as any[];
+    if (!isValidUUID(reviewId)) {
+      res.status(400).json({ error: 'Invalid review ID format', code: 'VALIDATION_ERROR' });
+      return;
+    }
 
-    if (result.affectedRows > 0) {
-      await DB.query(
-        'UPDATE truth_stream_reviews SET helpful_count = GREATEST(helpful_count - 1, 0) WHERE id = ?',
-        [reviewId]
-      );
+    const connection = await DB.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [result] = await connection.query(
+        'DELETE FROM truth_stream_helpful_votes WHERE review_id = ? AND user_id = ?',
+        [reviewId, userId]
+      ) as any[];
+
+      if (result.affectedRows > 0) {
+        await connection.query(
+          'UPDATE truth_stream_reviews SET helpful_count = GREATEST(helpful_count - 1, 0) WHERE id = ?',
+          [reviewId]
+        );
+      }
+      await connection.commit();
+    } catch (txErr) {
+      await connection.rollback();
+      throw txErr;
+    } finally {
+      connection.release();
     }
 
     res.json({ success: true, message: 'Unmarked helpful' });
   } catch (error: any) {
-    console.error('Error unmarking helpful:', error.message);
+    logger.error('Error unmarking helpful:', error.message);
     res.status(500).json({ error: 'Failed to unmark helpful', code: 'SERVER_ERROR' });
   }
 }
@@ -1015,6 +1207,17 @@ export async function addDialogueMessage(req: AuthenticatedRequest, res: Respons
     const userId = req.user!.id;
     const reviewId = req.params.reviewId;
     const { content } = req.body;
+
+    if (!isValidUUID(reviewId)) {
+      res.status(400).json({ error: 'Invalid review ID format', code: 'VALIDATION_ERROR' });
+      return;
+    }
+
+    // Rate limit
+    if (!checkActionRate(userId, 'dialogue')) {
+      res.status(429).json({ error: 'Too many messages. Please slow down.', code: 'RATE_LIMITED' });
+      return;
+    }
 
     const sanitizedContent = sanitizeInput(content, 2000);
     if (!sanitizedContent || sanitizedContent.length < 5) {
@@ -1066,6 +1269,16 @@ export async function addDialogueMessage(req: AuthenticatedRequest, res: Respons
       [messageId, reviewId, authorRole, userId, sanitizedContent]
     );
 
+    // Notify the other participant via WebSocket
+    const recipientId = authorRole === 'reviewee' ? review.reviewer_id : review.reviewee_id;
+    publishTSNotification({
+      type: 'ts_dialogue_message',
+      userId: recipientId,
+      title: 'New message in review dialogue',
+      message: `The ${authorRole === 'reviewee' ? 'reviewee' : 'reviewer'} replied to a review conversation.`,
+      metadata: { reviewId, authorRole, messageId },
+    });
+
     res.status(201).json({
       success: true,
       data: {
@@ -1076,7 +1289,7 @@ export async function addDialogueMessage(req: AuthenticatedRequest, res: Respons
       },
     });
   } catch (error: any) {
-    console.error('Error adding dialogue message:', error.message);
+    logger.error('Error adding dialogue message:', error.message);
     res.status(500).json({ error: 'Failed to add message', code: 'SERVER_ERROR' });
   }
 }
@@ -1088,6 +1301,11 @@ export async function getDialogue(req: AuthenticatedRequest, res: Response): Pro
   try {
     const userId = req.user!.id;
     const reviewId = req.params.reviewId;
+
+    if (!isValidUUID(reviewId)) {
+      res.status(400).json({ error: 'Invalid review ID format', code: 'VALIDATION_ERROR' });
+      return;
+    }
 
     // Verify participant
     const [reviewRows] = await DB.query(
@@ -1130,7 +1348,7 @@ export async function getDialogue(req: AuthenticatedRequest, res: Response): Pro
       },
     });
   } catch (error: any) {
-    console.error('Error getting dialogue:', error.message);
+    logger.error('Error getting dialogue:', error.message);
     res.status(500).json({ error: 'Failed to get dialogue', code: 'SERVER_ERROR' });
   }
 }
@@ -1144,14 +1362,31 @@ export async function flagReview(req: AuthenticatedRequest, res: Response): Prom
     const reviewId = req.params.reviewId;
     const { reason } = req.body;
 
+    if (!isValidUUID(reviewId)) {
+      res.status(400).json({ error: 'Invalid review ID format', code: 'VALIDATION_ERROR' });
+      return;
+    }
+
+    // Rate limit
+    if (!checkActionRate(userId, 'flag')) {
+      res.status(429).json({ error: 'Too many flag requests. Please slow down.', code: 'RATE_LIMITED' });
+      return;
+    }
+
     // Verify the review is for this user
     const [reviewCheck] = await DB.query(
-      'SELECT id FROM truth_stream_reviews WHERE id = ? AND reviewee_id = ?',
+      'SELECT id, is_flagged FROM truth_stream_reviews WHERE id = ? AND reviewee_id = ?',
       [reviewId, userId]
     ) as any[];
 
     if (!reviewCheck || reviewCheck.length === 0) {
       res.status(403).json({ error: 'Unauthorized', code: 'NOT_YOUR_REVIEW' });
+      return;
+    }
+
+    // Idempotent: if already flagged, return success without overwriting reason
+    if (reviewCheck[0].is_flagged) {
+      res.json({ success: true, message: 'Review already flagged' });
       return;
     }
 
@@ -1162,7 +1397,7 @@ export async function flagReview(req: AuthenticatedRequest, res: Response): Prom
 
     res.json({ success: true, message: 'Review flagged for review' });
   } catch (error: any) {
-    console.error('Error flagging review:', error.message);
+    logger.error('Error flagging review:', error.message);
     res.status(500).json({ error: 'Failed to flag review', code: 'SERVER_ERROR' });
   }
 }
@@ -1208,7 +1443,7 @@ export async function getAnalysis(req: AuthenticatedRequest, res: Response): Pro
       },
     });
   } catch (error: any) {
-    console.error('Error getting analysis:', error.message);
+    logger.error('Error getting analysis:', error.message);
     res.status(500).json({ error: 'Failed to get analysis', code: 'SERVER_ERROR' });
   }
 }
@@ -1220,6 +1455,21 @@ export async function generateAnalysis(req: AuthenticatedRequest, res: Response)
   try {
     const userId = req.user!.id;
     const analysisType = req.body.analysisType || 'truth_mirror_report';
+
+    // Rate limit — analysis generation is expensive (LLM calls)
+    if (!checkActionRate(userId, 'analysis')) {
+      res.status(429).json({ error: 'Too many analysis requests. Please wait.', code: 'RATE_LIMITED' });
+      return;
+    }
+
+    // Validate analysis type against whitelist
+    if (!VALID_ANALYSIS_TYPES.has(analysisType)) {
+      res.status(400).json({
+        error: `Invalid analysis type. Valid: ${[...VALID_ANALYSIS_TYPES].join(', ')}`,
+        code: 'INVALID_ANALYSIS_TYPE',
+      });
+      return;
+    }
 
     // Check review count
     const [countRows] = await DB.query(
@@ -1250,7 +1500,7 @@ export async function generateAnalysis(req: AuthenticatedRequest, res: Response)
 
     if (staleJobs && staleJobs.length > 0) {
       const staleIds = staleJobs.map((j: any) => j.id);
-      console.warn(`Auto-failing ${staleIds.length} stale generate_analysis job(s) for user ${userId}:`, staleIds);
+      logger.warn(`Auto-failing ${staleIds.length} stale generate_analysis job(s) for user ${userId}:`, staleIds);
       await DB.query(
         `UPDATE truth_stream_processing_queue
          SET status = 'failed', error_message = 'Auto-failed: exceeded ${STALE_JOB_MINUTES}min processing timeout', completed_at = NOW()
@@ -1296,7 +1546,7 @@ export async function generateAnalysis(req: AuthenticatedRequest, res: Response)
       },
     });
   } catch (error: any) {
-    console.error('Error generating analysis:', error.message);
+    logger.error('Error generating analysis:', error.message);
     res.status(500).json({ error: 'Failed to queue analysis', code: 'SERVER_ERROR' });
   }
 }
@@ -1323,7 +1573,7 @@ export async function getPerceptionGap(req: AuthenticatedRequest, res: Response)
       data: { perceptionGapScore: rows[0].perception_gap_score },
     });
   } catch (error: any) {
-    console.error('Error getting perception gap:', error.message);
+    logger.error('Error getting perception gap:', error.message);
     res.status(500).json({ error: 'Failed to get perception gap', code: 'SERVER_ERROR' });
   }
 }
@@ -1360,7 +1610,7 @@ export async function createFeedbackRequest(req: AuthenticatedRequest, res: Resp
       data: { id, question: sanitizedQuestion, expiresAt },
     });
   } catch (error: any) {
-    console.error('Error creating feedback request:', error.message);
+    logger.error('Error creating feedback request:', error.message);
     res.status(500).json({ error: 'Failed to create feedback request', code: 'SERVER_ERROR' });
   }
 }
@@ -1376,13 +1626,14 @@ export async function getMyFeedbackRequests(req: AuthenticatedRequest, res: Resp
       `SELECT id, question, context, is_active, response_count, created_at, expires_at
        FROM truth_stream_feedback_requests
        WHERE user_id = ?
-       ORDER BY created_at DESC`,
+       ORDER BY created_at DESC
+       LIMIT 100`,
       [userId]
     ) as any[];
 
     res.json({ success: true, data: { items: rows || [] } });
   } catch (error: any) {
-    console.error('Error getting feedback requests:', error.message);
+    logger.error('Error getting feedback requests:', error.message);
     res.status(500).json({ error: 'Failed to get feedback requests', code: 'SERVER_ERROR' });
   }
 }
@@ -1408,7 +1659,7 @@ export async function getFeedbackRequestsFeed(req: AuthenticatedRequest, res: Re
 
     res.json({ success: true, data: { items: rows || [] } });
   } catch (error: any) {
-    console.error('Error getting feedback feed:', error.message);
+    logger.error('Error getting feedback feed:', error.message);
     res.status(500).json({ error: 'Failed to get feedback feed', code: 'SERVER_ERROR' });
   }
 }
@@ -1438,33 +1689,56 @@ export async function getStats(req: AuthenticatedRequest, res: Response): Promis
 
     const profile = profileRows[0];
 
-    // Get classification distribution
+    // Get classification breakdown for reviews GIVEN by this user (for milestone checks)
     const [classRows] = await DB.query(
       `SELECT classification, COUNT(*) as count
        FROM truth_stream_reviews
-       WHERE reviewee_id = ? AND classification IS NOT NULL
+       WHERE reviewer_id = ? AND classification IS NOT NULL
        GROUP BY classification`,
       [userId]
     ) as any[];
 
-    const classificationDistribution: Record<string, number> = {};
+    const classificationBreakdown: Record<string, number> = {
+      constructive: 0, affirming: 0, raw_truth: 0, hostile: 0,
+    };
     for (const row of classRows || []) {
-      classificationDistribution[row.classification] = row.count;
+      classificationBreakdown[row.classification] = Number(row.count) || 0;
     }
+
+    // Count completed review batches (distinct sets of completed queue items)
+    const [batchRows] = await DB.query(
+      `SELECT COUNT(*) as count FROM truth_stream_queue
+       WHERE reviewer_id = ? AND status = 'completed'`,
+      [userId]
+    ) as any[];
+    const completedQueueItems = Number(batchRows?.[0]?.count) || 0;
+    // A batch is typically 5 reviews; count how many full batches completed
+    const completedBatches = Math.floor(completedQueueItems / 5);
+
+    // Average quality score for reviews given by this user
+    const [qualityRows] = await DB.query(
+      `SELECT AVG(quality_score) as avg_quality
+       FROM truth_stream_reviews
+       WHERE reviewer_id = ? AND quality_score IS NOT NULL`,
+      [userId]
+    ) as any[];
+    const averageQualityScore = Number(qualityRows?.[0]?.avg_quality) || 0;
 
     res.json({
       success: true,
       data: {
         totalReviewsReceived: profile.total_reviews_received,
         totalReviewsGiven: profile.total_reviews_given,
-        reviewQualityScore: profile.review_quality_score,
+        reviewerQualityScore: profile.review_quality_score,
         perceptionGapScore: profile.perception_gap_score,
         profileCompleteness: profile.profile_completeness,
-        classificationDistribution,
+        averageQualityScore,
+        completedBatches,
+        classificationBreakdown,
       },
     });
   } catch (error: any) {
-    console.error('Error getting stats:', error.message);
+    logger.error('Error getting stats:', error.message);
     res.status(500).json({ error: 'Failed to get stats', code: 'SERVER_ERROR' });
   }
 }
@@ -1480,7 +1754,8 @@ export async function getMilestones(req: AuthenticatedRequest, res: Response): P
       `SELECT id, milestone_type, milestone_name, milestone_description, milestone_data, achieved_at
        FROM truth_stream_milestones
        WHERE user_id = ?
-       ORDER BY achieved_at DESC`,
+       ORDER BY achieved_at DESC
+       LIMIT 100`,
       [userId]
     ) as any[];
 
@@ -1494,7 +1769,7 @@ export async function getMilestones(req: AuthenticatedRequest, res: Response): P
       },
     });
   } catch (error: any) {
-    console.error('Error getting milestones:', error.message);
+    logger.error('Error getting milestones:', error.message);
     res.status(500).json({ error: 'Failed to get milestones', code: 'SERVER_ERROR' });
   }
 }
@@ -1545,7 +1820,7 @@ export async function getQuestionnaire(req: AuthenticatedRequest, res: Response)
       },
     });
   } catch (error: any) {
-    console.error('Error getting questionnaire:', error.message);
+    logger.error('Error getting questionnaire:', error.message);
     res.status(500).json({ error: 'Failed to get questionnaire', code: 'SERVER_ERROR' });
   }
 }
@@ -1699,15 +1974,14 @@ async function buildSharedIntakeData(userId: number, sharedTypes: string[]): Pro
       }
     }
   } catch (error: any) {
-    console.error('Error building shared intake data:', error.message);
+    logger.error('Error building shared intake data:', error.message);
   }
 
   return shared;
 }
 
-/**
- * Round a date to the nearest hour for anonymity protection.
- */
+// Shared utility — import from '../utils/dateUtils' when build is configured
+// import { roundToNearestHour } from '../utils/dateUtils';
 function roundToNearestHour(date: Date | string): Date {
   const d = new Date(date);
   d.setMinutes(0, 0, 0);
@@ -1753,7 +2027,7 @@ export async function getAnalysisTrends(req: AuthenticatedRequest, res: Response
       },
     });
   } catch (error: any) {
-    console.error('Error getting analysis trends:', error.message);
+    logger.error('Error getting analysis trends:', error.message);
     res.status(500).json({ error: 'Failed to get trend analysis', code: 'SERVER_ERROR' });
   }
 }
@@ -1826,11 +2100,11 @@ export async function cleanupUserTruthStreamData(userId: number): Promise<boolea
     );
 
     await connection.commit();
-    console.log(`TruthStream cleanup completed for user ${userId}`);
+    logger.info(`TruthStream cleanup completed for user ${userId}`);
     return true;
   } catch (error: any) {
     await connection.rollback();
-    console.error(`TruthStream cleanup failed for user ${userId}:`, error.message);
+    logger.error(`TruthStream cleanup failed for user ${userId}:`, error.message);
     return false;
   } finally {
     connection.release();

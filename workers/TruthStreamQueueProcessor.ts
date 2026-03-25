@@ -35,6 +35,19 @@ import { DB } from '../db';
 import { mirrorRedis } from '../config/redis';
 import { Logger } from '../utils/logger';
 
+// Import the existing notification system for WebSocket delivery
+let mirrorGroupNotifications: {
+  notifyTruthStreamReviewClassified?: (userId: number, reviewId: string, classification: string) => Promise<boolean>;
+  notifyTruthStreamAnalysisComplete?: (userId: number, analysisId: string, analysisType: string) => Promise<boolean>;
+  notify: (userId: string | number, notification: { type: string; payload: Record<string, any> }) => Promise<boolean>;
+} | null = null;
+try {
+  const notifModule = require('../systems/mirrorGroupNotifications');
+  mirrorGroupNotifications = notifModule.mirrorGroupNotifications;
+} catch {
+  // Notification system unavailable — will fall back to Redis pub/sub
+}
+
 // ============================================================================
 // TYPES
 // ============================================================================
@@ -367,8 +380,9 @@ export class TruthStreamQueueProcessor {
       // Timeouts — standard operations
       dinaTimeoutMs: parseInt(process.env.TS_DINA_TIMEOUT || '120000', 10),
       // FIX: Extended timeout for LLM-heavy operations (generate_analysis)
-      // Must be less than Dina's Express route timeout (180s) to get proper errors
-      dinaLLMTimeoutMs: parseInt(process.env.TS_DINA_LLM_TIMEOUT || '170000', 10),
+      // Timeout hierarchy: Synthesizer (240s) < Queue processor (280s) < Express route (300s)
+      // Cold Ollama model loads take 150-160s before generation starts
+      dinaLLMTimeoutMs: parseInt(process.env.TS_DINA_LLM_TIMEOUT || '280000', 10),
       ...config,
     };
 
@@ -752,7 +766,7 @@ export class TruthStreamQueueProcessor {
     const classification = result.data;
 
     // Update the review with classification results
-    await DB.query(
+    const [updateResult] = await DB.query(
       `UPDATE truth_stream_reviews
        SET classification = ?,
            classification_confidence = ?,
@@ -766,23 +780,33 @@ export class TruthStreamQueueProcessor {
         classification.counterAnalysis || null,
         reviewId,
       ]
-    );
+    ) as any[];
+
+    if (updateResult?.affectedRows === 0) {
+      this.logger.warn('Classification update matched no rows — review may have been deleted', { reviewId });
+    }
 
     // If hostile, log it and check patterns
     if (classification.classification === 'hostile') {
       await this.logHostileReview(reviewId, classification);
     }
 
-    // Publish notification via Redis
-    try {
-      await mirrorRedis.publish('mirror:truthstream:notifications', JSON.stringify({
-        type: 'review_classified',
-        userId: job.user_id,
-        reviewId,
-        classification: classification.classification,
-      }));
-    } catch {
-      // Non-critical — user will see on next page load
+    // Notify user via WebSocket (best-effort, non-blocking)
+    if (mirrorGroupNotifications) {
+      try {
+        if (mirrorGroupNotifications.notifyTruthStreamReviewClassified) {
+          await mirrorGroupNotifications.notifyTruthStreamReviewClassified(
+            job.user_id, reviewId, classification.classification
+          );
+        } else {
+          await mirrorGroupNotifications.notify(job.user_id, {
+            type: 'ts_review_classified',
+            payload: { reviewId, classification: classification.classification },
+          });
+        }
+      } catch {
+        // Non-critical — user will see on next page load
+      }
     }
 
     // Save output data for debugging
@@ -913,41 +937,59 @@ export class TruthStreamQueueProcessor {
 
     const analysis = result.data;
 
-    // Save analysis to DB
+    // Save analysis + update profile atomically
     const analysisId = crypto.randomUUID();
-    await DB.query(
-      `INSERT INTO truth_stream_analyses
-       (id, user_id, analysis_type, review_count_at_generation, analysis_data,
-        perception_gap_score, confidence_level)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [
-        analysisId, userId,
-        analysis.analysisType || analysisType || 'truth_mirror_report',
-        analysis.metadata?.reviewsAnalyzed || reviewRows.length,
-        JSON.stringify(analysis.analysisData),
-        analysis.perceptionGapScore || null,
-        analysis.confidenceLevel || null,
-      ]
-    );
+    const connection = await DB.getConnection();
+    try {
+      await connection.beginTransaction();
 
-    // Update perception gap score on profile
-    if (analysis.perceptionGapScore !== null && analysis.perceptionGapScore !== undefined) {
-      await DB.query(
-        'UPDATE truth_stream_profiles SET perception_gap_score = ? WHERE user_id = ?',
-        [analysis.perceptionGapScore, userId]
+      await connection.query(
+        `INSERT INTO truth_stream_analyses
+         (id, user_id, analysis_type, review_count_at_generation, analysis_data,
+          perception_gap_score, confidence_level)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          analysisId, userId,
+          analysis.analysisType || analysisType || 'truth_mirror_report',
+          analysis.metadata?.reviewsAnalyzed || reviewRows.length,
+          JSON.stringify(analysis.analysisData),
+          analysis.perceptionGapScore || null,
+          analysis.confidenceLevel || null,
+        ]
       );
+
+      // Update perception gap score on profile within same transaction
+      if (analysis.perceptionGapScore !== null && analysis.perceptionGapScore !== undefined) {
+        await connection.query(
+          'UPDATE truth_stream_profiles SET perception_gap_score = ? WHERE user_id = ?',
+          [analysis.perceptionGapScore, userId]
+        );
+      }
+
+      await connection.commit();
+    } catch (txErr) {
+      await connection.rollback();
+      throw txErr;
+    } finally {
+      connection.release();
     }
 
-    // Publish notification
-    try {
-      await mirrorRedis.publish('mirror:truthstream:notifications', JSON.stringify({
-        type: 'analysis_complete',
-        userId,
-        analysisId,
-        analysisType: analysis.analysisType,
-      }));
-    } catch {
-      // Non-critical
+    // Notify user via WebSocket (best-effort, non-blocking)
+    if (mirrorGroupNotifications) {
+      try {
+        if (mirrorGroupNotifications.notifyTruthStreamAnalysisComplete) {
+          await mirrorGroupNotifications.notifyTruthStreamAnalysisComplete(
+            userId, analysisId, analysis.analysisType
+          );
+        } else {
+          await mirrorGroupNotifications.notify(userId, {
+            type: 'ts_analysis_complete',
+            payload: { analysisId, analysisType: analysis.analysisType },
+          });
+        }
+      } catch {
+        // Non-critical
+      }
     }
 
     // Save output for debugging
@@ -1246,6 +1288,8 @@ export class TruthStreamQueueProcessor {
 // HELPERS
 // ============================================================================
 
+// Shared utility — import from '../utils/dateUtils' when build is configured
+// import { roundToNearestHour } from '../utils/dateUtils';
 function roundToNearestHour(date: Date | string): Date {
   const d = new Date(date);
   d.setMinutes(0, 0, 0);
