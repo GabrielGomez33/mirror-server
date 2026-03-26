@@ -208,22 +208,19 @@ export class TruthStreamQueueManager {
       // Calculate expiry
       const expiresAt = new Date(Date.now() + QUEUE_EXPIRY_HOURS * 3600000);
 
-      // Insert queue items in a transaction
+      // [A2] Insert all queue items in a single batch INSERT (eliminates N+1 query pattern)
       const connection = await DB.getConnection();
       try {
         await connection.beginTransaction();
 
         const items: QueueItem[] = [];
+        const valuePlaceholders: string[] = [];
+        const insertParams: any[] = [];
 
         for (const profile of selected) {
           const itemId = crypto.randomUUID();
-
-          await connection.query(
-            `INSERT INTO truth_stream_queue
-             (id, reviewer_id, reviewee_id, batch_number, status, expires_at)
-             VALUES (?, ?, ?, ?, 'pending', ?)`,
-            [itemId, reviewerId, profile.user_id, batchNumber, expiresAt]
-          );
+          valuePlaceholders.push('(?, ?, ?, ?, ?, ?)');
+          insertParams.push(itemId, reviewerId, profile.user_id, batchNumber, 'pending', expiresAt);
 
           items.push({
             id: itemId,
@@ -237,6 +234,15 @@ export class TruthStreamQueueManager {
             completedAt: null,
             timeSpentSeconds: 0,
           });
+        }
+
+        if (valuePlaceholders.length > 0) {
+          await connection.query(
+            `INSERT INTO truth_stream_queue
+             (id, reviewer_id, reviewee_id, batch_number, status, expires_at)
+             VALUES ${valuePlaceholders.join(', ')}`,
+            insertParams
+          );
         }
 
         await connection.commit();

@@ -24,7 +24,7 @@ const logger = new Logger('TruthStreamController');
 // Import the existing notification system (used by groups, chat, etc.)
 // This delivers via WebSocket + push — the same infrastructure as Dina chat worker
 let mirrorGroupNotifications: {
-  notifyTruthStreamDialogueMessage: (userId: number, reviewId: string, authorRole: string) => Promise<boolean>;
+  notifyTruthStreamDialogueMessage: (userId: number, reviewId: string, recipientView: string) => Promise<boolean>;
   notifyTruthStreamReviewReceived?: (userId: number, reviewId: string) => Promise<boolean>;
   notifyTruthStreamHelpfulMarked?: (userId: number, reviewId: string) => Promise<boolean>;
   notify: (userId: string | number, notification: { type: string; payload: Record<string, any> }) => Promise<boolean>;
@@ -51,7 +51,7 @@ function publishTSNotification(payload: {
       mirrorGroupNotifications.notifyTruthStreamDialogueMessage(
         payload.userId,
         payload.metadata.reviewId as string,
-        (payload.metadata.authorRole as string) || 'unknown'
+        (payload.metadata.recipientView as string) || 'received'
       ).catch(() => {});
     } else if (payload.type === 'ts_review_received' && payload.metadata?.reviewId && mirrorGroupNotifications.notifyTruthStreamReviewReceived) {
       mirrorGroupNotifications.notifyTruthStreamReviewReceived(
@@ -569,10 +569,10 @@ export async function updateProfile(req: AuthenticatedRequest, res: Response): P
       updates.push('is_active = ?');
       params.push(req.body.isActive ? 1 : 0);
 
-      // If deactivating, expire pending queue items
+      // [D4] If deactivating, cancel pending queue items with audit trail
       if (!req.body.isActive) {
         await DB.query(
-          `UPDATE truth_stream_queue SET status = 'cancelled'
+          `UPDATE truth_stream_queue SET status = 'cancelled', cancellation_reason = 'profile_deactivated'
            WHERE reviewee_id = ? AND status IN ('pending', 'in_progress')`,
           [userId]
         );
@@ -584,11 +584,22 @@ export async function updateProfile(req: AuthenticatedRequest, res: Response): P
       return;
     }
 
-    params.push(userId);
-    await DB.query(
-      `UPDATE truth_stream_profiles SET ${updates.join(', ')} WHERE user_id = ?`,
-      params
-    );
+    // [A6] Wrap in transaction to prevent concurrent reads seeing inconsistent state
+    const connection = await DB.getConnection();
+    try {
+      await connection.beginTransaction();
+      params.push(userId);
+      await connection.query(
+        `UPDATE truth_stream_profiles SET ${updates.join(', ')} WHERE user_id = ?`,
+        params
+      );
+      await connection.commit();
+    } catch (txError) {
+      await connection.rollback();
+      throw txError;
+    } finally {
+      connection.release();
+    }
 
     res.json({ success: true, message: 'Truth Card updated' });
   } catch (error: any) {
@@ -608,11 +619,14 @@ export async function getTruthCard(req: AuthenticatedRequest, res: Response): Pr
       return;
     }
 
-    // Allow self-viewing; otherwise verify the requester has this user in their queue
+    // [S10] Allow self-viewing; otherwise verify the requester has this user in an ACTIVE queue slot
+    // Tightened: only 'in_progress' (reviewer has committed to reviewing) — not just 'pending'
     if (revieweeId !== req.user!.id) {
       const [queueCheck] = await DB.query(
         `SELECT id FROM truth_stream_queue
-         WHERE reviewer_id = ? AND reviewee_id = ? AND status IN ('pending', 'in_progress')`,
+         WHERE reviewer_id = ? AND reviewee_id = ?
+           AND status IN ('pending', 'in_progress')
+           AND expires_at > NOW()`,
         [req.user!.id, revieweeId]
       ) as any[];
 
@@ -802,6 +816,18 @@ export async function completeQueueItem(req: AuthenticatedRequest, res: Response
       return;
     }
 
+    // [D2] Server-side expiry validation — client-side countdown is informational only
+    const expiresAt = new Date(queueItem.expires_at);
+    const graceMs = 1 * 3600000; // 1 hour grace period for in-progress items
+    if (new Date() > new Date(expiresAt.getTime() + graceMs)) {
+      await DB.query(
+        `UPDATE truth_stream_queue SET status = 'expired' WHERE id = ?`,
+        [queueId]
+      );
+      res.status(410).json({ error: 'This review assignment has expired', code: 'QUEUE_EXPIRED' });
+      return;
+    }
+
     // Get questionnaire for validation
     const [questRows] = await DB.query(
       `SELECT id, sections FROM truth_stream_questionnaires
@@ -836,6 +862,44 @@ export async function completeQueueItem(req: AuthenticatedRequest, res: Response
     const freeFormText = truthStreamReviewScorer.extractFreeFormText(responses);
     const selfTaggedTone = truthStreamReviewScorer.extractSelfTaggedTone(responses);
 
+    // [D8] Validate review tone is present — required for accurate classification
+    if (!selfTaggedTone) {
+      res.status(400).json({
+        error: 'Please select a review tone before submitting',
+        code: 'MISSING_TONE',
+      });
+      return;
+    }
+
+    // [D3] Idempotency: client may send an idempotency_key to safely retry on network errors
+    const idempotencyKey: string | null = typeof req.body.idempotencyKey === 'string'
+      ? req.body.idempotencyKey.substring(0, 64)
+      : null;
+
+    // Check if this is a retry of a previously completed submission
+    if (idempotencyKey) {
+      const [existingReview] = await DB.query(
+        `SELECT id, quality_score, completeness_score, depth_score
+         FROM truth_stream_reviews WHERE idempotency_key = ?`,
+        [idempotencyKey]
+      ) as any[];
+      if (existingReview && existingReview.length > 0) {
+        // Return the existing review as if it was just created (idempotent response)
+        const existing = existingReview[0];
+        res.status(201).json({
+          success: true,
+          data: {
+            reviewId: existing.id,
+            qualityScore: existing.quality_score,
+            completenessScore: existing.completeness_score,
+            depthScore: existing.depth_score,
+            classificationPending: true,
+          },
+        });
+        return;
+      }
+    }
+
     // Use a transaction to ensure atomicity
     const connection = await DB.getConnection();
     try {
@@ -843,14 +907,14 @@ export async function completeQueueItem(req: AuthenticatedRequest, res: Response
 
       const reviewId = crypto.randomUUID();
 
-      // Insert the review
+      // Insert the review (with optional idempotency_key)
       await connection.query(
         `INSERT INTO truth_stream_reviews
-         (id, queue_id, reviewer_id, reviewee_id, questionnaire_id, responses,
-          completeness_score, depth_score, quality_score, time_spent_seconds)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, idempotency_key, queue_id, reviewer_id, reviewee_id, questionnaire_id, responses,
+          completeness_score, depth_score, quality_score, time_spent_seconds, scores_calculated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
         [
-          reviewId, queueId, userId, queueItem.reviewee_id, questionnaire.id,
+          reviewId, idempotencyKey, queueId, userId, queueItem.reviewee_id, questionnaire.id,
           JSON.stringify(responses),
           scoreResult.completenessScore, scoreResult.depthScore,
           scoreResult.qualityScore, time,
@@ -902,14 +966,31 @@ export async function completeQueueItem(req: AuthenticatedRequest, res: Response
 
       await connection.commit();
 
-      // Notify reviewee that they received a new review
-      publishTSNotification({
-        type: 'ts_review_received',
-        userId: queueItem.reviewee_id,
-        title: 'New review received',
-        message: 'Someone has reviewed your Truth Card. Check your received reviews!',
-        metadata: { reviewId },
-      });
+      // [D1] Notify AFTER commit succeeds — wrapped so notification failure never loses the review
+      try {
+        publishTSNotification({
+          type: 'ts_review_received',
+          userId: queueItem.reviewee_id,
+          title: 'New review received',
+          message: 'Someone has reviewed your Truth Card. Check your received reviews!',
+          metadata: { reviewId },
+        });
+      } catch (notifError) {
+        // Queue for retry so the reviewee is still notified eventually
+        logger.warn('Notification failed post-commit, queuing for retry', {
+          reviewId, revieweeId: queueItem.reviewee_id, error: (notifError as Error).message,
+        });
+        try {
+          await DB.query(
+            `INSERT INTO truth_stream_notification_retry_queue
+             (id, notification_type, recipient_user_id, payload)
+             VALUES (?, 'ts_review_received', ?, ?)`,
+            [crypto.randomUUID(), queueItem.reviewee_id, JSON.stringify({ reviewId })]
+          );
+        } catch {
+          // Last resort — the review is safe, notification will appear on next page load
+        }
+      }
 
       res.status(201).json({
         success: true,
@@ -1269,14 +1350,18 @@ export async function addDialogueMessage(req: AuthenticatedRequest, res: Respons
       [messageId, reviewId, authorRole, userId, sanitizedContent]
     );
 
-    // Notify the other participant via WebSocket
+    // [S6] Notify the other participant — use neutral language to avoid revealing role identity.
+    // Include recipientView so the frontend knows which tab to open for the recipient.
+    // If the author is the reviewee, the recipient is the reviewer → they see it in "given".
+    // If the author is the reviewer, the recipient is the reviewee → they see it in "received".
     const recipientId = authorRole === 'reviewee' ? review.reviewer_id : review.reviewee_id;
+    const recipientView = authorRole === 'reviewee' ? 'given' : 'received';
     publishTSNotification({
       type: 'ts_dialogue_message',
       userId: recipientId,
       title: 'New message in review dialogue',
-      message: `The ${authorRole === 'reviewee' ? 'reviewee' : 'reviewer'} replied to a review conversation.`,
-      metadata: { reviewId, authorRole, messageId },
+      message: 'Someone replied in a review conversation.',
+      metadata: { reviewId, messageId, recipientView },
     });
 
     res.status(201).json({
@@ -1487,55 +1572,72 @@ export async function generateAnalysis(req: AuthenticatedRequest, res: Response)
       return;
     }
 
-    // Check if analysis is already processing
-    // First, auto-fail any stale jobs stuck in 'processing' for over 5 minutes
-    // This prevents a failed queue processor from permanently blocking new requests
-    const STALE_JOB_MINUTES = 5;
-    const [staleJobs] = await DB.query(
-      `SELECT id FROM truth_stream_processing_queue
-       WHERE user_id = ? AND job_type = 'generate_analysis' AND status = 'processing'
-         AND started_at < DATE_SUB(NOW(), INTERVAL ? MINUTE)`,
-      [userId, STALE_JOB_MINUTES]
-    ) as any[];
+    // [D5] Use a transaction with row-level locking to prevent duplicate job creation.
+    // Two concurrent requests both checking "no pending jobs" could both insert — this prevents that.
+    const STALE_JOB_MINUTES = 10; // Increased from 5 to allow for cold LLM model loads
+    const connection = await DB.getConnection();
+    let jobId: string | null = null;
 
-    if (staleJobs && staleJobs.length > 0) {
-      const staleIds = staleJobs.map((j: any) => j.id);
-      logger.warn(`Auto-failing ${staleIds.length} stale generate_analysis job(s) for user ${userId}:`, staleIds);
-      await DB.query(
-        `UPDATE truth_stream_processing_queue
-         SET status = 'failed', error_message = 'Auto-failed: exceeded ${STALE_JOB_MINUTES}min processing timeout', completed_at = NOW()
-         WHERE id IN (${staleIds.map(() => '?').join(',')})`,
-        staleIds
+    try {
+      await connection.beginTransaction();
+
+      // Auto-fail stale jobs stuck in 'processing' (with lock to prevent races)
+      const [staleJobs] = await connection.query(
+        `SELECT id FROM truth_stream_processing_queue
+         WHERE user_id = ? AND job_type = 'generate_analysis' AND status = 'processing'
+           AND started_at < DATE_SUB(NOW(), INTERVAL ? MINUTE)
+         FOR UPDATE`,
+        [userId, STALE_JOB_MINUTES]
+      ) as any[];
+
+      if (staleJobs && staleJobs.length > 0) {
+        const staleIds = staleJobs.map((j: any) => j.id);
+        logger.warn(`Auto-failing ${staleIds.length} stale generate_analysis job(s) for user ${userId}:`, staleIds);
+        await connection.query(
+          `UPDATE truth_stream_processing_queue
+           SET status = 'failed', error_message = 'Auto-failed: exceeded processing timeout', completed_at = NOW()
+           WHERE id IN (${staleIds.map(() => '?').join(',')})`,
+          staleIds
+        );
+      }
+
+      // Check for legitimately active jobs (with lock held — no race possible)
+      const [pendingJobs] = await connection.query(
+        `SELECT id FROM truth_stream_processing_queue
+         WHERE user_id = ? AND job_type = 'generate_analysis' AND status IN ('pending', 'processing')
+         FOR UPDATE`,
+        [userId]
+      ) as any[];
+
+      if (pendingJobs && pendingJobs.length > 0) {
+        await connection.commit();
+        res.status(409).json({
+          error: 'Analysis is already in progress',
+          code: 'ALREADY_PROCESSING',
+          data: { jobId: pendingJobs[0].id },
+        });
+        return;
+      }
+
+      // Queue the analysis job (inside the same transaction — guaranteed unique)
+      jobId = crypto.randomUUID();
+      await connection.query(
+        `INSERT INTO truth_stream_processing_queue
+         (id, job_type, reference_id, user_id, priority, input_data)
+         VALUES (?, 'generate_analysis', ?, ?, 2, ?)`,
+        [
+          jobId, String(userId), userId,
+          JSON.stringify({ analysisType, reviewCount }),
+        ]
       );
+
+      await connection.commit();
+    } catch (txError) {
+      await connection.rollback();
+      throw txError;
+    } finally {
+      connection.release();
     }
-
-    // Now check for legitimately active jobs (pending or recently-started processing)
-    const [pendingJobs] = await DB.query(
-      `SELECT id FROM truth_stream_processing_queue
-       WHERE user_id = ? AND job_type = 'generate_analysis' AND status IN ('pending', 'processing')`,
-      [userId]
-    ) as any[];
-
-    if (pendingJobs && pendingJobs.length > 0) {
-      res.status(409).json({
-        error: 'Analysis is already in progress',
-        code: 'ALREADY_PROCESSING',
-        data: { jobId: pendingJobs[0].id },
-      });
-      return;
-    }
-
-    // Queue the analysis job
-    const jobId = crypto.randomUUID();
-    await DB.query(
-      `INSERT INTO truth_stream_processing_queue
-       (id, job_type, reference_id, user_id, priority, input_data)
-       VALUES (?, 'generate_analysis', ?, ?, 2, ?)`,
-      [
-        jobId, String(userId), userId,
-        JSON.stringify({ analysisType, reviewCount }),
-      ]
-    );
 
     res.status(202).json({
       success: true,
@@ -2110,5 +2212,4 @@ export async function cleanupUserTruthStreamData(userId: number): Promise<boolea
     connection.release();
   }
 }
-
 

@@ -689,11 +689,11 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
   async notifyTruthStreamDialogueMessage(
     userId: number,
     reviewId: string,
-    authorRole: string
+    recipientView: string
   ): Promise<boolean> {
     return this.sendNotification('ts_dialogue_message', String(userId), {
       reviewId,
-      authorRole,
+      recipientView,
     });
   }
 

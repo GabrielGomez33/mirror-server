@@ -1,4 +1,5 @@
 // middleware/authMiddleware.ts
+// UPDATED: Fixed CSP, HSTS enforcement, Redis-ready rate limiting, re-enabled account locking
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { DB } from '../db';
@@ -44,7 +45,15 @@ export enum SecurityLevel {
   ADMIN = 5         // Admin privileges required
 }
 
-// Rate limiting store (in production, use Redis)
+// ============================================================================
+// RATE LIMITING
+// ============================================================================
+// In-memory rate limiting store.
+// For multi-instance deployments, migrate to Redis using:
+//   const key = `ratelimit:${identifier}:${Math.floor(Date.now() / windowMs)}`;
+//   const count = await redis.incr(key);
+//   await redis.expire(key, Math.ceil(windowMs / 1000));
+// ============================================================================
 const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
 
 class AuthMiddleware {
@@ -52,7 +61,7 @@ class AuthMiddleware {
   static verifyToken = async (req: Request, res: Response, next: NextFunction) => {
     try {
       const authHeader = req.headers.authorization;
-      
+
       if (!authHeader?.startsWith('Bearer ')) {
         return res.status(401).json({
           error: 'No token provided.',
@@ -61,10 +70,18 @@ class AuthMiddleware {
       }
 
       const token = authHeader.substring(7);
-      
+
+      // Basic token format validation before verification
+      if (token.length > 2048 || token.split('.').length !== 3) {
+        return res.status(401).json({
+          error: 'Invalid token format.',
+          code: 'INVALID_TOKEN_FORMAT'
+        });
+      }
+
       // Verify and decode token
       const decoded = TokenManager.verifyAccessToken(token);
-      
+
       // Validate session exists and is active
       const isValidSession = await TokenManager.validateSession(decoded.id, decoded.sessionId);
       if (!isValidSession) {
@@ -75,11 +92,11 @@ class AuthMiddleware {
       }
 
       // Check if user account is locked
-      /*const [userRows] = await DB.query(
+      const [userRows] = await DB.query(
         'SELECT account_locked, locked_until, email_verified FROM users WHERE id = ?',
         [decoded.id]
       );
-      
+
       const user = (userRows as any[])[0];
       if (!user) {
         return res.status(401).json({
@@ -90,11 +107,11 @@ class AuthMiddleware {
 
       if (user.account_locked) {
         const now = new Date();
-        const lockUntil = new Date(user.locked_until);
-        
-        if (lockUntil > now) {
+        const lockUntil = user.locked_until ? new Date(user.locked_until) : null;
+
+        if (lockUntil && lockUntil > now) {
           return res.status(423).json({
-            error: 'Account is locked.',
+            error: 'Account is temporarily locked.',
             code: 'ACCOUNT_LOCKED',
             lockedUntil: lockUntil.toISOString()
           });
@@ -105,7 +122,7 @@ class AuthMiddleware {
             [decoded.id]
           );
         }
-      }*/
+      }
 
       // Set user context
       req.user = {
@@ -117,14 +134,17 @@ class AuthMiddleware {
 
       // Set security context
       req.securityContext = {
-        ipAddress: (req.ip || req.connection.remoteAddress || 'Unknown').replace('::ffff:', ''),
+        ipAddress: (req.ip || req.connection?.remoteAddress || 'Unknown').replace('::ffff:', ''),
         userAgent: req.headers['user-agent'] || 'Unknown',
         tier: 'tier1' // Default tier, can be elevated by other middleware
       };
 
       next();
     } catch (error: any) {
-      console.error('[AUTH MIDDLEWARE ERROR]', error);
+      // Don't expose internal error details
+      if (process.env.NODE_ENV !== 'production') {
+        console.error('[AUTH MIDDLEWARE ERROR]', error);
+      }
       return res.status(401).json({
         error: 'Invalid token.',
         code: 'INVALID_TOKEN'
@@ -146,7 +166,7 @@ class AuthMiddleware {
         'SELECT email_verified FROM users WHERE id = ?',
         [req.user.id]
       );
-      
+
       const user = (userRows as any[])[0];
       if (!user?.email_verified) {
         return res.status(403).json({
@@ -157,7 +177,9 @@ class AuthMiddleware {
 
       next();
     } catch (error) {
-      console.error('[EMAIL VERIFICATION CHECK ERROR]', error);
+      if (process.env.NODE_ENV !== 'production') {
+        console.error('[EMAIL VERIFICATION CHECK ERROR]', error);
+      }
       return res.status(500).json({
         error: 'Verification check failed.',
         code: 'VERIFICATION_CHECK_FAILED'
@@ -166,15 +188,16 @@ class AuthMiddleware {
   };
 
   // Rate limiting middleware
+  // NOTE: For multi-instance deployments, migrate this to Redis (see comment above rateLimitStore)
   static rateLimit = (maxRequests: number, windowMs: number) => {
     return (req: Request, res: Response, next: NextFunction) => {
-      const identifier = req.user?.id ? 
-        `user_${req.user.id}` : 
-        req.securityContext?.ipAddress || 'unknown';
-      
+      const identifier = req.user?.id ?
+        `user_${req.user.id}` :
+        req.securityContext?.ipAddress || req.ip || 'unknown';
+
       const now = Date.now();
       const windowStart = now - windowMs;
-      
+
       // Get or create rate limit entry
       let limitData = rateLimitStore.get(identifier);
       if (!limitData || limitData.resetTime < windowStart) {
@@ -205,7 +228,7 @@ class AuthMiddleware {
 
       // Increment counter
       limitData.count++;
-      
+
       // Set rate limit headers
       res.setHeader('X-RateLimit-Limit', maxRequests);
       res.setHeader('X-RateLimit-Remaining', Math.max(0, maxRequests - limitData.count));
@@ -232,7 +255,7 @@ class AuthMiddleware {
             'SELECT email_verified, privacy_level FROM users WHERE id = ?',
             [req.user.id]
           );
-          
+
           const user = (userRows as any[])[0];
           if (!user?.email_verified) {
             return res.status(403).json({
@@ -246,8 +269,8 @@ class AuthMiddleware {
         if (tier === 'tier3') {
           // Check for suspicious activity in the last hour
           const [suspiciousActivity] = await DB.query(`
-            SELECT COUNT(*) as count FROM security_events 
-            WHERE user_id = ? 
+            SELECT COUNT(*) as count FROM security_events
+            WHERE user_id = ?
             AND event_type IN ('suspicious_login_attempt', 'suspicious_data_access_pattern')
             AND created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)
           `, [req.user.id]);
@@ -276,7 +299,7 @@ class AuthMiddleware {
         // Log data access attempt
         await DB.query(`
           INSERT INTO data_access_log (
-            user_id, accessed_by, data_tier, file_path, access_type, 
+            user_id, accessed_by, data_tier, file_path, access_type,
             access_reason, ip_address, user_agent, session_id
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `, [
@@ -293,7 +316,9 @@ class AuthMiddleware {
 
         next();
       } catch (error) {
-        console.error('[TIER ACCESS CHECK ERROR]', error);
+        if (process.env.NODE_ENV !== 'production') {
+          console.error('[TIER ACCESS CHECK ERROR]', error);
+        }
         return res.status(500).json({
           error: 'Access check failed.',
           code: 'ACCESS_CHECK_FAILED'
@@ -316,7 +341,7 @@ class AuthMiddleware {
         'SELECT role FROM users WHERE id = ? AND role = "admin"',
         [req.user.id]
       );
-      
+
       if ((adminRows as any[]).length === 0) {
         // Log unauthorized admin access attempt
         await SecurityMonitor.logSecurityEvent(req.user.id, 'unauthorized_admin_access', {
@@ -333,7 +358,9 @@ class AuthMiddleware {
 
       next();
     } catch (error) {
-      console.error('[ADMIN CHECK ERROR]', error);
+      if (process.env.NODE_ENV !== 'production') {
+        console.error('[ADMIN CHECK ERROR]', error);
+      }
       return res.status(500).json({
         error: 'Admin check failed.',
         code: 'ADMIN_CHECK_FAILED'
@@ -387,7 +414,7 @@ class AuthMiddleware {
       if (req.user) {
         try {
           await DB.query(`
-            INSERT INTO activity_logs (user_id, action, details, ip_address, user_agent, session_id) 
+            INSERT INTO activity_logs (user_id, action, details, ip_address, user_agent, session_id)
             VALUES (?, ?, ?, ?, ?, ?)
           `, [
             req.user.id,
@@ -403,8 +430,10 @@ class AuthMiddleware {
             req.user.sessionId
           ]);
         } catch (error) {
-          console.error('[ACTIVITY LOGGING ERROR]', error);
           // Don't block the request if logging fails
+          if (process.env.NODE_ENV !== 'production') {
+            console.error('[ACTIVITY LOGGING ERROR]', error);
+          }
         }
       }
       next();
@@ -412,29 +441,16 @@ class AuthMiddleware {
   };
 
   // Security headers middleware
+  // NOTE: This is now SUPPLEMENTARY to Helmet.js configured in index.ts.
+  // Helmet provides the primary security headers. This middleware adds
+  // any custom headers not covered by Helmet's configuration.
   static securityHeaders = (req: Request, res: Response, next: NextFunction) => {
-    // Set security headers
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('X-XSS-Protection', '1; mode=block');
+    // Additional security headers beyond Helmet defaults
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
-    
-    // HSTS header for HTTPS
-    if (req.secure || req.headers['x-forwarded-proto'] === 'https') {
-      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
-    }
-    
-    // CSP header
-    res.setHeader('Content-Security-Policy', 
-      "default-src 'self'; " +
-      "script-src 'self' 'unsafe-inline' 'unsafe-eval'; " +
-      "style-src 'self' 'unsafe-inline'; " +
-      "img-src 'self' data: https:; " +
-      "font-src 'self' https:; " +
-      "connect-src 'self'; " +
-      "frame-ancestors 'none';"
-    );
+
+    // HSTS is now always set via Helmet in index.ts (not conditional)
+    // CSP is now set via Helmet in index.ts (without unsafe-inline/unsafe-eval in script-src)
 
     next();
   };
@@ -451,4 +467,3 @@ setInterval(() => {
 }, 60000); // Clean up every minute
 
 export default AuthMiddleware;
-//export { SecurityLevel };
