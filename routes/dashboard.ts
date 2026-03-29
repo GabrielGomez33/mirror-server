@@ -159,14 +159,15 @@ function extractCompletePersonalityData(intakeData: any): any {
 }
 
 function extractCompleteAstrologicalData(intakeData: any): any {
-  if (!intakeData?.astrologicalData) {
+  const astroData = intakeData?.astrologicalResult || intakeData?.astrologicalData;
+  if (!astroData) {
     return {
       available: false,
       message: 'Complete astrological assessment to unlock cosmic analysis'
     };
   }
 
-  const astrology = intakeData.astrologicalData;
+  const astrology = astroData;
   console.log(`🌟 Extracting complete astrological data:`, Object.keys(astrology));
 
   return {
@@ -250,11 +251,16 @@ function extractCompleteVoiceData(intakeData: any): any {
 }
 
 function extractAssessmentMetadata(intakeData: any): any {
+  // Determine completion date: try voiceFileRef.uploadedAt or photoFileRef timestamp as fallback
+  const completionDate = intakeData.voiceFileRef?.uploadedAt
+    || intakeData.photoFileRef?.uploadedAt
+    || null;
+
   return {
-    completionDate: intakeData.submissionDate || new Date(),
+    completionDate: completionDate || null,
     sectionsCompleted: {
       personality: !!intakeData.personalityResult,
-      astrology: !!intakeData.astrologicalData,
+      astrology: !!(intakeData.astrologicalResult || intakeData.astrologicalData),
       cognitive: !!intakeData.iqResults,
       emotional: !!intakeData.faceAnalysis,
       voice: !!intakeData.voiceMetadata
@@ -311,7 +317,7 @@ function assessVoiceQuality(voice: any): string {
 function calculateCompletionPercentage(intakeData: any): number {
   const sections = [
     intakeData.personalityResult,
-    intakeData.astrologicalData,
+    intakeData.astrologicalResult || intakeData.astrologicalData,
     intakeData.iqResults,
     intakeData.faceAnalysis,
     intakeData.voiceMetadata
@@ -354,7 +360,7 @@ function buildSimplePersonalitySnapshot(intakeData: any): any {
   }
 
   const personality = intakeData.personalityResult || {};
-  const astrology = intakeData.astrologicalData || {};
+  const astrology = intakeData.astrologicalResult || {};
   const face = intakeData.faceAnalysis || {};
   const iq = intakeData.iqResults || {};
 
@@ -430,15 +436,7 @@ async function getAIInsightsFromDINA(userId: string, req: any): Promise<any[]> {
 
 function formatLiveInsights(insights: any[]): any[] {
   if (!insights || insights.length === 0) {
-    return [{
-      id: 'welcome_insight',
-      text: 'Complete your Mirror assessment to unlock personalized AI insights.',
-      category: 'welcome',
-      confidence: 1.0,
-      timestamp: new Date(),
-      sourceModalities: ['system'],
-      actionable: 'Visit the intake section to begin your assessment'
-    }];
+    return [];
   }
 
   return insights.slice(0, 5).map((insight, index) => ({

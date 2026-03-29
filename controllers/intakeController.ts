@@ -421,6 +421,8 @@ export class IntakeDataManager {
                 intakeData.personalityAnswers = componentData.data.personalityAnswers;
               } else if (component.key === 'voiceMetadata') {
                 intakeData.voiceMetadata = componentData.data;
+              } else if (component.key === 'astrologicalData') {
+                intakeData.astrologicalResult = componentData.data;
               } else {
                 (intakeData as any)[component.key] = componentData.data;
               }

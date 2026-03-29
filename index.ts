@@ -57,6 +57,11 @@ import { chatMessageManager } from './managers/ChatMessageManager';
 import truthstreamRoutes from './routes/truthstream';
 
 // ============================================================================
+// PERSONAL ANALYSIS (MyMirror Comprehensive Reports)
+// ============================================================================
+import personalAnalysisRouter from './routes/personalAnalysis';
+
+// ============================================================================
 // MIRRORGROUPS PHASE 3 (Group Analysis System)
 // ============================================================================
 import { groupAnalyzer } from './analyzers/GroupAnalyzer';
@@ -289,6 +294,13 @@ console.log('[ROUTES] MirrorGroups Chat routes mounted at /mirror/api/groups/:gr
 
 APP.use('/mirror/api/truthstream', truthstreamRoutes);
 console.log('[ROUTES] TruthStream routes mounted at /mirror/api/truthstream');
+
+// ============================================================================
+// MOUNT PERSONAL ANALYSIS ROUTES
+// ============================================================================
+
+APP.use('/mirror/api/personal-analysis', personalAnalysisRouter);
+console.log('[ROUTES] Personal Analysis routes mounted at /mirror/api/personal-analysis');
 
 // ============================================================================
 // @DINA CHAT - Processor runs as SEPARATE PROCESS (via PM2/systemd)
