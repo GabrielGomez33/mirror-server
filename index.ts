@@ -1,6 +1,6 @@
-// index.ts - Mirror Server with MirrorGroups Phase 3.5 Integration + @Dina Chat + TruthStream
-// Includes: Existing routes, Redis, Notifications, Encryption, Group APIs, WebSocket signaling, Group Analysis, DINA LLM, @Dina Chat, TruthStream
-// UPDATED: Added Helmet.js, CORS, request size limits, security headers middleware
+// index.ts - Mirror Server with MirrorGroups Phase 3.5 Integration + @Dina Chat + TruthStream + Paywall
+// Includes: Existing routes, Redis, Notifications, Encryption, Group APIs, WebSocket signaling, Group Analysis, DINA LLM, @Dina Chat, TruthStream, Subscription/Paywall
+// UPDATED: Added Paywall system with PayPal subscriptions, email service, subscription routes
 
 import https from 'https';
 import fs from 'fs';
@@ -90,6 +90,16 @@ import { dinaWebSocket } from './services/DinaWebSocketClient';
 import AuthMiddleware from './middleware/authMiddleware';
 
 // ============================================================================
+// PAYWALL SYSTEM (Subscription, PayPal, Email, Feature Gating)
+// ============================================================================
+import { loadPaywallConfig } from './paywall/paywall.config';
+import { PayPalProvider } from './paywall/providers/paypal.provider';
+import { SubscriptionService } from './paywall/services/subscription.service';
+import { createPayPalWebhookRouter } from './paywall/webhooks/paypal.webhooks';
+import { createSubscriptionRoutes } from './routes/subscriptionRoutes';
+import { emailService } from './services/emailService';
+
+// ============================================================================
 // ERROR HANDLING UTILITIES
 // ============================================================================
 
@@ -163,6 +173,24 @@ if (process.env.SYSTEM_MASTER_KEY!.length !== 64) {
 }
 
 console.log('[STARTUP] All required environment variables validated');
+
+// ============================================================================
+// PAYWALL INITIALIZATION
+// ============================================================================
+
+const paywallConfig = loadPaywallConfig();
+const paypalProvider = paywallConfig.paypal.clientId
+  ? new PayPalProvider(paywallConfig)
+  : null;
+const subscriptionService = new SubscriptionService(paywallConfig, paypalProvider);
+
+// Wire subscription gating into AuthMiddleware (umbrella approach — no route file changes needed)
+AuthMiddleware.setSubscriptionService(subscriptionService);
+AuthMiddleware.setSubscriptionGateRules(
+  AuthMiddleware.buildGateRulesFromConfig(paywallConfig.gates)
+);
+
+console.log(`[STARTUP] Paywall system initialized (provider: ${paywallConfig.provider}, mode: ${paywallConfig.mode})`);
 
 // ============================================================================
 // EXPRESS APP SETUP
@@ -256,22 +284,39 @@ APP.use(((req, res, next) => {
 }) as express.RequestHandler);
 
 // ============================================================================
+// PAYPAL WEBHOOKS (mounted BEFORE auth — PayPal cannot authenticate as a user)
+// ============================================================================
+
+if (paypalProvider) {
+  APP.use(
+    paywallConfig.webhookPath,
+    createPayPalWebhookRouter(paypalProvider, subscriptionService)
+  );
+  console.log(`[ROUTES] PayPal webhooks mounted at ${paywallConfig.webhookPath}`);
+}
+
+// ============================================================================
 // MOUNT EXISTING ROUTES
 // ============================================================================
 
+// Auth routes — no subscription gate (user needs to log in first)
 APP.use('/mirror/api/auth', authRoutes);
-APP.use('/mirror/api/user', userRoutes);
+
+// All other authenticated routes — subscription gate applied as umbrella
+// This single middleware intercepts all requests and checks subscription tier
+// against the gate rules defined in .payenv. Zero changes to individual route files.
+APP.use('/mirror/api/user', AuthMiddleware.subscriptionGate as express.RequestHandler, userRoutes);
 APP.use('/mirror/api/storage', storageRoutes);
 APP.use('/mirror/api/debug', debugRoutes);
 APP.use('/mirror/api/intake', intakeRoutes);
 APP.use('/mirror/api/dashboard', dashboardRoutes);
-APP.use('/mirror/api/journal', journalRoutes);
+APP.use('/mirror/api/journal', AuthMiddleware.subscriptionGate as express.RequestHandler, journalRoutes);
 
 // ============================================================================
 // MOUNT MIRRORGROUPS ROUTES (PHASE 1 + PHASE 3 + PHASE 4)
 // ============================================================================
 
-APP.use('/mirror/api/groups', groupRoutes);
+APP.use('/mirror/api/groups', AuthMiddleware.subscriptionGate as express.RequestHandler, groupRoutes);
 console.log('[ROUTES] MirrorGroups routes mounted at /mirror/api/groups');
 
 APP.use('/mirror/api', groupInsightsRoutes);
@@ -292,15 +337,25 @@ console.log('[ROUTES] MirrorGroups Chat routes mounted at /mirror/api/groups/:gr
 // MOUNT TRUTHSTREAM ROUTES
 // ============================================================================
 
-APP.use('/mirror/api/truthstream', truthstreamRoutes);
+APP.use('/mirror/api/truthstream', AuthMiddleware.subscriptionGate as express.RequestHandler, truthstreamRoutes);
 console.log('[ROUTES] TruthStream routes mounted at /mirror/api/truthstream');
 
 // ============================================================================
 // MOUNT PERSONAL ANALYSIS ROUTES
 // ============================================================================
 
-APP.use('/mirror/api/personal-analysis', personalAnalysisRouter);
+APP.use('/mirror/api/personal-analysis', AuthMiddleware.subscriptionGate as express.RequestHandler, personalAnalysisRouter);
 console.log('[ROUTES] Personal Analysis routes mounted at /mirror/api/personal-analysis');
+
+// ============================================================================
+// MOUNT SUBSCRIPTION ROUTES (Paywall)
+// ============================================================================
+
+APP.use('/mirror/api/subscription',
+  AuthMiddleware.verifyToken as express.RequestHandler,
+  createSubscriptionRoutes(paywallConfig, subscriptionService, paypalProvider)
+);
+console.log('[ROUTES] Subscription routes mounted at /mirror/api/subscription');
 
 // ============================================================================
 // @DINA CHAT - Processor runs as SEPARATE PROCESS (via PM2/systemd)
@@ -321,9 +376,12 @@ APP.get('/mirror/api/health', async (req, res) => {
     status: 'healthy',
     service: 'mirror-server',
     timestamp: new Date().toISOString(),
-    version: '3.8.0', // Bumped for security hardening
+    version: '4.0.0', // Bumped for paywall system
     features: {
       authentication: 'enabled',
+      paywall: paywallConfig.provider ? 'enabled' : 'disabled',
+      subscriptions: paypalProvider ? 'paypal_active' : 'not_configured',
+      email: emailService.isEnabled() ? 'enabled' : 'disabled',
       redis: mirrorRedis.isConnected() ? 'connected' : 'disconnected',
       notifications: 'enabled',
       encryption: 'enabled',
@@ -429,6 +487,8 @@ APP.get('/mirror/api/health', async (req, res) => {
       sessions: '/mirror/api/groups/:groupId/sessions/:sessionId',
       chat: '/mirror/api/groups/:groupId/chat',
       truthstream: '/mirror/api/truthstream/*',
+      subscription: '/mirror/api/subscription',
+      paywallWebhooks: paywallConfig.webhookPath,
       websocket: 'wss://theundergroundrailroad.world:8444/mirror/groups/ws',
       chatWebsocket: 'wss://theundergroundrailroad.world:8444/mirror/groups/chat'
     }
@@ -743,6 +803,55 @@ async function startServer(): Promise<void> {
     // Setup graceful shutdown handlers
     setupGracefulShutdown(httpsServer);
 
+    // ========================================================================
+    // PAYWALL CRON JOBS
+    // ========================================================================
+
+    // Check expired trials and grace periods every hour
+    setInterval(async () => {
+      try {
+        const trials = await subscriptionService.checkAndExpireTrials();
+        const grace = await subscriptionService.checkAndExpireGracePeriods();
+        if (trials > 0 || grace > 0) {
+          console.log(`[PAYWALL CRON] Expired ${trials} trials, ${grace} grace periods`);
+        }
+      } catch (error) {
+        logError('[PAYWALL CRON] Expiry check error', error);
+      }
+    }, 60 * 60 * 1000); // Every hour
+
+    // Send trial ending notifications daily
+    setInterval(async () => {
+      try {
+        const sent = await subscriptionService.sendTrialEndingNotifications();
+        if (sent > 0) {
+          console.log(`[PAYWALL CRON] Sent ${sent} trial ending notifications`);
+        }
+      } catch (error) {
+        logError('[PAYWALL CRON] Trial notification error', error);
+      }
+    }, 24 * 60 * 60 * 1000); // Every 24 hours
+
+    // Expire old cancelled subscriptions weekly
+    setInterval(async () => {
+      try {
+        await subscriptionService.expireCancelledSubscriptions();
+      } catch (error) {
+        logError('[PAYWALL CRON] Cancellation expiry error', error);
+      }
+    }, 7 * 24 * 60 * 60 * 1000); // Every 7 days
+
+    // Process queued emails every 30 seconds
+    setInterval(async () => {
+      try {
+        await emailService.processQueue();
+      } catch (error) {
+        logError('[EMAIL QUEUE] Processing error', error);
+      }
+    }, 30000);
+
+    console.log('[STARTUP] Paywall cron jobs and email queue processor started');
+
     // Start listening
     const PORT = parseInt(process.env.MIRRORPORT || '8444');
     httpsServer.listen(PORT, () => {
@@ -753,6 +862,9 @@ async function startServer(): Promise<void> {
       console.log(`  Base URL: https://theundergroundrailroad.world:${PORT}`);
       console.log(`  Health: https://theundergroundrailroad.world:${PORT}/mirror/api/health`);
       console.log(`  Security: Helmet + CORS + CSP + HSTS + Size Limits`);
+      console.log(`  Paywall: ${paywallConfig.provider} (${paywallConfig.mode})`);
+      console.log(`  PayPal: ${paypalProvider ? 'configured' : 'not configured'}`);
+      console.log(`  Email: ${emailService.isEnabled() ? 'enabled' : 'disabled'}`);
       console.log(`  DINA WS: ${dinaWebSocket.connected ? 'CONNECTED' : 'DISCONNECTED (will retry)'}`);
       console.log(`  Model: ${process.env.DEFAULT_MODEL || 'mistral:7b'}`);
       console.log('='.repeat(70));

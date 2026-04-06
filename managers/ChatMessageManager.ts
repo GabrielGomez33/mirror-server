@@ -224,6 +224,53 @@ export class ChatMessageManager extends EventEmitter {
   }
 
   // ============================================================================
+  // ANONYMOUS GROUP ALIAS SUPPORT
+  // ============================================================================
+
+  /**
+   * Check if a group is anonymous and build alias map if so.
+   * Returns null if the group is not anonymous.
+   */
+  private async getAnonymousAliasMap(groupId: string): Promise<Map<number, string> | null> {
+    try {
+      const [groupRows] = await DB.query(
+        `SELECT type FROM mirror_groups WHERE id = ?`,
+        [groupId]
+      );
+      if ((groupRows as any[])[0]?.type !== 'anonymous') return null;
+
+      const [memberRows] = await DB.query(
+        `SELECT user_id, joined_at FROM mirror_group_members
+         WHERE group_id = ? AND status = 'active'
+         ORDER BY joined_at ASC`,
+        [groupId]
+      );
+
+      const aliasMap = new Map<number, string>();
+      (memberRows as any[]).forEach((row: any, index: number) => {
+        aliasMap.set(row.user_id, `Member ${index + 1}`);
+      });
+
+      return aliasMap;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Resolve a sender's display name for a given group.
+   * Returns alias for anonymous groups, real username otherwise.
+   */
+  private resolveDisplayName(
+    senderUserId: number,
+    realUsername: string,
+    aliasMap: Map<number, string> | null
+  ): string {
+    if (!aliasMap) return realUsername;
+    return aliasMap.get(senderUserId) || 'Member';
+  }
+
+  // ============================================================================
   // INITIALIZATION
   // ============================================================================
 
@@ -359,7 +406,11 @@ export class ChatMessageManager extends EventEmitter {
         'SELECT username FROM users WHERE id = ?',
         [input.senderUserId]
       );
-      const senderUsername = (userRows as any[])[0]?.username || 'Unknown';
+      const realUsername = (userRows as any[])[0]?.username || 'Unknown';
+
+      // Resolve display name (alias for anonymous groups)
+      const aliasMap = await this.getAnonymousAliasMap(input.groupId);
+      const senderUsername = this.resolveDisplayName(input.senderUserId, realUsername, aliasMap);
 
       // Create message object
       const message: ChatMessage = {
@@ -567,6 +618,9 @@ export class ChatMessageManager extends EventEmitter {
         messageRows.pop(); // Remove the extra row
       }
 
+      // Build anonymous alias map if applicable (once for all messages)
+      const msgAliasMap = await this.getAnonymousAliasMap(groupId);
+
       // Decrypt and process messages
       const messages: ChatMessage[] = await Promise.all(
         messageRows.map(async (row) => {
@@ -582,7 +636,7 @@ export class ChatMessageManager extends EventEmitter {
               id: row.id,
               groupId: row.group_id,
               senderUserId: row.sender_user_id,
-              senderUsername: row.sender_username,
+              senderUsername: this.resolveDisplayName(row.sender_user_id, row.sender_username, msgAliasMap),
               content: decryptedContent,
               contentType: row.content_type,
               parentMessageId: row.parent_message_id,

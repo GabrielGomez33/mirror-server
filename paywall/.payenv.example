@@ -1,0 +1,71 @@
+# ============================================================================
+# UNIVERSAL PAYWALL CONFIGURATION
+# ============================================================================
+# This file configures the paywall module for any Express-based application.
+# Copy this file to .payenv and fill in your values.
+# NEVER commit .payenv to version control — add it to .gitignore.
+# ============================================================================
+
+# === PROVIDER CONFIGURATION ===
+# Which payment provider to use: paypal | stripe
+PAYWALL_PROVIDER=paypal
+
+# Environment mode: sandbox (testing) | live (production)
+PAYWALL_MODE=sandbox
+
+# === PAYPAL CREDENTIALS ===
+# Get these from https://developer.paypal.com/dashboard/applications
+PAYPAL_CLIENT_ID=your_paypal_client_id_here
+PAYPAL_CLIENT_SECRET=your_paypal_client_secret_here
+
+# PayPal Webhook ID — created in the PayPal developer dashboard
+# Used to verify webhook signatures
+PAYPAL_WEBHOOK_ID=your_paypal_webhook_id_here
+
+# === PRODUCT DEFINITION ===
+# Unique identifier for this product (used in PayPal plan creation)
+PAYWALL_PRODUCT_ID=mirror-app
+PAYWALL_PRODUCT_NAME=Mirror Premium
+
+# === TIER DEFINITIONS (JSON) ===
+# Define your subscription tiers. Each tier has:
+#   id: unique tier identifier (matches database ENUM)
+#   name: display name
+#   price: monthly price in USD (0 for free)
+#   paypal_plan_id: PayPal billing plan ID (created via setup script or API)
+#   trial_days: number of trial days (0 for no trial)
+#   features: array of feature keys this tier grants access to
+PAYWALL_TIERS=[{"id":"free","name":"Free","price":0,"features":["basic_intake","limited_journal","join_one_group","give_reviews","basic_dashboard","group_chat","basic_insights"]},{"id":"premium","name":"Premium","price":9.99,"paypal_plan_id":"","trial_days":7,"features":["full_intake","unlimited_journal","journal_analysis","personal_analysis","create_groups","unlimited_groups","group_insights","receive_reviews","truth_mirror_report","dina_unlimited","data_export","basic_intake","limited_journal","join_one_group","give_reviews","basic_dashboard","group_chat","basic_insights"]},{"id":"enterprise","name":"Enterprise","price":0,"paypal_plan_id":"","trial_days":0,"features":[]}]
+
+# === FEATURE GATING ===
+# Map feature keys to the minimum tier required.
+# Any feature not listed here is available to all tiers.
+PAYWALL_GATES={"journal_analysis":"premium","personal_analysis":"premium","create_group":"premium","group_insights":"premium","truth_mirror_report":"premium","receive_reviews":"premium","dina_unlimited":"premium","data_export":"premium","unlimited_journal":"premium","unlimited_groups":"premium","full_intake_rerun":"premium"}
+
+# === FREE TIER USAGE LIMITS ===
+# Enforce numeric limits for free-tier users. Premium users bypass all limits.
+# Format: {"feature_key": max_count, ...}
+PAYWALL_FREE_LIMITS={"journal_entries_per_month":5,"groups_joined":1,"dina_queries_per_day":3}
+
+# === TRIAL CONFIGURATION ===
+# Enable automatic free trial of premium tier for new users
+PAYWALL_TRIAL_ENABLED=true
+PAYWALL_TRIAL_DAYS=7
+PAYWALL_TRIAL_TIER=premium
+
+# === GRACE PERIOD ===
+# Days to wait after a failed payment before downgrading the user
+PAYWALL_GRACE_PERIOD_DAYS=5
+
+# === WEBHOOK PATH ===
+# The URL path where payment provider webhooks will be received
+# This is relative to your server's base URL
+PAYWALL_WEBHOOK_PATH=/mirror/api/paywall/webhooks
+
+# === CURRENCY ===
+PAYWALL_CURRENCY=USD
+
+# === APP URLS (for PayPal redirects) ===
+# Where to redirect users after PayPal approval/cancellation
+PAYWALL_RETURN_URL=https://www.theundergroundrailroad.world/Mirror/dashboard?subscription=success
+PAYWALL_CANCEL_URL=https://www.theundergroundrailroad.world/Mirror/dashboard?subscription=cancelled
