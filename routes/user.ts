@@ -7,6 +7,7 @@ import {
 	deleteUserHandler,
 	searchUsersHandler
 } from '../controllers/userController';
+import { exportUserData } from '../controllers/exportController';
 import AuthMiddleware from '../middleware/authMiddleware';
 
 const router = express.Router();
@@ -16,6 +17,7 @@ const verified = AuthMiddleware.verifyToken as unknown as RequestHandler;
 
 // Protected routes (require authentication)
 router.get('/search', verified, searchUsersHandler);
+router.get('/export', verified, exportUserData as unknown as RequestHandler);
 
 // Other routes
 router.post('/update-password', updateUserPasswordHandler);

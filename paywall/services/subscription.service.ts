@@ -667,21 +667,23 @@ export class SubscriptionService {
 
     let trialDaysLeft: number | null = null;
     if (sub.status === 'trialing' && sub.trialEnd) {
+      const trialEndMs = sub.trialEnd instanceof Date ? sub.trialEnd.getTime() : new Date(sub.trialEnd).getTime();
       trialDaysLeft = Math.max(0, Math.ceil(
-        (sub.trialEnd.getTime() - Date.now()) / (24 * 60 * 60 * 1000)
+        (trialEndMs - Date.now()) / (24 * 60 * 60 * 1000)
       ));
     }
 
     let graceDaysLeft: number | null = null;
     if (sub.status === 'past_due' && sub.gracePeriodEnd) {
+      const graceEndMs = sub.gracePeriodEnd instanceof Date ? sub.gracePeriodEnd.getTime() : new Date(sub.gracePeriodEnd).getTime();
       graceDaysLeft = Math.max(0, Math.ceil(
-        (sub.gracePeriodEnd.getTime() - Date.now()) / (24 * 60 * 60 * 1000)
+        (graceEndMs - Date.now()) / (24 * 60 * 60 * 1000)
       ));
     }
 
     let accessUntil: Date | null = null;
     if (sub.status === 'cancelled' && sub.currentPeriodEnd) {
-      accessUntil = sub.currentPeriodEnd;
+      accessUntil = sub.currentPeriodEnd instanceof Date ? sub.currentPeriodEnd : new Date(sub.currentPeriodEnd);
     } else if (sub.status === 'trialing' && sub.trialEnd) {
       accessUntil = sub.trialEnd;
     } else if (sub.status === 'past_due' && sub.gracePeriodEnd) {
