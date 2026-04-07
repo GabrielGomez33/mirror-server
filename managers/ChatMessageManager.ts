@@ -335,11 +335,15 @@ export class ChatMessageManager extends EventEmitter {
       // Validate input
       await this.validateMessageInput(input);
 
-      // Check rate limiting
-      await this.checkRateLimit(input.senderUserId, input.groupId);
+      // Skip rate limit and membership check for Dina system user
+      const dinaUserId = parseInt(process.env.DINA_USER_ID_SQL || '59', 10);
+      if (input.senderUserId !== dinaUserId) {
+        // Check rate limiting
+        await this.checkRateLimit(input.senderUserId, input.groupId);
 
-      // Verify sender is a group member
-      await this.verifyGroupMembership(input.senderUserId, input.groupId);
+        // Verify sender is a group member
+        await this.verifyGroupMembership(input.senderUserId, input.groupId);
+      }
 
       // Generate message ID
       const messageId = uuidv4();
@@ -439,80 +443,117 @@ export class ChatMessageManager extends EventEmitter {
 
       // ========== @DINA CHAT INTEGRATION ==========
       // Check if message contains @Dina mention and queue for AI processing
-      console.log('\n' + '🔍'.repeat(20));
-      console.log('[DINA-CHECK] Checking message for @Dina mention...');
-      console.log(`  📝 Content: "${sanitizedContent.substring(0, 100)}${sanitizedContent.length > 100 ? '...' : ''}"`);
-      console.log(`  👤 Sender: ${senderUsername} (ID: ${input.senderUserId})`);
-      console.log(`  🏠 Group: ${input.groupId}`);
-      console.log('🔍'.repeat(20));
-
-      const hasDinaMention = DinaChatQueueProcessor.containsDinaMention(sanitizedContent);
-      console.log(`[DINA-CHECK] Has @Dina mention: ${hasDinaMention ? '✅ YES' : '❌ NO'}`);
+      // Skip detection for messages FROM Dina (prevents recursion on limit messages)
+      const hasDinaMention = input.senderUserId !== dinaUserId &&
+        DinaChatQueueProcessor.containsDinaMention(sanitizedContent);
 
       if (hasDinaMention) {
-        console.log('[DINA-CHECK] 🎯 @DINA MENTION DETECTED! Processing...');
         try {
           const dinaQuery = DinaChatQueueProcessor.extractDinaQuery(sanitizedContent);
-          console.log(`[DINA-CHECK] 📝 Extracted query: "${dinaQuery}"`);
-          console.log(`[DINA-CHECK] 📏 Query length: ${dinaQuery.length}`);
 
           if (dinaQuery.length > 0) {
-            console.log('[DINA-CHECK] ✅ Valid query, queuing for processing...');
-            const queueId = await DinaChatQueueProcessor.queueDinaMessage({
-              groupId: input.groupId,
-              userId: input.senderUserId,
-              username: senderUsername,
-              query: dinaQuery,
-              originalMessageId: messageId,
-              context: {
-                parentMessageId: input.parentMessageId,
-                contentType: input.contentType,
-                timestamp: now.toISOString(),
-              },
-              priority: 5,
-            });
+            // ---- FREE TIER USAGE LIMIT CHECK ----
+            let dinaBlocked = false;
 
-            console.log('\n' + '✅'.repeat(20));
-            console.log(`[DINA-CHECK] 🎉 SUCCESSFULLY QUEUED @DINA MESSAGE`);
-            console.log(`  📋 Queue ID: ${queueId}`);
-            console.log(`  👤 From: ${senderUsername}`);
-            console.log(`  🏠 Group: ${input.groupId}`);
-            console.log(`  💬 Query: "${dinaQuery.substring(0, 50)}..."`);
-            console.log('✅'.repeat(20) + '\n');
+            const [subRows] = await DB.query(
+              `SELECT tier, status FROM user_subscriptions WHERE user_id = ?`,
+              [input.senderUserId]
+            );
+            const sub = (subRows as any[])[0];
+            const isFreeTier = !sub || sub.tier === 'free' ||
+              !['active', 'trialing', 'past_due'].includes(sub.status);
 
-            // Broadcast dina:processing_start to notify frontend of pending response
-            try {
-              const [members] = await DB.query(
-                `SELECT user_id FROM mirror_group_members WHERE group_id = ? AND status = 'active'`,
-                [input.groupId]
+            if (isFreeTier) {
+              const dailyLimit = 3;
+
+              // Use MySQL CURDATE() for consistency with DB timezone
+              const [usageRows] = await DB.query(
+                `SELECT count FROM usage_tracking
+                 WHERE user_id = ? AND feature_key = 'dina_queries_per_day'
+                 AND period_type = 'daily' AND period_start = CURDATE()`,
+                [input.senderUserId]
               );
-              for (const member of members as any[]) {
-                await mirrorGroupNotifications.notify(member.user_id, {
-                  type: 'dina_processing_started',
-                  payload: {
-                    queueId,
-                    originalMessageId: messageId,
-                    groupId: input.groupId,
-                    userId: input.senderUserId,
-                    username: senderUsername,
-                    timestamp: new Date().toISOString(),
+
+              const currentCount = (usageRows as any[])[0]?.count || 0;
+
+              if (currentCount >= dailyLimit) {
+                dinaBlocked = true;
+              } else {
+                // Increment usage counter
+                await DB.query(
+                  `INSERT INTO usage_tracking (user_id, feature_key, period_type, period_start, count, limit_value)
+                   VALUES (?, 'dina_queries_per_day', 'daily', CURDATE(), 1, ?)
+                   ON DUPLICATE KEY UPDATE count = count + 1`,
+                  [input.senderUserId, dailyLimit]
+                );
+                try { await mirrorRedis.del(`subscription:${input.senderUserId}`); } catch {}
+              }
+            }
+            // ---- END USAGE LIMIT CHECK ----
+
+            if (dinaBlocked) {
+              // Send limit message as Dina (uses sendMessage which will go through full pipeline)
+              try {
+                await this.sendMessage({
+                  groupId: input.groupId,
+                  senderUserId: dinaUserId,
+                  content: `@${senderUsername}, you have reached your daily limit of 3 free Dina queries. Please upgrade to Premium for unlimited access, or try again tomorrow.`,
+                  contentType: 'text',
+                  metadata: {
+                    custom: { isDinaResponse: true, type: 'usage_limit' },
+                    replyPreview: {
+                      messageId: messageId,
+                      senderUsername: senderUsername,
+                      content: sanitizedContent.substring(0, 100),
+                    },
                   },
                 });
+              } catch (limitErr) {
+                console.error('[DINA-CHECK] Failed to send limit message:', (limitErr as Error).message);
               }
-              console.log(`[DINA-CHECK] 📡 Broadcast dina:processing_start to ${(members as any[]).length} members`);
-            } catch (broadcastError) {
-              console.error('[DINA-CHECK] ⚠️ Failed to broadcast processing_start:', broadcastError);
+            } else {
+              // Queue for Dina processing
+              const queueId = await DinaChatQueueProcessor.queueDinaMessage({
+                groupId: input.groupId,
+                userId: input.senderUserId,
+                username: senderUsername,
+                query: dinaQuery,
+                originalMessageId: messageId,
+                context: {
+                  parentMessageId: input.parentMessageId,
+                  contentType: input.contentType,
+                  timestamp: now.toISOString(),
+                },
+                priority: 5,
+              });
+
+              // Broadcast dina:processing_start to notify frontend of pending response
+              try {
+                const [members] = await DB.query(
+                  `SELECT user_id FROM mirror_group_members WHERE group_id = ? AND status = 'active'`,
+                  [input.groupId]
+                );
+                for (const member of members as any[]) {
+                  await mirrorGroupNotifications.notify(member.user_id, {
+                    type: 'dina_processing_started',
+                    payload: {
+                      queueId,
+                      originalMessageId: messageId,
+                      groupId: input.groupId,
+                      userId: input.senderUserId,
+                      username: senderUsername,
+                      timestamp: new Date().toISOString(),
+                    },
+                  });
+                }
+              } catch (broadcastError) {
+                console.error('[DINA-CHECK] Failed to broadcast processing_start:', broadcastError);
+              }
             }
-          } else {
-            console.log('[DINA-CHECK] ⚠️ Empty query after extraction, skipping');
           }
         } catch (dinaError) {
           // Don't fail message send if @Dina queue fails
-          console.error('\n' + '❌'.repeat(20));
-          console.error('[DINA-CHECK] ❌ FAILED TO QUEUE @DINA MESSAGE');
-          console.error(`  Error: ${(dinaError as Error).message}`);
-          console.error(`  Stack: ${(dinaError as Error).stack}`);
-          console.error('❌'.repeat(20) + '\n');
+          console.error('[DINA-CHECK] Failed to queue @Dina message:', (dinaError as Error).message);
         }
       }
       // ========== END @DINA INTEGRATION ==========
@@ -520,13 +561,12 @@ export class ChatMessageManager extends EventEmitter {
       // Cache the message
       await this.cacheMessage(message);
 
-      // Broadcast to group members via WebSocket
-      await this.broadcastMessage(message);
-
       // Queue delivery for offline members
       await this.queueOfflineDelivery(message);
 
       // Emit event for real-time processing
+      // chatWSHandler listens for 'message:sent' and broadcasts via chat WebSocket
+      // (broadcastMessage via mirrorGroupNotifications removed — was causing duplicates)
       this.emit('message:sent', message);
 
       console.log(`✉️ Message sent: ${messageId} to group ${input.groupId}`);

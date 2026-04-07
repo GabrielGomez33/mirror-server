@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS usage_tracking (
   id INT AUTO_INCREMENT PRIMARY KEY,
   user_id INT NOT NULL,
   feature_key VARCHAR(100) NOT NULL,
-  period_type ENUM('daily', 'monthly') NOT NULL,
+  period_type ENUM('daily', 'weekly', 'monthly') NOT NULL,
   period_start DATE NOT NULL,
   count INT NOT NULL DEFAULT 0,
   limit_value INT NOT NULL,

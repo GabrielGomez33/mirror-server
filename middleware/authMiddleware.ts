@@ -85,7 +85,7 @@ interface SubscriptionGateRule {
   requiredTier: SubscriptionTier;
   featureName: string;
   usageLimitKey?: string;
-  usagePeriodType?: 'daily' | 'monthly';
+  usagePeriodType?: 'daily' | 'weekly' | 'monthly';
 }
 
 // Default rules — can be overridden by setSubscriptionGateRules() from paywall config
@@ -153,11 +153,14 @@ class AuthMiddleware {
 
       // PERSONAL ANALYSIS
       // Mounted at /mirror/api/personal-analysis, route is POST /generate
+      // Free tier: 1 per week. Premium: unlimited.
       {
         pattern: '/personal-analysis/generate',
         methods: ['POST'],
-        requiredTier: (gates['personal_analysis'] as SubscriptionTier) || 'premium',
+        requiredTier: 'free',
         featureName: 'personal_analysis',
+        usageLimitKey: 'personal_analysis_per_week',
+        usagePeriodType: 'weekly',
       },
 
       // GROUPS — create is premium, join is usage-limited
@@ -186,6 +189,15 @@ class AuthMiddleware {
         usageLimitKey: 'groups_joined',
         usagePeriodType: 'monthly',
       },
+      // Mounted at /mirror/api/groups, route is POST /:groupId/join
+      {
+        pattern: '/groups/*/join',
+        methods: ['POST'],
+        requiredTier: 'free',
+        featureName: 'join_one_group',
+        usageLimitKey: 'groups_joined',
+        usagePeriodType: 'monthly',
+      },
       // Mounted at /mirror/api/groups, route is POST /:groupId/request-join
       {
         pattern: '/groups/*/request-join',
@@ -205,36 +217,12 @@ class AuthMiddleware {
         usagePeriodType: 'monthly',
       },
 
-      // TRUTHSTREAM — receiving reviews and analysis are premium
+      // TRUTHSTREAM — entire feature is premium
       {
-        pattern: '/truthstream/reviews/received',
-        methods: ['GET'],
+        pattern: '/truthstream/*',
+        methods: ['GET', 'POST', 'PUT', 'DELETE'],
         requiredTier: (gates['receive_reviews'] as SubscriptionTier) || 'premium',
-        featureName: 'receive_reviews',
-      },
-      {
-        pattern: '/truthstream/analysis/generate',
-        methods: ['POST'],
-        requiredTier: (gates['truth_mirror_report'] as SubscriptionTier) || 'premium',
-        featureName: 'truth_mirror_report',
-      },
-      {
-        pattern: '/truthstream/analysis',
-        methods: ['GET'],
-        requiredTier: (gates['truth_mirror_report'] as SubscriptionTier) || 'premium',
-        featureName: 'truth_mirror_report',
-      },
-      {
-        pattern: '/truthstream/analysis/perception-gap',
-        methods: ['GET'],
-        requiredTier: (gates['truth_mirror_report'] as SubscriptionTier) || 'premium',
-        featureName: 'truth_mirror_report',
-      },
-      {
-        pattern: '/truthstream/analysis/trends',
-        methods: ['GET'],
-        requiredTier: (gates['truth_mirror_report'] as SubscriptionTier) || 'premium',
-        featureName: 'truth_mirror_report',
+        featureName: 'truthstream',
       },
 
       // DATA EXPORT
@@ -452,8 +440,10 @@ class AuthMiddleware {
 
             const friendlyNames: Record<string, string> = {
               journal_entries_per_month: 'journal entries this month',
-              groups_joined: 'groups joined',
+              groups_joined: 'groups joined this month',
               dina_queries_per_day: '@Dina queries today',
+              personal_analysis_per_week: 'personal analysis reports this week',
+              truth_mirror_per_week: 'Truth Mirror reports this week',
             };
 
             res.status(403).json({

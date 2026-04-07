@@ -166,7 +166,7 @@ export function loadPaywallConfig(payenvPath?: string): PaywallConfig {
 
     freeLimits: parseJSON<FreeTierLimits>(
       getVar(vars, 'PAYWALL_FREE_LIMITS'),
-      { journal_entries_per_month: 5, groups_joined: 1, dina_queries_per_day: 3 },
+      { journal_entries_per_month: 5, groups_joined: 3, dina_queries_per_day: 3, personal_analysis_per_week: 1 },
       'PAYWALL_FREE_LIMITS'
     ),
 

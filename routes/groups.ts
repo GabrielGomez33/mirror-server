@@ -68,9 +68,6 @@ function sanitizeInput(input: unknown, maxLength: number = 500): string | null {
   return cleaned.length > 0 ? cleaned.substring(0, maxLength) : null;
 }
 
-/**
- * Validate UUID v4 format
- */
 const UUID_V4_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function isValidUUID(value: unknown): value is string {
   return typeof value === 'string' && UUID_V4_REGEX.test(value);
@@ -207,12 +204,6 @@ async function enrichMembersWithSharedData(groupId: string, members: any[]): Pro
 /**
  * Apply anonymous aliasing to a members array for anonymous groups.
  * Members are sorted by joined_at and assigned "Member N" aliases.
- *
- * Rules:
- * - Owner/admin sees real usernames + alias label (for moderation)
- * - Regular members see only aliases for OTHER members
- * - Everyone sees their own alias so they know which "Member N" they are
- * - Shared data indicators are hidden (anonymous = no identity linkage)
  */
 function applyAnonymousAliases(
   members: any[],
@@ -222,12 +213,10 @@ function applyAnonymousAliases(
 ): any[] {
   if (groupType !== 'anonymous') return members;
 
-  // Sort by joined_at to get stable alias numbering
   const sorted = [...members].sort(
     (a, b) => new Date(a.joined_at).getTime() - new Date(b.joined_at).getTime()
   );
 
-  // Build userId -> alias map
   const aliasMap = new Map<number, string>();
   sorted.forEach((member, index) => {
     aliasMap.set(member.user_id, `Member ${index + 1}`);
@@ -240,26 +229,22 @@ function applyAnonymousAliases(
     const isSelf = member.user_id === requestingUserId;
 
     if (isOwnerOrAdmin) {
-      // Owner/admin: sees real name + alias for context
       return {
         ...member,
         display_name: isSelf ? `${alias} (You)` : `${alias} — ${member.username}`,
         anonymous_alias: alias,
-        // Keep username visible for moderation
       };
     }
 
-    // Regular member: only sees aliases
     return {
       ...member,
       username: isSelf ? `${alias} (You)` : alias,
       display_name: isSelf ? `${alias} (You)` : alias,
-      email: undefined, // Never expose email in anonymous groups
+      email: undefined,
       anonymous_alias: alias,
-      // Strip shared data indicators to prevent identity linkage
       has_shared_data: false,
       shared_data_types: [],
-      is_online: undefined, // Online status can be used to identify
+      is_online: undefined,
       last_active: undefined,
     };
   });
@@ -267,7 +252,6 @@ function applyAnonymousAliases(
 
 /**
  * Build an alias map for a group's members (for use in chat, notifications, etc.)
- * Returns a Map of userId -> "Member N"
  */
 async function buildAnonymousAliasMap(groupId: string): Promise<Map<number, string>> {
   const [memberRows] = await DB.query(
@@ -286,74 +270,51 @@ async function buildAnonymousAliasMap(groupId: string): Promise<Map<number, stri
 }
 
 /* ============================================================================
-   ATOMIC MEMBER OPERATIONS — Transaction-safe add/remove with count sync
+   ATOMIC MEMBER OPERATIONS
 ============================================================================ */
 
-/**
- * Atomically add a member to a group within a transaction.
- * Checks capacity with a row-level lock, inserts member, and increments count.
- * Returns { success, error?, memberId? }
- */
 async function atomicAddMember(
   groupId: string,
   userId: number,
   role: 'owner' | 'admin' | 'member' = 'member'
-): Promise<{ success: boolean; error?: string; code?: string; memberId?: string }> {
+): Promise<{ success: boolean; error?: string; code?: string }> {
   const conn = await DB.getConnection();
   try {
     await conn.beginTransaction();
-
-    // Lock the group row and check capacity
     const [groupRows] = await conn.query(
       `SELECT max_members, current_member_count, status FROM mirror_groups WHERE id = ? FOR UPDATE`,
       [groupId]
     );
     const group = (groupRows as any[])[0];
     if (!group || group.status !== 'active') {
-      await conn.rollback();
-      return { success: false, error: 'Group not found or inactive', code: 'GROUP_NOT_FOUND' };
+      await conn.rollback(); return { success: false, error: 'Group not found or inactive', code: 'GROUP_NOT_FOUND' };
     }
     if (group.current_member_count >= group.max_members) {
-      await conn.rollback();
-      return { success: false, error: 'Group has reached maximum capacity', code: 'GROUP_FULL' };
+      await conn.rollback(); return { success: false, error: 'Group has reached maximum capacity', code: 'GROUP_FULL' };
     }
-
-    // Check for existing membership
     const [existing] = await conn.query(
       `SELECT id, status FROM mirror_group_members WHERE group_id = ? AND user_id = ?`,
       [groupId, userId]
     );
     if ((existing as any[]).length > 0) {
       const status = (existing as any[])[0].status;
-      if (status === 'active') {
-        await conn.rollback();
-        return { success: false, error: 'Already a member', code: 'ALREADY_MEMBER' };
-      }
-      if (status === 'banned') {
-        await conn.rollback();
-        return { success: false, error: 'You are not permitted to join this group', code: 'BANNED' };
-      }
-      // Reactivate (left, removed, etc.)
+      if (status === 'active') { await conn.rollback(); return { success: false, error: 'Already a member', code: 'ALREADY_MEMBER' }; }
+      if (status === 'banned') { await conn.rollback(); return { success: false, error: 'You are not permitted to join this group', code: 'BANNED' }; }
       await conn.query(
-        `UPDATE mirror_group_members SET status = 'active', role = ?, joined_at = NOW()
-         WHERE group_id = ? AND user_id = ?`,
+        `UPDATE mirror_group_members SET status = 'active', role = ?, joined_at = NOW() WHERE group_id = ? AND user_id = ?`,
         [role, groupId, userId]
       );
     } else {
       const memberId = uuidv4();
       await conn.query(
-        `INSERT INTO mirror_group_members (id, group_id, user_id, role, status, joined_at)
-         VALUES (?, ?, ?, ?, 'active', NOW())`,
+        `INSERT INTO mirror_group_members (id, group_id, user_id, role, status, joined_at) VALUES (?, ?, ?, ?, 'active', NOW())`,
         [memberId, groupId, userId, role]
       );
     }
-
-    // Increment count atomically (within same transaction)
     await conn.query(
       `UPDATE mirror_groups SET current_member_count = current_member_count + 1, updated_at = NOW() WHERE id = ?`,
       [groupId]
     );
-
     await conn.commit();
     return { success: true };
   } catch (error) {
@@ -365,9 +326,6 @@ async function atomicAddMember(
   }
 }
 
-/**
- * Atomically remove a member from a group within a transaction.
- */
 async function atomicRemoveMember(
   groupId: string,
   userId: number,
@@ -376,29 +334,19 @@ async function atomicRemoveMember(
   const conn = await DB.getConnection();
   try {
     await conn.beginTransaction();
-
     const [memberRows] = await conn.query(
-      `SELECT id, status, role FROM mirror_group_members
-       WHERE group_id = ? AND user_id = ? AND status = 'active'`,
+      `SELECT id, status, role FROM mirror_group_members WHERE group_id = ? AND user_id = ? AND status = 'active'`,
       [groupId, userId]
     );
-    if ((memberRows as any[]).length === 0) {
-      await conn.rollback();
-      return { success: false, error: 'Not an active member' };
-    }
-
+    if ((memberRows as any[]).length === 0) { await conn.rollback(); return { success: false, error: 'Not an active member' }; }
     await conn.query(
-      `UPDATE mirror_group_members SET status = ?, left_at = NOW()
-       WHERE group_id = ? AND user_id = ? AND status = 'active'`,
+      `UPDATE mirror_group_members SET status = ?, left_at = NOW() WHERE group_id = ? AND user_id = ? AND status = 'active'`,
       [removalStatus, groupId, userId]
     );
-
     await conn.query(
-      `UPDATE mirror_groups SET current_member_count = GREATEST(current_member_count - 1, 0), updated_at = NOW()
-       WHERE id = ?`,
+      `UPDATE mirror_groups SET current_member_count = GREATEST(current_member_count - 1, 0), updated_at = NOW() WHERE id = ?`,
       [groupId]
     );
-
     await conn.commit();
     return { success: true };
   } catch (error) {
@@ -410,10 +358,6 @@ async function atomicRemoveMember(
   }
 }
 
-/**
- * Reconcile current_member_count with actual count.
- * Call periodically or after suspected drift.
- */
 async function reconcileMemberCount(groupId: string): Promise<void> {
   try {
     await DB.query(
@@ -430,9 +374,6 @@ async function reconcileMemberCount(groupId: string): Promise<void> {
   }
 }
 
-/**
- * Validate groupId parameter — reusable guard for all handlers.
- */
 function validateGroupIdParam(groupId: string, res: express.Response): boolean {
   if (!isValidUUID(groupId)) {
     res.status(400).json({ success: false, error: 'Invalid group identifier', code: 'INVALID_GROUP_ID' });
@@ -542,7 +483,7 @@ const createGroupHandler: RequestHandler = async (req, res) => {
       ]
     );
 
-    // ---- Add creator as owner (critical — must succeed) ----
+    // ---- Add creator as owner ----
     const memberId = uuidv4();
     await DB.query(
       `INSERT INTO mirror_group_members (id, group_id, user_id, role, status, joined_at)
@@ -553,39 +494,6 @@ const createGroupHandler: RequestHandler = async (req, res) => {
          joined_at = NOW()`,
       [memberId, groupId, user.id]
     );
-
-    // ---- Verify owner was actually inserted (guard against silent failures) ----
-    const [ownerCheck] = await DB.query(
-      `SELECT id, status, role FROM mirror_group_members
-       WHERE group_id = ? AND user_id = ? AND status = 'active' AND role = 'owner'`,
-      [groupId, user.id]
-    );
-
-    if ((ownerCheck as any[]).length === 0) {
-      // Critical: owner record missing — force insert with a fresh attempt
-      console.error(`[CRITICAL] Owner membership failed for user ${user.id} in group ${groupId}. Retrying...`);
-      const retryMemberId = uuidv4();
-      await DB.query(
-        `INSERT INTO mirror_group_members (id, group_id, user_id, role, status, joined_at)
-         VALUES (?, ?, ?, 'owner', 'active', NOW())`,
-        [retryMemberId, groupId, user.id]
-      );
-
-      // Final verification
-      const [retryCheck] = await DB.query(
-        `SELECT id FROM mirror_group_members WHERE group_id = ? AND user_id = ? AND status = 'active'`,
-        [groupId, user.id]
-      );
-      if ((retryCheck as any[]).length === 0) {
-        // Unrecoverable — roll back the group creation
-        console.error(`[CRITICAL] Cannot add owner to group ${groupId}. Rolling back group creation.`);
-        await DB.query(`DELETE FROM mirror_groups WHERE id = ?`, [groupId]);
-        res.status(500).json({ success: false, error: 'Failed to create group — could not add you as owner. Please try again.' });
-        return;
-      }
-    }
-
-    console.log(`Owner ${user.id} confirmed as member of group ${groupId}`);
 
     // ---- Generate encryption key ----
     try {
@@ -600,9 +508,9 @@ const createGroupHandler: RequestHandler = async (req, res) => {
     if (groupPrivacy === 'public') {
       try {
         await DB.query(
-          `INSERT INTO mirror_group_directory_settings (group_id, show_member_count, show_goal, show_description, auto_approve_joins)
-           VALUES (?, TRUE, TRUE, TRUE, TRUE)
-           ON DUPLICATE KEY UPDATE auto_approve_joins = TRUE, updated_at = NOW()`,
+          `INSERT INTO mirror_group_directory_settings (group_id, show_member_count, show_goal, show_description)
+           VALUES (?, TRUE, TRUE, TRUE)
+           ON DUPLICATE KEY UPDATE updated_at = NOW()`,
           [groupId]
         );
       } catch (dirError) {
@@ -677,7 +585,7 @@ const listGroupsHandler: RequestHandler = async (req, res) => {
       created_at: row.created_at,
       updated_at: row.updated_at,
       group_image_url: row.group_image_url,
-      is_owner: Number(row.owner_user_id) === Number(user.id)
+      is_owner: row.owner_user_id === user.id
     }));
 
     res.json({
@@ -691,61 +599,27 @@ const listGroupsHandler: RequestHandler = async (req, res) => {
 };
 
 /* ============================================================================
-   SUGGESTED GROUPS - Public groups the user is NOT a member of
-   GET /suggested
+   SUGGESTED GROUPS
 ============================================================================ */
 
 const getSuggestedGroupsHandler: RequestHandler = async (req, res) => {
   try {
     const user = (req as any).user;
-    if (!user?.id) {
-      res.status(401).json({ success: false, error: 'Unauthorized', code: 'NO_AUTH' });
-      return;
-    }
-
+    if (!user?.id) { res.status(401).json({ success: false, error: 'Unauthorized' }); return; }
     const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 10, 1), 50);
-
     const [rows] = await DB.query(
       `SELECT g.id, g.name, g.description, g.type, g.subtype, g.privacy,
               g.goal, g.goal_custom, g.max_members, g.current_member_count,
-              g.owner_user_id, g.status, g.created_at, g.updated_at,
-              g.group_image_url
+              g.owner_user_id, g.status, g.created_at, g.updated_at, g.group_image_url
        FROM mirror_groups g
-       WHERE g.privacy = 'public'
-         AND g.status = 'active'
-         AND g.current_member_count < g.max_members
+       WHERE g.privacy = 'public' AND g.status = 'active' AND g.current_member_count < g.max_members
          AND g.id NOT IN (
-           SELECT gm.group_id FROM mirror_group_members gm
-           WHERE gm.user_id = ? AND gm.status IN ('active', 'invited')
+           SELECT gm.group_id FROM mirror_group_members gm WHERE gm.user_id = ? AND gm.status IN ('active', 'invited')
          )
-       ORDER BY g.current_member_count DESC, g.created_at DESC
-       LIMIT ?`,
+       ORDER BY g.current_member_count DESC, g.created_at DESC LIMIT ?`,
       [user.id, limit]
     );
-
-    const groups = (rows as any[]).map(row => ({
-      id: row.id,
-      name: row.name,
-      description: row.description,
-      type: row.type,
-      subtype: row.subtype,
-      privacy: row.privacy,
-      goal: row.goal,
-      goalCustom: row.goal_custom,
-      maxMembers: row.max_members,
-      memberCount: row.current_member_count,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-      groupImageUrl: row.group_image_url,
-    }));
-
-    res.json({
-      success: true,
-      data: {
-        groups,
-        total: groups.length
-      }
-    });
+    res.json({ success: true, data: { groups: rows, total: (rows as any[]).length } });
   } catch (error) {
     console.error('Error fetching suggested groups:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch suggested groups' });
@@ -845,10 +719,8 @@ const searchPublicDirectoryHandler: RequestHandler = async (req, res) => {
 };
 
 /* ============================================================================
-   REQUEST TO JOIN / INSTANT JOIN (for public groups)
+   REQUEST TO JOIN (for public groups - user requests, admin approves)
    POST /:groupId/request-join
-   Public groups = instant join. Kept for backward compat with any code
-   that still calls this endpoint directly.
 ============================================================================ */
 
 const requestToJoinHandler: RequestHandler = async (req, res) => {
@@ -860,6 +732,7 @@ const requestToJoinHandler: RequestHandler = async (req, res) => {
     }
 
     const { groupId } = req.params;
+    const { message } = req.body;
 
     // Verify group exists and is public
     const [groupRows] = await DB.query(
@@ -886,34 +759,76 @@ const requestToJoinHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    // ---- Public = instant join via atomic operation ----
-    const addResult = await atomicAddMember(groupId, user.id, 'member');
-    if (!addResult.success) {
-      const status = addResult.code === 'GROUP_FULL' ? 409
-        : addResult.code === 'ALREADY_MEMBER' ? 409
-        : addResult.code === 'BANNED' ? 403 : 500;
-      res.status(status).json({ success: false, error: addResult.error, code: addResult.code });
+    // Check if already a member
+    const [existingMember] = await DB.query(
+      `SELECT id, status FROM mirror_group_members WHERE group_id = ? AND user_id = ?`,
+      [groupId, user.id]
+    );
+
+    if ((existingMember as any[]).length > 0) {
+      const memberStatus = (existingMember as any[])[0].status;
+      if (memberStatus === 'active') {
+        res.status(400).json({ success: false, error: 'You are already a member of this group' });
+        return;
+      }
+      if (memberStatus === 'invited') {
+        res.status(400).json({ success: false, error: 'You already have a pending invitation. Check your invitations.' });
+        return;
+      }
+    }
+
+    // Check for existing pending request
+    const [existingRequest] = await DB.query(
+      `SELECT id FROM mirror_group_join_requests
+       WHERE group_id = ? AND user_id = ? AND status = 'pending'`,
+      [groupId, user.id]
+    );
+
+    if ((existingRequest as any[]).length > 0) {
+      res.status(400).json({ success: false, error: 'You already have a pending join request for this group' });
       return;
     }
 
-    // Distribute encryption key (non-fatal)
+    // Check directory settings for auto-approve
+    let autoApprove = false;
     try {
-      const [keyRows] = await DB.query(
-        `SELECT id, key_version FROM mirror_group_encryption_keys
-         WHERE group_id = ? AND status = 'active'
-         ORDER BY key_version DESC LIMIT 1`,
+      const [dirSettings] = await DB.query(
+        `SELECT auto_approve_joins FROM mirror_group_directory_settings WHERE group_id = ?`,
         [groupId]
       );
-      if ((keyRows as any[]).length > 0) {
-        const { id: keyId, key_version } = (keyRows as any[])[0];
-        await groupEncryptionManager.distributeKeyToMember(groupId, String(user.id), keyId, key_version);
+      if ((dirSettings as any[]).length > 0) {
+        autoApprove = (dirSettings as any[])[0].auto_approve_joins;
       }
-    } catch (encError) {
-      console.error('Encryption key distribution failed (non-fatal):', encError);
-    }
+    } catch { /* no directory settings - default to manual approval */ }
 
-    // Notify existing members (non-fatal)
-    try {
+    const requestId = uuidv4();
+    const sanitizedMessage = sanitizeInput(message, 500);
+
+    if (autoApprove) {
+      // Auto-approve: add member atomically
+      const addResult = await atomicAddMember(groupId, user.id, 'member');
+      if (!addResult.success) {
+        res.status(400).json({ success: false, error: addResult.error, code: addResult.code });
+        return;
+      }
+
+      // Distribute encryption key
+      try {
+        const [keyRows] = await DB.query(
+          `SELECT id, key_version FROM mirror_group_encryption_keys
+           WHERE group_id = ? AND status = 'active'
+           ORDER BY key_version DESC LIMIT 1`,
+          [groupId]
+        );
+        if ((keyRows as any[]).length > 0) {
+          const { id: keyId, key_version } = (keyRows as any[])[0];
+          await groupEncryptionManager.distributeKeyToMember(groupId, String(user.id), keyId, key_version);
+        }
+      } catch (encError) {
+        console.error('Encryption key distribution failed (non-fatal):', encError);
+      }
+
+      // Notify members
       const [userInfo] = await DB.query(`SELECT username FROM users WHERE id = ?`, [user.id]);
       const [membersRows] = await DB.query(
         `SELECT gm.user_id as userId, u.username as userName, u.email, gm.role
@@ -928,21 +843,56 @@ const requestToJoinHandler: RequestHandler = async (req, res) => {
         { userId: String(user.id), userName: (userInfo as any[])[0]?.username || 'Unknown' },
         group.name
       );
-    } catch (notifError) {
-      console.error('Join notification failed (non-fatal):', notifError);
+
+      res.status(201).json({
+        success: true,
+        data: { status: 'approved', autoApproved: true },
+        message: 'You have been automatically added to the group!'
+      });
+
+    } else {
+      // Manual approval: create join request
+      await DB.query(
+        `INSERT INTO mirror_group_join_requests (id, group_id, user_id, status, message, request_type, requested_at)
+         VALUES (?, ?, ?, 'pending', ?, 'join_request', NOW())`,
+        [requestId, groupId, user.id, sanitizedMessage]
+      );
+
+      // Notify group admins/owners
+      const [adminRows] = await DB.query(
+        `SELECT gm.user_id as userId, u.username as userName, u.email, gm.role
+         FROM mirror_group_members gm
+         JOIN users u ON gm.user_id = u.id
+         WHERE gm.group_id = ? AND gm.status = 'active' AND gm.role IN ('owner', 'admin')`,
+        [groupId]
+      );
+
+      const [requesterInfo] = await DB.query(`SELECT username FROM users WHERE id = ?`, [user.id]);
+      const requesterName = (requesterInfo as any[])[0]?.username || 'Someone';
+
+      // Notify admins about the join request
+      for (const admin of (adminRows as any[])) {
+        try {
+          await mirrorGroupNotifications.notifyGroupInvite({
+            inviteeUserId: String(admin.userId),
+            inviterName: requesterName,
+            groupId: groupId,
+            groupName: `${group.name} (Join Request)`,
+            inviteCode: requestId
+          });
+        } catch { /* non-fatal */ }
+      }
+
+      res.status(201).json({
+        success: true,
+        data: { requestId, status: 'pending' },
+        message: 'Join request submitted. An admin will review your request.'
+      });
     }
 
-    console.log(`User ${user.id} joined public group ${groupId} (${group.name})`);
-
-    res.status(201).json({
-      success: true,
-      data: { status: 'approved', groupId },
-      message: 'You have been added to the group!'
-    });
-
   } catch (error) {
-    console.error('Error joining public group:', error);
-    res.status(500).json({ success: false, error: 'Failed to join group' });
+    console.error('Error requesting to join group:', error);
+    res.status(500).json({ success: false, error: 'Failed to submit join request' });
   }
 };
 
@@ -1254,268 +1204,6 @@ const joinGroupHandler: RequestHandler = async (req, res) => {
 };
 
 /* ============================================================================
-   JOIN GROUP BY ID (URL param) - Enterprise-grade unified join handler
-   POST /:groupId/join
-   Supports: public (auto-approve / request), private (invite-code), secret (invite-code)
-============================================================================ */
-
-const joinGroupByIdHandler: RequestHandler = async (req, res) => {
-  try {
-    const user = (req as any).user;
-    if (!user?.id) {
-      res.status(401).json({ success: false, error: 'Authentication required', code: 'NO_AUTH' });
-      return;
-    }
-
-    const { groupId } = req.params;
-    const { joinCode } = req.body || {};
-
-    // ---- Validate groupId format ----
-    if (!isValidUUID(groupId)) {
-      res.status(400).json({ success: false, error: 'Invalid group identifier', code: 'INVALID_GROUP_ID' });
-      return;
-    }
-
-    // ---- Fetch group ----
-    const [groupRows] = await DB.query(
-      `SELECT id, name, privacy, max_members, current_member_count, status, type
-       FROM mirror_groups WHERE id = ? AND status = 'active'`,
-      [groupId]
-    );
-
-    if ((groupRows as any[]).length === 0) {
-      res.status(404).json({ success: false, error: 'Group not found or inactive', code: 'GROUP_NOT_FOUND' });
-      return;
-    }
-
-    const group = (groupRows as any[])[0];
-
-    // ---- Check capacity ----
-    if (group.current_member_count >= group.max_members) {
-      res.status(409).json({ success: false, error: 'Group has reached maximum capacity', code: 'GROUP_FULL' });
-      return;
-    }
-
-    // ---- Check if already a member ----
-    const [existingMember] = await DB.query(
-      `SELECT id, status, role FROM mirror_group_members WHERE group_id = ? AND user_id = ?`,
-      [groupId, user.id]
-    );
-
-    if ((existingMember as any[]).length > 0) {
-      const memberStatus = (existingMember as any[])[0].status;
-      if (memberStatus === 'active') {
-        res.status(409).json({ success: false, error: 'You are already a member of this group', code: 'ALREADY_MEMBER' });
-        return;
-      }
-      if (memberStatus === 'invited') {
-        res.status(409).json({
-          success: false,
-          error: 'You have a pending invitation for this group. Check your invitations to accept it.',
-          code: 'PENDING_INVITATION'
-        });
-        return;
-      }
-      if (memberStatus === 'banned') {
-        res.status(403).json({ success: false, error: 'You are not permitted to join this group', code: 'BANNED' });
-        return;
-      }
-    }
-
-    // ---- Check for existing pending join request ----
-    const [existingRequest] = await DB.query(
-      `SELECT id, status, requested_at FROM mirror_group_join_requests
-       WHERE group_id = ? AND user_id = ? AND status = 'pending'`,
-      [groupId, user.id]
-    );
-
-    if ((existingRequest as any[]).length > 0) {
-      res.status(409).json({
-        success: false,
-        error: 'You already have a pending join request for this group',
-        code: 'PENDING_REQUEST'
-      });
-      return;
-    }
-
-    // ---- Check for recently rejected requests (24h cooldown) ----
-    const [recentRejection] = await DB.query(
-      `SELECT id, processed_at FROM mirror_group_join_requests
-       WHERE group_id = ? AND user_id = ? AND status = 'rejected'
-       AND processed_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
-       ORDER BY processed_at DESC LIMIT 1`,
-      [groupId, user.id]
-    );
-
-    if ((recentRejection as any[]).length > 0) {
-      res.status(429).json({
-        success: false,
-        error: 'Your previous join request was recently declined. Please wait before trying again.',
-        code: 'COOLDOWN_ACTIVE'
-      });
-      return;
-    }
-
-    // ========================================================================
-    // ROUTE BY PRIVACY TYPE — All paths use atomicAddMember for safety
-    // ========================================================================
-
-    if (group.privacy === 'public') {
-      // --- Public group: ALWAYS instant join — public means open access ---
-      const addResult = await atomicAddMember(groupId, user.id, 'member');
-      if (!addResult.success) {
-        const status = addResult.code === 'GROUP_FULL' ? 409
-          : addResult.code === 'ALREADY_MEMBER' ? 409
-          : addResult.code === 'BANNED' ? 403 : 500;
-        res.status(status).json({ success: false, error: addResult.error, code: addResult.code });
-        return;
-      }
-
-      // Distribute encryption key (non-fatal)
-      try {
-        const [keyRows] = await DB.query(
-          `SELECT id, key_version FROM mirror_group_encryption_keys
-           WHERE group_id = ? AND status = 'active'
-           ORDER BY key_version DESC LIMIT 1`,
-          [groupId]
-        );
-        if ((keyRows as any[]).length > 0) {
-          const { id: keyId, key_version } = (keyRows as any[])[0];
-          await groupEncryptionManager.distributeKeyToMember(groupId, String(user.id), keyId, key_version);
-        }
-      } catch (encError) {
-        console.error('Encryption key distribution failed (non-fatal):', encError);
-      }
-
-      // Notify existing members (non-fatal)
-      try {
-        const [userInfo] = await DB.query(`SELECT username FROM users WHERE id = ?`, [user.id]);
-        const [membersRows] = await DB.query(
-          `SELECT gm.user_id as userId, u.username as userName, u.email, gm.role
-           FROM mirror_group_members gm
-           JOIN users u ON gm.user_id = u.id
-           WHERE gm.group_id = ? AND gm.status = 'active'`,
-          [groupId]
-        );
-        await mirrorGroupNotifications.notifyMemberJoined(
-          membersRows as any[],
-          { userId: String(user.id), userName: (userInfo as any[])[0]?.username || 'Unknown' },
-          group.name
-        );
-      } catch (notifError) {
-        console.error('Join notification failed (non-fatal):', notifError);
-      }
-
-      console.log(`User ${user.id} joined public group ${groupId} (${group.name})`);
-
-      res.status(201).json({
-        success: true,
-        data: { status: 'approved', groupId },
-        message: 'You have been added to the group!'
-      });
-
-    } else if (group.privacy === 'private' || group.privacy === 'secret') {
-      // --- Private/Secret group: require a valid invitation (joinCode = requestId) ---
-      if (!joinCode || typeof joinCode !== 'string') {
-        res.status(403).json({
-          success: false,
-          error: group.privacy === 'secret'
-            ? 'This group requires an invitation to join'
-            : 'This is a private group. You need an invitation to join.',
-          code: 'INVITATION_REQUIRED'
-        });
-        return;
-      }
-
-      // Validate the invitation exists for this user and group
-      const [inviteRows] = await DB.query(
-        `SELECT id, status, request_type FROM mirror_group_join_requests
-         WHERE id = ? AND group_id = ? AND user_id = ? AND status = 'pending'`,
-        [joinCode, groupId, user.id]
-      );
-
-      if ((inviteRows as any[]).length === 0) {
-        res.status(404).json({
-          success: false,
-          error: 'Invalid or expired invitation code',
-          code: 'INVALID_INVITE'
-        });
-        return;
-      }
-
-      // Atomically add member
-      const addResult = await atomicAddMember(groupId, user.id, 'member');
-      if (!addResult.success) {
-        const status = addResult.code === 'GROUP_FULL' ? 409 : addResult.code === 'BANNED' ? 403 : 500;
-        res.status(status).json({ success: false, error: addResult.error, code: addResult.code });
-        return;
-      }
-
-      // Mark invitation as processed
-      await DB.query(
-        `DELETE FROM mirror_group_join_requests WHERE id = ?`,
-        [joinCode]
-      );
-
-      // Distribute encryption key (non-fatal)
-      try {
-        const [keyRows] = await DB.query(
-          `SELECT id, key_version FROM mirror_group_encryption_keys
-           WHERE group_id = ? AND status = 'active'
-           ORDER BY key_version DESC LIMIT 1`,
-          [groupId]
-        );
-        if ((keyRows as any[]).length > 0) {
-          const { id: keyId, key_version } = (keyRows as any[])[0];
-          await groupEncryptionManager.distributeKeyToMember(groupId, String(user.id), keyId, key_version);
-        }
-      } catch (encError) {
-        console.error('Encryption key distribution failed (non-fatal):', encError);
-      }
-
-      // Notify existing members (non-fatal)
-      try {
-        const [userInfo] = await DB.query(`SELECT username FROM users WHERE id = ?`, [user.id]);
-        const [membersRows] = await DB.query(
-          `SELECT gm.user_id as userId, u.username as userName, u.email, gm.role
-           FROM mirror_group_members gm
-           JOIN users u ON gm.user_id = u.id
-           WHERE gm.group_id = ? AND gm.status = 'active'`,
-          [groupId]
-        );
-        await mirrorGroupNotifications.notifyMemberJoined(
-          membersRows as any[],
-          { userId: String(user.id), userName: (userInfo as any[])[0]?.username || 'Unknown' },
-          group.name
-        );
-      } catch (notifError) {
-        console.error('Join notification failed (non-fatal):', notifError);
-      }
-
-      console.log(`User ${user.id} joined ${group.privacy} group ${groupId} (${group.name}) via invitation`);
-
-      res.status(201).json({
-        success: true,
-        data: { status: 'approved', groupId },
-        message: 'Successfully joined group'
-      });
-
-    } else {
-      // Unknown privacy type — defensive fallback
-      res.status(400).json({
-        success: false,
-        error: 'Unable to process join request for this group type',
-        code: 'UNSUPPORTED_PRIVACY'
-      });
-    }
-
-  } catch (error) {
-    console.error('Error in joinGroupByIdHandler:', error);
-    res.status(500).json({ success: false, error: 'Failed to process join request', code: 'INTERNAL_ERROR' });
-  }
-};
-
-/* ============================================================================
    GET GROUP DETAILS - UPDATED WITH NEW FIELDS
 ============================================================================ */
 
@@ -1632,13 +1320,6 @@ const getMembersHandler: RequestHandler = async (req, res) => {
       return;
     }
 
-    // Fetch group type for anonymous aliasing
-    const [groupTypeRows] = await DB.query(
-      `SELECT type FROM mirror_groups WHERE id = ?`,
-      [groupId]
-    );
-    const groupType = (groupTypeRows as any[])[0]?.type || '';
-
     const [membersRows] = await DB.query(
       `SELECT
         gm.id, gm.user_id, gm.role, gm.status, gm.joined_at,
@@ -1658,6 +1339,13 @@ const getMembersHandler: RequestHandler = async (req, res) => {
     );
 
     const enrichedMembers = await enrichMembersWithSharedData(groupId, membersRows as any[]);
+
+    // Fetch group type for anonymous aliasing
+    const [groupTypeRows] = await DB.query(
+      `SELECT type FROM mirror_groups WHERE id = ?`,
+      [groupId]
+    );
+    const groupType = (groupTypeRows as any[])[0]?.type || '';
     const userRole = (memberCheck as any[])[0].role;
     const finalMembers = applyAnonymousAliases(enrichedMembers, user.id, userRole, groupType);
 
@@ -1738,43 +1426,20 @@ const getMemberDetailsHandler: RequestHandler = async (req, res) => {
     const hasSharedData = sharedDataTypes.length > 0;
     const hasSharedProfile = sharedDataTypes.includes('profile') || sharedDataTypes.includes('full_profile');
 
-    // Fetch group type for anonymous aliasing
-    const [groupTypeRows] = await DB.query(
-      `SELECT type FROM mirror_groups WHERE id = ?`,
-      [groupId]
-    );
-    const groupType = (groupTypeRows as any[])[0]?.type || '';
-    const isAnonymous = groupType === 'anonymous';
-    const userRole = (memberCheck as any[])[0].role;
-    const isOwnerOrAdmin = ['owner', 'admin'].includes(userRole);
-    const isSelf = member.user_id === user.id;
-
-    // Build alias for the target member
-    let memberAlias = member.username;
-    if (isAnonymous) {
-      const aliasMap = await buildAnonymousAliasMap(groupId);
-      const alias = aliasMap.get(member.user_id) || 'Member';
-      if (isOwnerOrAdmin) {
-        memberAlias = isSelf ? `${alias} (You)` : `${alias} — ${member.username}`;
-      } else {
-        memberAlias = isSelf ? `${alias} (You)` : alias;
-      }
-    }
-
     const enrichedMember = {
       id: member.id,
       user_id: member.user_id,
-      username: memberAlias,
-      display_name: memberAlias,
+      username: member.username,
+      display_name: member.username,
       role: member.role,
       status: member.status,
       joined_at: member.joined_at,
-      user_created_at: isAnonymous && !isOwnerOrAdmin && !isSelf ? undefined : member.user_created_at,
-      last_active: isAnonymous && !isOwnerOrAdmin && !isSelf ? undefined : member.last_active,
-      is_online: isAnonymous && !isOwnerOrAdmin && !isSelf ? undefined : isUserOnline(member.user_id),
-      has_shared_data: isAnonymous && !isOwnerOrAdmin && !isSelf ? false : hasSharedData,
-      shared_data_types: isAnonymous && !isOwnerOrAdmin && !isSelf ? [] : sharedDataTypes,
-      ...(hasSharedProfile && (!isAnonymous || isOwnerOrAdmin || isSelf) ? { email: member.email } : {})
+      user_created_at: member.user_created_at,
+      last_active: member.last_active,
+      is_online: isUserOnline(member.user_id),
+      has_shared_data: hasSharedData,
+      shared_data_types: sharedDataTypes,
+      ...(hasSharedProfile ? { email: member.email } : {})
     };
 
     const dataTypeCounts: Record<string, number> = {};
@@ -1782,19 +1447,14 @@ const getMemberDetailsHandler: RequestHandler = async (req, res) => {
       dataTypeCounts[sd.dataType] = (dataTypeCounts[sd.dataType] || 0) + 1;
     }
 
-    // In anonymous groups, non-admins can't see other members' shared data details
-    const showSharedData = !isAnonymous || isOwnerOrAdmin || isSelf;
-
     res.json({
       success: true,
       data: {
         member: enrichedMember,
-        sharedData: showSharedData ? sharedData : [],
-        sharedDataSummary: showSharedData
-          ? { totalShared: sharedDataTypes.length, dataTypes: dataTypeCounts }
-          : { totalShared: 0, dataTypes: {} },
-        hasSharedData: showSharedData ? hasSharedData : false,
-        hasSharedProfile: showSharedData ? hasSharedProfile : false
+        sharedData: sharedData,
+        sharedDataSummary: { totalShared: sharedDataTypes.length, dataTypes: dataTypeCounts },
+        hasSharedData: hasSharedData,
+        hasSharedProfile: hasSharedProfile
       }
     });
   } catch (error) {
@@ -2138,7 +1798,7 @@ const leaveGroupHandler: RequestHandler = async (req, res) => {
 
     const group = (groupRows as any[])[0];
 
-    if (Number(group.owner_user_id) === Number(user.id)) {
+    if (group.owner_user_id === user.id) {
       res.status(400).json({
         success: false,
         error: 'Owner cannot leave group. Delete the group or transfer ownership first.'
@@ -2157,18 +1817,22 @@ const leaveGroupHandler: RequestHandler = async (req, res) => {
       [groupId, user.id]
     );
 
-    // Atomically remove member + decrement count
-    const removeResult = await atomicRemoveMember(groupId, user.id, 'left');
-    if (!removeResult.success) {
-      res.status(400).json({ success: false, error: removeResult.error || 'Failed to leave group' });
-      return;
-    }
+    await DB.query(
+      `UPDATE mirror_group_members SET status = 'left', left_at = NOW()
+       WHERE group_id = ? AND user_id = ?`,
+      [groupId, user.id]
+    );
 
     try {
       await groupEncryptionManager.revokeUserAccess(groupId, String(user.id));
     } catch (encError) {
       console.error('Encryption key revocation failed:', encError);
     }
+
+    await DB.query(
+      `UPDATE mirror_groups SET current_member_count = current_member_count - 1 WHERE id = ?`,
+      [groupId]
+    );
 
     await mirrorGroupNotifications.notifyMemberLeft(
       membersRows as any[],
@@ -2211,7 +1875,7 @@ const deleteGroupHandler: RequestHandler = async (req, res) => {
 
     const group = (groupRows as any[])[0];
 
-    if (Number(group.owner_user_id) !== Number(user.id)) {
+    if (group.owner_user_id !== user.id) {
       res.status(403).json({ success: false, error: 'Only the group owner can delete the group' });
       return;
     }
@@ -2258,6 +1922,244 @@ const deleteGroupHandler: RequestHandler = async (req, res) => {
     console.error('Error deleting group:', error);
     res.status(500).json({ success: false, error: 'Failed to delete group' });
   }
+};
+
+/* ============================================================================
+   JOIN GROUP BY ID - Enterprise unified join handler
+   POST /:groupId/join
+============================================================================ */
+
+const joinGroupByIdHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    if (!user?.id) { res.status(401).json({ success: false, error: 'Authentication required' }); return; }
+    const { groupId } = req.params;
+    if (!validateGroupIdParam(groupId, res)) return;
+    const { joinCode } = req.body || {};
+    const [groupRows] = await DB.query(
+      `SELECT id, name, privacy, max_members, current_member_count, status, type FROM mirror_groups WHERE id = ? AND status = 'active'`,
+      [groupId]
+    );
+    if ((groupRows as any[]).length === 0) { res.status(404).json({ success: false, error: 'Group not found' }); return; }
+    const group = (groupRows as any[])[0];
+    if (group.current_member_count >= group.max_members) { res.status(409).json({ success: false, error: 'Group full' }); return; }
+
+    // Check existing membership
+    const [existingMember] = await DB.query(
+      `SELECT id, status FROM mirror_group_members WHERE group_id = ? AND user_id = ?`, [groupId, user.id]
+    );
+    if ((existingMember as any[]).length > 0) {
+      const s = (existingMember as any[])[0].status;
+      if (s === 'active') { res.status(409).json({ success: false, error: 'Already a member' }); return; }
+      if (s === 'banned') { res.status(403).json({ success: false, error: 'You are not permitted to join this group' }); return; }
+    }
+
+    if (group.privacy === 'public') {
+      const addResult = await atomicAddMember(groupId, user.id, 'member');
+      if (!addResult.success) { res.status(addResult.code === 'GROUP_FULL' ? 409 : 500).json({ success: false, error: addResult.error }); return; }
+      try {
+        const [keyRows] = await DB.query(`SELECT id, key_version FROM mirror_group_encryption_keys WHERE group_id = ? AND status = 'active' ORDER BY key_version DESC LIMIT 1`, [groupId]);
+        if ((keyRows as any[]).length > 0) { await groupEncryptionManager.distributeKeyToMember(groupId, String(user.id), (keyRows as any[])[0].id, (keyRows as any[])[0].key_version); }
+      } catch {}
+      try {
+        const [userInfo] = await DB.query(`SELECT username FROM users WHERE id = ?`, [user.id]);
+        const [membersRows] = await DB.query(`SELECT gm.user_id as userId, u.username as userName, u.email, gm.role FROM mirror_group_members gm JOIN users u ON gm.user_id = u.id WHERE gm.group_id = ? AND gm.status = 'active'`, [groupId]);
+        await mirrorGroupNotifications.notifyMemberJoined(membersRows as any[], { userId: String(user.id), userName: (userInfo as any[])[0]?.username || 'Unknown' }, group.name);
+      } catch {}
+      res.status(201).json({ success: true, data: { status: 'approved', groupId }, message: 'You have been added to the group!' });
+    } else {
+      if (!joinCode) { res.status(403).json({ success: false, error: 'This group requires an invitation to join' }); return; }
+      const [inviteRows] = await DB.query(`SELECT id FROM mirror_group_join_requests WHERE id = ? AND group_id = ? AND user_id = ? AND status = 'pending'`, [joinCode, groupId, user.id]);
+      if ((inviteRows as any[]).length === 0) { res.status(404).json({ success: false, error: 'Invalid or expired invitation' }); return; }
+      const addResult = await atomicAddMember(groupId, user.id, 'member');
+      if (!addResult.success) { res.status(500).json({ success: false, error: addResult.error }); return; }
+      await DB.query(`DELETE FROM mirror_group_join_requests WHERE id = ?`, [joinCode]);
+      try {
+        const [keyRows] = await DB.query(`SELECT id, key_version FROM mirror_group_encryption_keys WHERE group_id = ? AND status = 'active' ORDER BY key_version DESC LIMIT 1`, [groupId]);
+        if ((keyRows as any[]).length > 0) { await groupEncryptionManager.distributeKeyToMember(groupId, String(user.id), (keyRows as any[])[0].id, (keyRows as any[])[0].key_version); }
+      } catch {}
+      res.status(201).json({ success: true, data: { status: 'approved', groupId }, message: 'Successfully joined group' });
+    }
+  } catch (error) {
+    console.error('Error in joinGroupByIdHandler:', error);
+    res.status(500).json({ success: false, error: 'Failed to process join request' });
+  }
+};
+
+/* ============================================================================
+   UPDATE GROUP - PUT /:groupId
+============================================================================ */
+
+const updateGroupHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    if (!user?.id) { res.status(401).json({ success: false, error: 'Unauthorized' }); return; }
+    const { groupId } = req.params;
+    if (!validateGroupIdParam(groupId, res)) return;
+    const [memberCheck] = await DB.query(`SELECT role FROM mirror_group_members WHERE group_id = ? AND user_id = ? AND status = 'active' AND role IN ('owner', 'admin')`, [groupId, user.id]);
+    if ((memberCheck as any[]).length === 0) { res.status(403).json({ success: false, error: 'Only owners and admins can update group settings' }); return; }
+    const { name, description, goal, goalCustom, maxMembers, settings } = req.body;
+    const updates: string[] = [];
+    const params: any[] = [];
+    if (name !== undefined) { const s = sanitizeInput(name, 50); if (!s || s.length < 3) { res.status(400).json({ success: false, error: 'Name must be 3-50 chars' }); return; } updates.push('name = ?'); params.push(s); }
+    if (description !== undefined) { updates.push('description = ?'); params.push(sanitizeInput(description, 500)); }
+    if (goal !== undefined) { const g = sanitizeInput(goal, 500); if (g && isValidGoalPreset(g)) { updates.push('goal = ?'); params.push(g); } else if (g) { updates.push('goal_custom = ?'); params.push(g); } }
+    if (goalCustom !== undefined) { updates.push('goal_custom = ?'); params.push(sanitizeInput(goalCustom, 500)); }
+    if (maxMembers !== undefined) {
+      const newMax = Math.max(2, Math.min(100, Number(maxMembers) || 10));
+      const [gr] = await DB.query(`SELECT current_member_count FROM mirror_groups WHERE id = ?`, [groupId]);
+      if (newMax < (gr as any[])[0]?.current_member_count) { res.status(400).json({ success: false, error: 'Cannot set max below current count' }); return; }
+      updates.push('max_members = ?'); params.push(newMax);
+    }
+    if (settings !== undefined) { updates.push('settings = ?'); params.push(JSON.stringify(settings)); }
+    if (updates.length === 0) { res.status(400).json({ success: false, error: 'No valid fields to update' }); return; }
+    updates.push('updated_at = NOW()'); params.push(groupId);
+    await DB.query(`UPDATE mirror_groups SET ${updates.join(', ')} WHERE id = ?`, params);
+    res.json({ success: true, message: 'Group updated successfully' });
+  } catch (error) { console.error('Error updating group:', error); res.status(500).json({ success: false, error: 'Failed to update group' }); }
+};
+
+/* ============================================================================
+   REMOVE MEMBER - DELETE /:groupId/members/:userId
+============================================================================ */
+
+const removeMemberHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    if (!user?.id) { res.status(401).json({ success: false, error: 'Unauthorized' }); return; }
+    const { groupId, userId: targetUserId } = req.params;
+    const targetId = parseInt(targetUserId, 10);
+    if (isNaN(targetId)) { res.status(400).json({ success: false, error: 'Invalid user ID' }); return; }
+    if (targetId === user.id) { res.status(400).json({ success: false, error: 'Use leave endpoint instead' }); return; }
+    const [requesterCheck] = await DB.query(`SELECT role FROM mirror_group_members WHERE group_id = ? AND user_id = ? AND status = 'active'`, [groupId, user.id]);
+    if ((requesterCheck as any[]).length === 0 || !['owner', 'admin'].includes((requesterCheck as any[])[0].role)) { res.status(403).json({ success: false, error: 'Only owners and admins can remove members' }); return; }
+    const [targetCheck] = await DB.query(`SELECT role FROM mirror_group_members WHERE group_id = ? AND user_id = ? AND status = 'active'`, [groupId, targetId]);
+    if ((targetCheck as any[]).length === 0) { res.status(404).json({ success: false, error: 'Not an active member' }); return; }
+    if ((targetCheck as any[])[0].role === 'owner') { res.status(403).json({ success: false, error: 'Cannot remove the group owner' }); return; }
+    if ((targetCheck as any[])[0].role === 'admin' && (requesterCheck as any[])[0].role !== 'owner') { res.status(403).json({ success: false, error: 'Only the owner can remove admins' }); return; }
+    const r = await atomicRemoveMember(groupId, targetId, 'removed');
+    if (!r.success) { res.status(500).json({ success: false, error: r.error }); return; }
+    try { await groupEncryptionManager.revokeUserAccess(groupId, String(targetId)); } catch {}
+    res.json({ success: true, message: 'Member removed successfully' });
+  } catch (error) { console.error('Error removing member:', error); res.status(500).json({ success: false, error: 'Failed to remove member' }); }
+};
+
+/* ============================================================================
+   UPDATE MEMBER ROLE - PUT /:groupId/members/:userId/role
+============================================================================ */
+
+const updateMemberRoleHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    if (!user?.id) { res.status(401).json({ success: false, error: 'Unauthorized' }); return; }
+    const { groupId, userId: targetUserId } = req.params;
+    const targetId = parseInt(targetUserId, 10);
+    const { role: newRole } = req.body;
+    const validRoles = ['admin', 'moderator', 'member'];
+    if (!newRole || !validRoles.includes(newRole)) { res.status(400).json({ success: false, error: `Invalid role. Valid: ${validRoles.join(', ')}` }); return; }
+    const [ownerCheck] = await DB.query(`SELECT role FROM mirror_group_members WHERE group_id = ? AND user_id = ? AND status = 'active' AND role = 'owner'`, [groupId, user.id]);
+    if ((ownerCheck as any[]).length === 0) { res.status(403).json({ success: false, error: 'Only the owner can change roles' }); return; }
+    if (targetId === user.id) { res.status(400).json({ success: false, error: 'Cannot change your own role' }); return; }
+    const [targetCheck] = await DB.query(`SELECT role FROM mirror_group_members WHERE group_id = ? AND user_id = ? AND status = 'active'`, [groupId, targetId]);
+    if ((targetCheck as any[]).length === 0) { res.status(404).json({ success: false, error: 'Not an active member' }); return; }
+    await DB.query(`UPDATE mirror_group_members SET role = ? WHERE group_id = ? AND user_id = ? AND status = 'active'`, [newRole, groupId, targetId]);
+    res.json({ success: true, message: `Role updated to ${newRole}` });
+  } catch (error) { console.error('Error updating role:', error); res.status(500).json({ success: false, error: 'Failed to update role' }); }
+};
+
+/* ============================================================================
+   BAN MEMBER - POST /:groupId/members/:userId/ban
+============================================================================ */
+
+const banMemberHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    if (!user?.id) { res.status(401).json({ success: false, error: 'Unauthorized' }); return; }
+    const { groupId, userId: targetUserId } = req.params;
+    const targetId = parseInt(targetUserId, 10);
+    if (targetId === user.id) { res.status(400).json({ success: false, error: 'Cannot ban yourself' }); return; }
+    const [requesterCheck] = await DB.query(`SELECT role FROM mirror_group_members WHERE group_id = ? AND user_id = ? AND status = 'active'`, [groupId, user.id]);
+    if ((requesterCheck as any[]).length === 0 || !['owner', 'admin'].includes((requesterCheck as any[])[0].role)) { res.status(403).json({ success: false, error: 'Only owners and admins can ban members' }); return; }
+    const [targetCheck] = await DB.query(`SELECT role, status FROM mirror_group_members WHERE group_id = ? AND user_id = ?`, [groupId, targetId]);
+    if ((targetCheck as any[]).length === 0) { res.status(404).json({ success: false, error: 'User not found in group' }); return; }
+    const td = (targetCheck as any[])[0];
+    if (td.role === 'owner') { res.status(403).json({ success: false, error: 'Cannot ban the owner' }); return; }
+    if (td.role === 'admin' && (requesterCheck as any[])[0].role !== 'owner') { res.status(403).json({ success: false, error: 'Only owner can ban admins' }); return; }
+    if (td.status === 'banned') { res.status(409).json({ success: false, error: 'Already banned' }); return; }
+    if (td.status === 'active') {
+      const r = await atomicRemoveMember(groupId, targetId, 'banned');
+      if (!r.success) { res.status(500).json({ success: false, error: r.error }); return; }
+    } else {
+      await DB.query(`UPDATE mirror_group_members SET status = 'banned', left_at = NOW() WHERE group_id = ? AND user_id = ?`, [groupId, targetId]);
+    }
+    try { await groupEncryptionManager.revokeUserAccess(groupId, String(targetId)); } catch {}
+    await DB.query(`UPDATE mirror_group_join_requests SET status = 'rejected', processed_by = ?, processed_at = NOW() WHERE group_id = ? AND user_id = ? AND status = 'pending'`, [user.id, groupId, targetId]).catch(() => {});
+    res.json({ success: true, message: 'Member has been banned', data: { userId: targetId, status: 'banned' } });
+  } catch (error) { console.error('Error banning member:', error); res.status(500).json({ success: false, error: 'Failed to ban member' }); }
+};
+
+/* ============================================================================
+   UNBAN MEMBER - POST /:groupId/members/:userId/unban
+============================================================================ */
+
+const unbanMemberHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    if (!user?.id) { res.status(401).json({ success: false, error: 'Unauthorized' }); return; }
+    const { groupId, userId: targetUserId } = req.params;
+    const targetId = parseInt(targetUserId, 10);
+    const [requesterCheck] = await DB.query(`SELECT role FROM mirror_group_members WHERE group_id = ? AND user_id = ? AND status = 'active'`, [groupId, user.id]);
+    if ((requesterCheck as any[]).length === 0 || !['owner', 'admin'].includes((requesterCheck as any[])[0].role)) { res.status(403).json({ success: false, error: 'Only owners and admins can unban' }); return; }
+    const [targetCheck] = await DB.query(`SELECT id FROM mirror_group_members WHERE group_id = ? AND user_id = ? AND status = 'banned'`, [groupId, targetId]);
+    if ((targetCheck as any[]).length === 0) { res.status(404).json({ success: false, error: 'User is not banned' }); return; }
+    await DB.query(`UPDATE mirror_group_members SET status = 'left', left_at = NOW() WHERE group_id = ? AND user_id = ? AND status = 'banned'`, [groupId, targetId]);
+    res.json({ success: true, message: 'Member unbanned. They can now rejoin.' });
+  } catch (error) { console.error('Error unbanning:', error); res.status(500).json({ success: false, error: 'Failed to unban member' }); }
+};
+
+/* ============================================================================
+   GET BANNED MEMBERS - GET /:groupId/banned
+============================================================================ */
+
+const getBannedMembersHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    if (!user?.id) { res.status(401).json({ success: false, error: 'Unauthorized' }); return; }
+    const { groupId } = req.params;
+    const [requesterCheck] = await DB.query(`SELECT role FROM mirror_group_members WHERE group_id = ? AND user_id = ? AND status = 'active' AND role IN ('owner', 'admin')`, [groupId, user.id]);
+    if ((requesterCheck as any[]).length === 0) { res.status(403).json({ success: false, error: 'Only owners and admins can view banned members' }); return; }
+    const [rows] = await DB.query(`SELECT gm.user_id, u.username, gm.left_at as banned_at FROM mirror_group_members gm JOIN users u ON gm.user_id = u.id WHERE gm.group_id = ? AND gm.status = 'banned' ORDER BY gm.left_at DESC`, [groupId]);
+    res.json({ success: true, data: { banned: rows, total: (rows as any[]).length } });
+  } catch (error) { console.error('Error fetching banned:', error); res.status(500).json({ success: false, error: 'Failed to fetch banned members' }); }
+};
+
+/* ============================================================================
+   TRANSFER OWNERSHIP - POST /:groupId/transfer-ownership
+============================================================================ */
+
+const transferOwnershipHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    if (!user?.id) { res.status(401).json({ success: false, error: 'Unauthorized' }); return; }
+    const { groupId } = req.params;
+    const { newOwnerId } = req.body;
+    const targetId = parseInt(newOwnerId, 10);
+    if (isNaN(targetId) || targetId === user.id) { res.status(400).json({ success: false, error: 'Invalid new owner' }); return; }
+    const [groupRows] = await DB.query(`SELECT owner_user_id, name FROM mirror_groups WHERE id = ? AND status = 'active'`, [groupId]);
+    if ((groupRows as any[]).length === 0) { res.status(404).json({ success: false, error: 'Group not found' }); return; }
+    if (Number((groupRows as any[])[0].owner_user_id) !== Number(user.id)) { res.status(403).json({ success: false, error: 'Only the current owner can transfer' }); return; }
+    const [targetCheck] = await DB.query(`SELECT role FROM mirror_group_members WHERE group_id = ? AND user_id = ? AND status = 'active'`, [groupId, targetId]);
+    if ((targetCheck as any[]).length === 0) { res.status(404).json({ success: false, error: 'Target is not an active member' }); return; }
+    const conn = await DB.getConnection();
+    try {
+      await conn.beginTransaction();
+      await conn.query(`UPDATE mirror_groups SET owner_user_id = ?, updated_at = NOW() WHERE id = ?`, [targetId, groupId]);
+      await conn.query(`UPDATE mirror_group_members SET role = 'owner' WHERE group_id = ? AND user_id = ?`, [groupId, targetId]);
+      await conn.query(`UPDATE mirror_group_members SET role = 'admin' WHERE group_id = ? AND user_id = ?`, [groupId, user.id]);
+      await conn.commit();
+    } catch (txError) { await conn.rollback(); throw txError; } finally { conn.release(); }
+    res.json({ success: true, message: 'Ownership transferred successfully' });
+  } catch (error) { console.error('Error transferring ownership:', error); res.status(500).json({ success: false, error: 'Failed to transfer ownership' }); }
 };
 
 /* ============================================================================
@@ -2537,659 +2439,6 @@ const getDataSummaryHandler: RequestHandler = async (req, res) => {
 };
 
 /* ============================================================================
-   UPDATE GROUP
-   PUT /:groupId
-============================================================================ */
-
-const updateGroupHandler: RequestHandler = async (req, res) => {
-  try {
-    const user = (req as any).user;
-    if (!user?.id) {
-      res.status(401).json({ success: false, error: 'Unauthorized', code: 'NO_AUTH' });
-      return;
-    }
-
-    const { groupId } = req.params;
-    if (!validateGroupIdParam(groupId, res)) return;
-
-    // Verify user is owner or admin
-    const [memberCheck] = await DB.query(
-      `SELECT role FROM mirror_group_members
-       WHERE group_id = ? AND user_id = ? AND status = 'active' AND role IN ('owner', 'admin')`,
-      [groupId, user.id]
-    );
-
-    if ((memberCheck as any[]).length === 0) {
-      res.status(403).json({ success: false, error: 'Only owners and admins can update group settings' });
-      return;
-    }
-
-    const { name, description, goal, goalCustom, maxMembers, settings } = req.body;
-
-    const updates: string[] = [];
-    const params: any[] = [];
-
-    if (name !== undefined) {
-      const sanitizedName = sanitizeInput(name, 50);
-      if (!sanitizedName || sanitizedName.length < 3) {
-        res.status(400).json({ success: false, error: 'Group name must be between 3 and 50 characters' });
-        return;
-      }
-      updates.push('name = ?');
-      params.push(sanitizedName);
-    }
-
-    if (description !== undefined) {
-      updates.push('description = ?');
-      params.push(sanitizeInput(description, 500));
-    }
-
-    if (goal !== undefined) {
-      const rawGoal = sanitizeInput(goal, 500);
-      if (rawGoal && isValidGoalPreset(rawGoal)) {
-        updates.push('goal = ?');
-        params.push(rawGoal);
-      } else if (rawGoal) {
-        updates.push('goal_custom = ?');
-        params.push(rawGoal);
-      }
-    }
-
-    if (goalCustom !== undefined) {
-      updates.push('goal_custom = ?');
-      params.push(sanitizeInput(goalCustom, 500));
-    }
-
-    if (maxMembers !== undefined) {
-      const newMax = Math.max(2, Math.min(100, Number(maxMembers) || 10));
-      // Ensure new max isn't less than current members
-      const [groupRows] = await DB.query(
-        `SELECT current_member_count FROM mirror_groups WHERE id = ?`,
-        [groupId]
-      );
-      const currentCount = (groupRows as any[])[0]?.current_member_count || 0;
-      if (newMax < currentCount) {
-        res.status(400).json({
-          success: false,
-          error: `Cannot set max members to ${newMax} — group already has ${currentCount} members`
-        });
-        return;
-      }
-      updates.push('max_members = ?');
-      params.push(newMax);
-    }
-
-    if (settings !== undefined) {
-      updates.push('settings = ?');
-      params.push(JSON.stringify(settings));
-    }
-
-    if (updates.length === 0) {
-      res.status(400).json({ success: false, error: 'No valid fields to update' });
-      return;
-    }
-
-    updates.push('updated_at = NOW()');
-    params.push(groupId);
-
-    await DB.query(
-      `UPDATE mirror_groups SET ${updates.join(', ')} WHERE id = ?`,
-      params
-    );
-
-    res.json({ success: true, message: 'Group updated successfully' });
-  } catch (error) {
-    console.error('Error updating group:', error);
-    res.status(500).json({ success: false, error: 'Failed to update group' });
-  }
-};
-
-/* ============================================================================
-   REMOVE MEMBER (Owner/Admin only)
-   DELETE /:groupId/members/:userId
-============================================================================ */
-
-const removeMemberHandler: RequestHandler = async (req, res) => {
-  try {
-    const user = (req as any).user;
-    if (!user?.id) {
-      res.status(401).json({ success: false, error: 'Unauthorized', code: 'NO_AUTH' });
-      return;
-    }
-
-    const { groupId, userId: targetUserId } = req.params;
-    if (!validateGroupIdParam(groupId, res)) return;
-
-    const targetId = parseInt(targetUserId, 10);
-    if (isNaN(targetId)) {
-      res.status(400).json({ success: false, error: 'Invalid user ID' });
-      return;
-    }
-
-    // Cannot remove yourself (use leave instead)
-    if (targetId === user.id) {
-      res.status(400).json({ success: false, error: 'Use the leave endpoint to remove yourself' });
-      return;
-    }
-
-    // Verify requester is owner or admin
-    const [requesterCheck] = await DB.query(
-      `SELECT role FROM mirror_group_members
-       WHERE group_id = ? AND user_id = ? AND status = 'active'`,
-      [groupId, user.id]
-    );
-
-    if ((requesterCheck as any[]).length === 0) {
-      res.status(403).json({ success: false, error: 'Not a member of this group' });
-      return;
-    }
-
-    const requesterRole = (requesterCheck as any[])[0].role;
-    if (!['owner', 'admin'].includes(requesterRole)) {
-      res.status(403).json({ success: false, error: 'Only owners and admins can remove members' });
-      return;
-    }
-
-    // Check target's role — admins cannot remove other admins or owner
-    const [targetCheck] = await DB.query(
-      `SELECT role FROM mirror_group_members
-       WHERE group_id = ? AND user_id = ? AND status = 'active'`,
-      [groupId, targetId]
-    );
-
-    if ((targetCheck as any[]).length === 0) {
-      res.status(404).json({ success: false, error: 'Target user is not an active member' });
-      return;
-    }
-
-    const targetRole = (targetCheck as any[])[0].role;
-    if (targetRole === 'owner') {
-      res.status(403).json({ success: false, error: 'Cannot remove the group owner' });
-      return;
-    }
-    if (targetRole === 'admin' && requesterRole !== 'owner') {
-      res.status(403).json({ success: false, error: 'Only the owner can remove admins' });
-      return;
-    }
-
-    // Atomically remove
-    const removeResult = await atomicRemoveMember(groupId, targetId, 'removed');
-    if (!removeResult.success) {
-      res.status(500).json({ success: false, error: removeResult.error });
-      return;
-    }
-
-    // Revoke encryption access (non-fatal)
-    try {
-      await groupEncryptionManager.revokeUserAccess(groupId, String(targetId));
-    } catch (encError) {
-      console.error('Encryption key revocation failed (non-fatal):', encError);
-    }
-
-    // Notify (non-fatal)
-    try {
-      const [groupInfo] = await DB.query(`SELECT name FROM mirror_groups WHERE id = ?`, [groupId]);
-      const [membersRows] = await DB.query(
-        `SELECT gm.user_id as userId, u.username as userName, u.email, gm.role
-         FROM mirror_group_members gm
-         JOIN users u ON gm.user_id = u.id
-         WHERE gm.group_id = ? AND gm.status = 'active'`,
-        [groupId]
-      );
-      const [targetInfo] = await DB.query(`SELECT username FROM users WHERE id = ?`, [targetId]);
-      await mirrorGroupNotifications.notifyMemberLeft(
-        membersRows as any[],
-        { userId: String(targetId), userName: (targetInfo as any[])[0]?.username || 'Unknown' },
-        (groupInfo as any[])[0]?.name || 'Unknown Group'
-      );
-    } catch (notifError) {
-      console.error('Remove notification failed (non-fatal):', notifError);
-    }
-
-    console.log(`User ${targetId} removed from group ${groupId} by ${user.id} (${requesterRole})`);
-    res.json({ success: true, message: 'Member removed successfully' });
-  } catch (error) {
-    console.error('Error removing member:', error);
-    res.status(500).json({ success: false, error: 'Failed to remove member' });
-  }
-};
-
-/* ============================================================================
-   UPDATE MEMBER ROLE (Owner only)
-   PUT /:groupId/members/:userId/role
-============================================================================ */
-
-const updateMemberRoleHandler: RequestHandler = async (req, res) => {
-  try {
-    const user = (req as any).user;
-    if (!user?.id) {
-      res.status(401).json({ success: false, error: 'Unauthorized', code: 'NO_AUTH' });
-      return;
-    }
-
-    const { groupId, userId: targetUserId } = req.params;
-    if (!validateGroupIdParam(groupId, res)) return;
-
-    const targetId = parseInt(targetUserId, 10);
-    if (isNaN(targetId)) {
-      res.status(400).json({ success: false, error: 'Invalid user ID' });
-      return;
-    }
-
-    const { role: newRole } = req.body;
-    const validRoles = ['admin', 'moderator', 'member'];
-    if (!newRole || !validRoles.includes(newRole)) {
-      res.status(400).json({ success: false, error: `Invalid role. Valid roles: ${validRoles.join(', ')}` });
-      return;
-    }
-
-    // Only owner can change roles
-    const [ownerCheck] = await DB.query(
-      `SELECT role FROM mirror_group_members
-       WHERE group_id = ? AND user_id = ? AND status = 'active' AND role = 'owner'`,
-      [groupId, user.id]
-    );
-
-    if ((ownerCheck as any[]).length === 0) {
-      res.status(403).json({ success: false, error: 'Only the group owner can change member roles' });
-      return;
-    }
-
-    // Cannot change own role
-    if (targetId === user.id) {
-      res.status(400).json({ success: false, error: 'Cannot change your own role' });
-      return;
-    }
-
-    // Verify target is active member
-    const [targetCheck] = await DB.query(
-      `SELECT role FROM mirror_group_members
-       WHERE group_id = ? AND user_id = ? AND status = 'active'`,
-      [groupId, targetId]
-    );
-
-    if ((targetCheck as any[]).length === 0) {
-      res.status(404).json({ success: false, error: 'Target user is not an active member' });
-      return;
-    }
-
-    await DB.query(
-      `UPDATE mirror_group_members SET role = ? WHERE group_id = ? AND user_id = ? AND status = 'active'`,
-      [newRole, groupId, targetId]
-    );
-
-    console.log(`User ${targetId} role changed to ${newRole} in group ${groupId} by owner ${user.id}`);
-    res.json({ success: true, message: `Role updated to ${newRole}` });
-  } catch (error) {
-    console.error('Error updating member role:', error);
-    res.status(500).json({ success: false, error: 'Failed to update member role' });
-  }
-};
-
-/* ============================================================================
-   BAN MEMBER (Owner/Admin only)
-   POST /:groupId/members/:userId/ban
-============================================================================ */
-
-const banMemberHandler: RequestHandler = async (req, res) => {
-  try {
-    const user = (req as any).user;
-    if (!user?.id) {
-      res.status(401).json({ success: false, error: 'Unauthorized', code: 'NO_AUTH' });
-      return;
-    }
-
-    const { groupId, userId: targetUserId } = req.params;
-    const { reason } = req.body || {};
-
-    const targetId = parseInt(targetUserId, 10);
-    if (isNaN(targetId)) {
-      res.status(400).json({ success: false, error: 'Invalid user ID' });
-      return;
-    }
-
-    // Cannot ban yourself
-    if (targetId === user.id) {
-      res.status(400).json({ success: false, error: 'Cannot ban yourself' });
-      return;
-    }
-
-    // Verify requester is owner or admin
-    const [requesterCheck] = await DB.query(
-      `SELECT role FROM mirror_group_members
-       WHERE group_id = ? AND user_id = ? AND status = 'active'`,
-      [groupId, user.id]
-    );
-
-    if ((requesterCheck as any[]).length === 0) {
-      res.status(403).json({ success: false, error: 'Not a member of this group' });
-      return;
-    }
-
-    const requesterRole = (requesterCheck as any[])[0].role;
-    if (!['owner', 'admin'].includes(requesterRole)) {
-      res.status(403).json({ success: false, error: 'Only owners and admins can ban members' });
-      return;
-    }
-
-    // Check target exists and their role
-    const [targetCheck] = await DB.query(
-      `SELECT role, status FROM mirror_group_members
-       WHERE group_id = ? AND user_id = ?`,
-      [groupId, targetId]
-    );
-
-    if ((targetCheck as any[]).length === 0) {
-      res.status(404).json({ success: false, error: 'User is not associated with this group' });
-      return;
-    }
-
-    const targetData = (targetCheck as any[])[0];
-
-    // Cannot ban the owner
-    if (targetData.role === 'owner') {
-      res.status(403).json({ success: false, error: 'Cannot ban the group owner' });
-      return;
-    }
-
-    // Admins cannot ban other admins — only owner can
-    if (targetData.role === 'admin' && requesterRole !== 'owner') {
-      res.status(403).json({ success: false, error: 'Only the owner can ban admins' });
-      return;
-    }
-
-    // If already banned
-    if (targetData.status === 'banned') {
-      res.status(409).json({ success: false, error: 'User is already banned from this group' });
-      return;
-    }
-
-    // Use atomicRemoveMember with 'banned' status if currently active
-    if (targetData.status === 'active') {
-      const removeResult = await atomicRemoveMember(groupId, targetId, 'banned');
-      if (!removeResult.success) {
-        res.status(500).json({ success: false, error: removeResult.error });
-        return;
-      }
-    } else {
-      // Just update status to banned (was left/removed/invited)
-      await DB.query(
-        `UPDATE mirror_group_members SET status = 'banned', left_at = NOW()
-         WHERE group_id = ? AND user_id = ?`,
-        [groupId, targetId]
-      );
-    }
-
-    // Revoke encryption access (non-fatal)
-    try {
-      await groupEncryptionManager.revokeUserAccess(groupId, String(targetId));
-    } catch (encError) {
-      console.error('Encryption key revocation failed (non-fatal):', encError);
-    }
-
-    // Clean up any pending join requests from this user
-    await DB.query(
-      `UPDATE mirror_group_join_requests SET status = 'rejected', processed_by = ?, processed_at = NOW()
-       WHERE group_id = ? AND user_id = ? AND status = 'pending'`,
-      [user.id, groupId, targetId]
-    ).catch(() => {});
-
-    // Log the ban
-    const sanitizedReason = sanitizeInput(reason, 500) || 'No reason provided';
-    console.log(`User ${targetId} BANNED from group ${groupId} by ${user.id} (${requesterRole}). Reason: ${sanitizedReason}`);
-
-    // Notify group members about the ban (non-fatal)
-    try {
-      const [groupInfo] = await DB.query(`SELECT name FROM mirror_groups WHERE id = ?`, [groupId]);
-      const [membersRows] = await DB.query(
-        `SELECT gm.user_id as userId, u.username as userName, u.email, gm.role
-         FROM mirror_group_members gm
-         JOIN users u ON gm.user_id = u.id
-         WHERE gm.group_id = ? AND gm.status = 'active'`,
-        [groupId]
-      );
-      const [targetInfo] = await DB.query(`SELECT username FROM users WHERE id = ?`, [targetId]);
-      await mirrorGroupNotifications.notifyMemberLeft(
-        membersRows as any[],
-        { userId: String(targetId), userName: (targetInfo as any[])[0]?.username || 'Unknown' },
-        (groupInfo as any[])[0]?.name || 'Unknown Group'
-      );
-    } catch (notifError) {
-      console.error('Ban notification failed (non-fatal):', notifError);
-    }
-
-    res.json({
-      success: true,
-      message: 'Member has been banned from the group',
-      data: { userId: targetId, status: 'banned' }
-    });
-  } catch (error) {
-    console.error('Error banning member:', error);
-    res.status(500).json({ success: false, error: 'Failed to ban member' });
-  }
-};
-
-/* ============================================================================
-   UNBAN MEMBER (Owner/Admin only)
-   POST /:groupId/members/:userId/unban
-============================================================================ */
-
-const unbanMemberHandler: RequestHandler = async (req, res) => {
-  try {
-    const user = (req as any).user;
-    if (!user?.id) {
-      res.status(401).json({ success: false, error: 'Unauthorized', code: 'NO_AUTH' });
-      return;
-    }
-
-    const { groupId, userId: targetUserId } = req.params;
-
-    const targetId = parseInt(targetUserId, 10);
-    if (isNaN(targetId)) {
-      res.status(400).json({ success: false, error: 'Invalid user ID' });
-      return;
-    }
-
-    // Verify requester is owner or admin
-    const [requesterCheck] = await DB.query(
-      `SELECT role FROM mirror_group_members
-       WHERE group_id = ? AND user_id = ? AND status = 'active'`,
-      [groupId, user.id]
-    );
-
-    if ((requesterCheck as any[]).length === 0) {
-      res.status(403).json({ success: false, error: 'Not a member of this group' });
-      return;
-    }
-
-    const requesterRole = (requesterCheck as any[])[0].role;
-    if (!['owner', 'admin'].includes(requesterRole)) {
-      res.status(403).json({ success: false, error: 'Only owners and admins can unban members' });
-      return;
-    }
-
-    // Check target is actually banned
-    const [targetCheck] = await DB.query(
-      `SELECT id, status FROM mirror_group_members
-       WHERE group_id = ? AND user_id = ? AND status = 'banned'`,
-      [groupId, targetId]
-    );
-
-    if ((targetCheck as any[]).length === 0) {
-      res.status(404).json({ success: false, error: 'User is not banned from this group' });
-      return;
-    }
-
-    // Unban: set status to 'left' (they can rejoin but are not auto-added)
-    await DB.query(
-      `UPDATE mirror_group_members SET status = 'left', left_at = NOW()
-       WHERE group_id = ? AND user_id = ? AND status = 'banned'`,
-      [groupId, targetId]
-    );
-
-    const [targetInfo] = await DB.query(`SELECT username FROM users WHERE id = ?`, [targetId]);
-    console.log(`User ${targetId} (${(targetInfo as any[])[0]?.username}) UNBANNED from group ${groupId} by ${user.id}`);
-
-    res.json({
-      success: true,
-      message: 'Member has been unbanned. They can now rejoin the group.',
-      data: { userId: targetId, status: 'unbanned' }
-    });
-  } catch (error) {
-    console.error('Error unbanning member:', error);
-    res.status(500).json({ success: false, error: 'Failed to unban member' });
-  }
-};
-
-/* ============================================================================
-   GET BANNED MEMBERS (Owner/Admin only)
-   GET /:groupId/banned
-============================================================================ */
-
-const getBannedMembersHandler: RequestHandler = async (req, res) => {
-  try {
-    const user = (req as any).user;
-    if (!user?.id) {
-      res.status(401).json({ success: false, error: 'Unauthorized', code: 'NO_AUTH' });
-      return;
-    }
-
-    const { groupId } = req.params;
-
-    // Verify requester is owner or admin
-    const [requesterCheck] = await DB.query(
-      `SELECT role FROM mirror_group_members
-       WHERE group_id = ? AND user_id = ? AND status = 'active' AND role IN ('owner', 'admin')`,
-      [groupId, user.id]
-    );
-
-    if ((requesterCheck as any[]).length === 0) {
-      res.status(403).json({ success: false, error: 'Only owners and admins can view banned members' });
-      return;
-    }
-
-    const [bannedRows] = await DB.query(
-      `SELECT gm.user_id, u.username, gm.left_at as banned_at
-       FROM mirror_group_members gm
-       JOIN users u ON gm.user_id = u.id
-       WHERE gm.group_id = ? AND gm.status = 'banned'
-       ORDER BY gm.left_at DESC`,
-      [groupId]
-    );
-
-    res.json({
-      success: true,
-      data: {
-        banned: (bannedRows as any[]).map(row => ({
-          userId: row.user_id,
-          username: row.username,
-          bannedAt: row.banned_at
-        })),
-        total: (bannedRows as any[]).length
-      }
-    });
-  } catch (error) {
-    console.error('Error fetching banned members:', error);
-    res.status(500).json({ success: false, error: 'Failed to fetch banned members' });
-  }
-};
-
-/* ============================================================================
-   TRANSFER OWNERSHIP
-   POST /:groupId/transfer-ownership
-============================================================================ */
-
-const transferOwnershipHandler: RequestHandler = async (req, res) => {
-  try {
-    const user = (req as any).user;
-    if (!user?.id) {
-      res.status(401).json({ success: false, error: 'Unauthorized', code: 'NO_AUTH' });
-      return;
-    }
-
-    const { groupId } = req.params;
-    if (!validateGroupIdParam(groupId, res)) return;
-
-    const { newOwnerId } = req.body;
-    const targetId = parseInt(newOwnerId, 10);
-    if (isNaN(targetId)) {
-      res.status(400).json({ success: false, error: 'Invalid new owner ID' });
-      return;
-    }
-
-    if (targetId === user.id) {
-      res.status(400).json({ success: false, error: 'You are already the owner' });
-      return;
-    }
-
-    // Verify requester is current owner
-    const [groupRows] = await DB.query(
-      `SELECT owner_user_id, name FROM mirror_groups WHERE id = ? AND status = 'active'`,
-      [groupId]
-    );
-
-    if ((groupRows as any[]).length === 0) {
-      res.status(404).json({ success: false, error: 'Group not found' });
-      return;
-    }
-
-    const group = (groupRows as any[])[0];
-    if (Number(group.owner_user_id) !== Number(user.id)) {
-      res.status(403).json({ success: false, error: 'Only the current owner can transfer ownership' });
-      return;
-    }
-
-    // Verify new owner is an active member
-    const [targetCheck] = await DB.query(
-      `SELECT role FROM mirror_group_members
-       WHERE group_id = ? AND user_id = ? AND status = 'active'`,
-      [groupId, targetId]
-    );
-
-    if ((targetCheck as any[]).length === 0) {
-      res.status(404).json({ success: false, error: 'Target user is not an active member of this group' });
-      return;
-    }
-
-    // Transfer: update group owner + member roles (transaction)
-    const conn = await DB.getConnection();
-    try {
-      await conn.beginTransaction();
-
-      await conn.query(
-        `UPDATE mirror_groups SET owner_user_id = ?, updated_at = NOW() WHERE id = ?`,
-        [targetId, groupId]
-      );
-
-      // New owner gets 'owner' role
-      await conn.query(
-        `UPDATE mirror_group_members SET role = 'owner' WHERE group_id = ? AND user_id = ?`,
-        [groupId, targetId]
-      );
-
-      // Old owner becomes 'admin'
-      await conn.query(
-        `UPDATE mirror_group_members SET role = 'admin' WHERE group_id = ? AND user_id = ?`,
-        [groupId, user.id]
-      );
-
-      await conn.commit();
-    } catch (txError) {
-      await conn.rollback();
-      throw txError;
-    } finally {
-      conn.release();
-    }
-
-    console.log(`Ownership of group ${groupId} transferred from user ${user.id} to user ${targetId}`);
-    res.json({ success: true, message: 'Ownership transferred successfully' });
-  } catch (error) {
-    console.error('Error transferring ownership:', error);
-    res.status(500).json({ success: false, error: 'Failed to transfer ownership' });
-  }
-};
-
-/* ============================================================================
    ROUTE REGISTRATION - UPDATED WITH PHASE 6 ENDPOINTS
 ============================================================================ */
 
@@ -3205,30 +2454,22 @@ router.param('groupId', (req: express.Request, res: express.Response, next: expr
   next();
 });
 
-// ---- Per-user rate limiting for mutation endpoints ----
+// ---- Per-user rate limiting for join endpoints ----
 const joinRateLimits = new Map<string, number[]>();
 const rateLimitedJoin: RequestHandler = ((req: express.Request, res: express.Response, next: express.NextFunction) => {
   const user = (req as any).user;
   if (!user?.id) { next(); return; }
   const key = `join:${user.id}`;
   const now = Date.now();
-  const window = 60000; // 1 minute
-  const max = 10; // max 10 join attempts per minute
+  const window = 60000;
+  const max = 10;
   const timestamps = (joinRateLimits.get(key) || []).filter(t => now - t < window);
-  if (timestamps.length >= max) {
-    res.status(429).json({
-      success: false,
-      error: 'Too many join attempts. Please wait a moment.',
-      code: 'RATE_LIMIT_EXCEEDED'
-    });
-    return;
-  }
+  if (timestamps.length >= max) { res.status(429).json({ success: false, error: 'Too many join attempts. Please wait.' }); return; }
   timestamps.push(now);
   joinRateLimits.set(key, timestamps);
   next();
 }) as RequestHandler;
 
-// Clean up rate limit entries every 5 minutes
 setInterval(() => {
   const now = Date.now();
   for (const [key, timestamps] of joinRateLimits.entries()) {

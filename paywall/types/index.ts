@@ -58,7 +58,7 @@ export interface SubscriptionWithUsage extends Subscription {
 
 export interface UsageRecord {
   featureKey: string;
-  periodType: 'daily' | 'monthly';
+  periodType: 'daily' | 'weekly' | 'monthly';
   periodStart: string; // YYYY-MM-DD
   count: number;
   limit: number;

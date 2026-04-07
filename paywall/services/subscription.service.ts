@@ -61,33 +61,32 @@ export class SubscriptionService {
    * Reads from Redis cache first, falls back to DB.
    */
   async getSubscription(userId: number): Promise<SubscriptionWithUsage> {
-    // Check cache
+    // Check cache for subscription state (not usage — usage is always fresh)
+    let sub: Subscription;
     const cached = await mirrorRedis.get(cacheKey(userId));
     if (cached) {
-      return cached as SubscriptionWithUsage;
-    }
-
-    // Query DB
-    const [rows] = await DB.query(
-      'SELECT * FROM user_subscriptions WHERE user_id = ?',
-      [userId]
-    );
-
-    const dbRows = rows as any[];
-    let sub: Subscription;
-
-    if (dbRows.length === 0) {
-      // No subscription record — create free tier
-      sub = await this.createFreeSubscription(userId);
+      sub = cached as Subscription;
     } else {
-      sub = this.mapRowToSubscription(dbRows[0]);
+      // Query DB
+      const [rows] = await DB.query(
+        'SELECT * FROM user_subscriptions WHERE user_id = ?',
+        [userId]
+      );
+
+      const dbRows = rows as any[];
+
+      if (dbRows.length === 0) {
+        sub = await this.createFreeSubscription(userId);
+      } else {
+        sub = this.mapRowToSubscription(dbRows[0]);
+      }
+
+      // Cache subscription state only (usage rebuilt fresh each time)
+      await mirrorRedis.set(cacheKey(userId), sub, CACHE_TTL);
     }
 
-    // Build full response with usage
+    // Always build usage fresh from DB (not cached)
     const full = await this.buildSubscriptionWithUsage(sub);
-
-    // Cache
-    await mirrorRedis.set(cacheKey(userId), full, CACHE_TTL);
 
     return full;
   }
@@ -409,7 +408,7 @@ export class SubscriptionService {
   /**
    * Get usage for a specific feature and period.
    */
-  async getUsage(userId: number, featureKey: string, periodType: 'daily' | 'monthly'): Promise<UsageRecord> {
+  async getUsage(userId: number, featureKey: string, periodType: 'daily' | 'weekly' | 'monthly'): Promise<UsageRecord> {
     const periodStart = this.getCurrentPeriodStart(periodType);
     const limit = getFreeTierLimit(this.config, featureKey) ?? 999999;
 
@@ -435,7 +434,7 @@ export class SubscriptionService {
   /**
    * Increment usage counter. Returns updated count and whether limit is exceeded.
    */
-  async incrementUsage(userId: number, featureKey: string, periodType: 'daily' | 'monthly'): Promise<{
+  async incrementUsage(userId: number, featureKey: string, periodType: 'daily' | 'weekly' | 'monthly'): Promise<{
     count: number;
     limit: number;
     exceeded: boolean;
@@ -464,7 +463,7 @@ export class SubscriptionService {
   /**
    * Check if a feature's usage limit is exceeded (without incrementing).
    */
-  async isUsageExceeded(userId: number, featureKey: string, periodType: 'daily' | 'monthly'): Promise<boolean> {
+  async isUsageExceeded(userId: number, featureKey: string, periodType: 'daily' | 'weekly' | 'monthly'): Promise<boolean> {
     const usage = await this.getUsage(userId, featureKey, periodType);
     return usage.count >= usage.limit;
   }
@@ -709,12 +708,16 @@ export class SubscriptionService {
     const limits = this.config.freeLimits;
 
     for (const [featureKey, limit] of Object.entries(limits)) {
-      const periodType = featureKey.includes('per_day') ? 'daily' as const : 'monthly' as const;
+      const periodType = featureKey.includes('per_day') ? 'daily' as const
+        : featureKey.includes('per_week') ? 'weekly' as const
+        : 'monthly' as const;
       const usage = await this.getUsage(userId, featureKey, periodType);
 
       const resetsAt = periodType === 'daily'
         ? this.getNextDayStart()
-        : this.getNextMonthStart();
+        : periodType === 'weekly'
+          ? this.getNextWeekStart()
+          : this.getNextMonthStart();
 
       summary[featureKey] = {
         used: usage.count,
@@ -794,12 +797,29 @@ export class SubscriptionService {
     }
   }
 
-  private getCurrentPeriodStart(periodType: 'daily' | 'monthly'): string {
+  private getCurrentPeriodStart(periodType: 'daily' | 'weekly' | 'monthly'): string {
     const now = new Date();
     if (periodType === 'daily') {
-      return now.toISOString().split('T')[0]; // YYYY-MM-DD
+      return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    }
+    if (periodType === 'weekly') {
+      // Start of current week (Monday)
+      const day = now.getDay();
+      const diff = day === 0 ? 6 : day - 1; // Monday = 0 offset
+      const monday = new Date(now);
+      monday.setDate(now.getDate() - diff);
+      return `${monday.getFullYear()}-${String(monday.getMonth() + 1).padStart(2, '0')}-${String(monday.getDate()).padStart(2, '0')}`;
     }
     return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+  }
+
+  private getNextWeekStart(): Date {
+    const d = new Date();
+    const day = d.getDay();
+    const daysUntilMonday = day === 0 ? 1 : 8 - day;
+    d.setDate(d.getDate() + daysUntilMonday);
+    d.setHours(0, 0, 0, 0);
+    return d;
   }
 
   private getNextDayStart(): Date {
