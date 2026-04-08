@@ -5,7 +5,7 @@
 
 import { Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
-import DB from '../config/database/db';
+import { DB } from '../db';
 import { validateJournalEntry, calculateSentiment, extractThemes } from '../utils/journalHelpers';
 
 // ============================================================================
@@ -14,8 +14,10 @@ import { validateJournalEntry, calculateSentiment, extractThemes } from '../util
 
 interface AuthenticatedRequest extends Request {
   user?: {
-    id: string;
+    id: number;
     email: string;
+    username: string;
+    sessionId: string;
   };
 }
 
@@ -61,14 +63,14 @@ export class JournalController {
       }
 
       // Check if entry already exists for this date/time
-      const existingEntry = await DB.query(`
-        SELECT id FROM mirror_journal_entries 
+      const [existingEntry]: any = await DB.query(`
+        SELECT id FROM mirror_journal_entries
         WHERE user_id = ? AND entry_date = ? AND time_of_day = ? AND deleted_at IS NULL
       `, [userId, entryDate, timeOfDay]);
 
       if (existingEntry.length > 0) {
-        return res.status(409).json({ 
-          success: false, 
+        return res.status(409).json({
+          success: false,
           error: 'Entry already exists for this date and time of day. Use PUT to update.',
           existingEntryId: existingEntry[0].id
         });
@@ -103,7 +105,7 @@ export class JournalController {
       ]);
 
       // Invalidate analytics cache
-      await JournalController.invalidateAnalyticsCache(userId);
+      await JournalController.invalidateAnalyticsCache(String(userId));
 
       console.log(`✅ Journal entry created: ${entryId} for user ${userId}`);
 
@@ -177,11 +179,11 @@ export class JournalController {
 
       query += ` ORDER BY time_of_day ASC`;
 
-      const entries = await DB.query(query, params);
+      const [entries]: any = await DB.query(query, params);
 
       if (entries.length === 0) {
-        return res.status(404).json({ 
-          success: false, 
+        return res.status(404).json({
+          success: false,
           error: 'No journal entries found for this date',
           date,
           timeOfDay: timeOfDay || 'any'
@@ -308,7 +310,7 @@ export class JournalController {
       query += ` LIMIT ? OFFSET ?`;
       params.push(parseInt(limit as string), parseInt(offset as string));
 
-      const entries = await DB.query(query, params);
+      const [entries]: any = await DB.query(query, params);
 
       // Parse JSON fields
       const parsedEntries = entries.map((entry: any) => ({
@@ -320,11 +322,11 @@ export class JournalController {
 
       // Get total count for pagination
       const countQuery = `
-        SELECT COUNT(*) as total 
-        FROM mirror_journal_entries 
+        SELECT COUNT(*) as total
+        FROM mirror_journal_entries
         WHERE user_id = ? AND deleted_at IS NULL
       `;
-      const countResult = await DB.query(countQuery, [userId]);
+      const [countResult]: any = await DB.query(countQuery, [userId]);
       const totalEntries = countResult[0].total;
 
       console.log(`✅ Retrieved ${parsedEntries.length} entries for user ${userId}`);
@@ -365,8 +367,8 @@ export class JournalController {
 
     try {
       // Check ownership and edit window (24 hours)
-      const existing = await DB.query(`
-        SELECT id, created_at FROM mirror_journal_entries 
+      const [existing]: any = await DB.query(`
+        SELECT id, created_at FROM mirror_journal_entries
         WHERE id = ? AND user_id = ? AND deleted_at IS NULL
       `, [entryId, userId]);
 
@@ -478,7 +480,7 @@ export class JournalController {
       await DB.query(query, params);
 
       // Invalidate analytics cache
-      await JournalController.invalidateAnalyticsCache(userId);
+      await JournalController.invalidateAnalyticsCache(String(userId));
 
       console.log(`✅ Journal entry updated: ${entryId}`);
 
@@ -535,7 +537,7 @@ export class JournalController {
         ORDER BY entry_date ASC
       `;
 
-      const results = await DB.query(query, [userId, start, end]);
+      const [results]: any = await DB.query(query, [userId, start, end]);
 
       const trendData = results.map((row: any) => ({
         date: row.entry_date,

@@ -20,7 +20,7 @@
 
 import { Worker } from 'worker_threads';
 import { EventEmitter } from 'events';
-import pool from '../db';
+import { DB as pool } from '../db';
 import path from 'path';
 
 // ============================================================================

@@ -40,7 +40,7 @@ router.get('/', async (req, res) => {
 
     // Check Redis
     try {
-      const redisHealth = await mirrorRedis.getHealth();
+      const redisHealth = await mirrorRedis.healthCheck();
       health.components.redis = redisHealth;
       if (redisHealth.status !== 'healthy') {
         health.status = 'degraded';
@@ -89,7 +89,7 @@ router.get('/database', async (req, res) => {
  */
 router.get('/redis', async (req, res) => {
   try {
-    const health = await mirrorRedis.getHealth();
+    const health = await mirrorRedis.healthCheck();
     res.status(health.status === 'healthy' ? 200 : 503).json(health);
   } catch (error) {
     res.status(503).json({
@@ -105,8 +105,8 @@ router.get('/redis', async (req, res) => {
  */
 router.get('/dina', async (req, res) => {
   try {
-    const health = await dinaLLMConnector.getHealth();
-    const statusCode = health.status === 'healthy' ? 200 : health.status === 'degraded' ? 503 : 503;
+    const health = await dinaLLMConnector.healthCheck();
+    const statusCode = health.healthy ? 200 : 503;
     res.status(statusCode).json(health);
   } catch (error) {
     res.status(503).json({

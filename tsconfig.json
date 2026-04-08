@@ -1,16 +1,22 @@
 {
   "compilerOptions": {
-    "target": "ES2020",                          
-    "module": "commonjs",                        
-    "outDir": "dist",                            
-    "rootDir": ".",                              
-    "strict": true,                              
-    "esModuleInterop": true,                     
-    "forceConsistentCasingInFileNames": true,    
-    "skipLibCheck": true,                        
-    "moduleResolution": "node",                 
-    "resolveJsonModule": true,                  
-    "allowJs": false                             
+    "target": "ES2020",
+    "module": "commonjs",
+    "outDir": "dist",
+    "rootDir": ".",
+    "strict": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "moduleResolution": "node10",
+    "ignoreDeprecations": "5.0",
+    "resolveJsonModule": true,
+    "allowJs": false,
+    "sourceMap": true,
+    "declaration": true,
+    "declarationMap": true,
+    "incremental": true,
+    "tsBuildInfoFile": "./dist/.tsbuildinfo"
   },
   "include": ["./**/*.ts"],
   "exclude": ["node_modules", "dist"]

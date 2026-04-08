@@ -5,6 +5,7 @@
 import { RequestHandler } from 'express';
 import { DB } from '../db';
 import crypto from 'crypto';
+import { v4 as uuidv4 } from 'uuid';
 import { groupEncryptionManager } from '../systems/GroupEncryptionManager';
 
 // ============================================================================
@@ -44,9 +45,6 @@ function validateGroupName(name: string): { valid: boolean; error?: string } {
   
   return { valid: true };
 }
-console.log('🔴🔴🔴 CORRECTED CONTROLLER RUNNING - VERSION 2.0 🔴🔴🔴');
-console.log('🔴 User ID:', req.user!.id);
-console.log('🔴 Group Name:', req.body.name);
 
 function validateGroupType(type: string): { valid: boolean; error?: string } {
   const validTypes = ['family', 'team', 'friends', 'community', 'public'];
@@ -657,9 +655,10 @@ const shareDataHandler: RequestHandler = async (req, res) => {
     const assessments = await aggregator.aggregateForUser(user.id);
 
     // Encrypt for group
+    const dataBuffer = Buffer.from(JSON.stringify(assessments.data), 'utf-8');
     const encryptedData = await groupEncryptionManager.encryptForGroup(
-      groupId,
-      JSON.stringify(assessments.data)
+      dataBuffer,
+      groupId
     );
 
     // Store in database
@@ -683,4 +682,4 @@ const shareDataHandler: RequestHandler = async (req, res) => {
   }
 };
 
-router.post('/:groupId/share-data', verified, shareDataHandler);
+// Route registration is handled in routes/groups.ts

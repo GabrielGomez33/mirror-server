@@ -11,10 +11,10 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
-import { Database } from '../config/database';
+import { DB } from '../db';
 import { mirrorRedis } from '../config/redis';
 import { Logger } from '../utils/logger';
-import { GroupEncryptionManager } from './GroupEncryptionManager';
+import { groupEncryptionManager, GroupEncryptionManager } from '../systems/GroupEncryptionManager';
 import {
   GroupAnalysisResult,
   CompatibilityMatrix,
@@ -46,16 +46,34 @@ export interface InsightUpdate {
 }
 
 export class GroupInsightManager {
-  private db: Database;
   private logger: Logger;
   private encryptionManager: GroupEncryptionManager;
   private readonly CACHE_TTL = 3600; // 1 hour
   private readonly INSIGHT_EXPIRY_DAYS = 30;
 
+  // Compatibility wrapper for DB pool — provides query/transaction interface
+  private db = {
+    query: async (sql: string, params?: any[]): Promise<any> => {
+      const [rows] = await DB.query(sql, params);
+      return rows;
+    },
+    beginTransaction: async () => {
+      const conn = await DB.getConnection();
+      await conn.beginTransaction();
+      return {
+        query: async (sql: string, params?: any[]): Promise<any> => {
+          const [rows] = await conn.query(sql, params);
+          return rows;
+        },
+        commit: async () => { await conn.commit(); conn.release(); },
+        rollback: async () => { await conn.rollback(); conn.release(); },
+      };
+    },
+  };
+
   constructor() {
     this.logger = new Logger('GroupInsightManager');
-    this.db = Database.getInstance();
-    this.encryptionManager = new GroupEncryptionManager();
+    this.encryptionManager = groupEncryptionManager;
   }
 
   /**
@@ -194,7 +212,7 @@ export class GroupInsightManager {
         ORDER BY ${sortBy} ${sortOrder}
         LIMIT ? OFFSET ?
       `;
-      params.push(limit, offset);
+      params.push(String(limit), String(offset));
 
       const results = await this.db.query(query, params);
 

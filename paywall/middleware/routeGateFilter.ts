@@ -174,13 +174,11 @@ const TIER_ORDER: Record<SubscriptionTier, number> = {
 // PATTERN MATCHING
 // ============================================================================
 
-/**
- * Match a request path against a route pattern.
- * Supports:
- *   - Exact match: '/journal/analyze'
- *   - Wildcard segments: '/groups/*/insights' matches '/groups/abc123/insights'
- *   - Trailing wildcard: '/analysis/*' matches '/analysis/anything/here'
- */
+// Match a request path against a route pattern.
+// Supports:
+//   - Exact match: '/journal/analyze'
+//   - Wildcard segments: '/groups/[wildcard]/insights' matches '/groups/abc123/insights'
+//   - Trailing wildcard: '/analysis/[wildcard]' matches '/analysis/anything/here'
 function matchRoute(requestPath: string, pattern: string): boolean {
   // Strip the /mirror/api prefix if present
   const cleanPath = requestPath.replace(/^\/mirror\/api/, '');
