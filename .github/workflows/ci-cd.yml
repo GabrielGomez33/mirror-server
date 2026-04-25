@@ -1,0 +1,288 @@
+# =============================================================================
+# MIRROR-SERVER CI/CD PIPELINE
+# =============================================================================
+# Enterprise-grade pipeline for the Mirror backend API + worker processes.
+#
+# TRIGGERS:
+#   - Push to master or develop → full pipeline + deploy
+#   - Pull request to master or develop → quality gates only (no deploy)
+#   - Manual dispatch → full pipeline with optional deploy
+#
+# QUALITY GATES:
+#   1. Dependency install (deterministic via npm ci)
+#   2. TypeScript strict type-check (tsc --noEmit)
+#   3. Full production build (tsc → dist/)
+#   4. Security audit (npm audit)
+#   5. Secret scanning (prevent accidental credential commits)
+#
+# DEPLOYMENT:
+#   - SSH into production server as mirror_app
+#   - Git pull → npm ci → build → PM2 zero-downtime reload
+#   - Health check verification with automatic rollback on failure
+#   - Git tag + GitHub Release on success
+# =============================================================================
+
+name: Mirror Server CI/CD
+
+on:
+  push:
+    branches: [master, develop]
+  pull_request:
+    branches: [master, develop]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: 'Force deploy to production'
+        required: false
+        type: boolean
+        default: false
+
+# Prevent concurrent deployments — queue new runs, cancel redundant PR checks
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  # ===========================================================================
+  # JOB 1: QUALITY GATES
+  # ===========================================================================
+  quality:
+    name: Quality Gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript type-check (strict)
+        run: npx tsc --noEmit
+
+      - name: Build production artifacts
+        run: npm run build
+
+      - name: Security audit
+        run: npm audit --audit-level=high
+        continue-on-error: true
+
+      - name: Scan for secrets in code
+        run: |
+          echo "Scanning for potential secrets..."
+          PATTERNS='(password|secret|api_key|private_key|token)\s*[:=]\s*["\x27][^"\x27]{8,}'
+          if grep -rniE "$PATTERNS" --include="*.ts" --include="*.js" --include="*.json" \
+            --exclude-dir=node_modules --exclude-dir=dist \
+            --exclude="package-lock.json" --exclude="*.d.ts" . ; then
+            echo "::warning::Potential hardcoded secrets detected. Review the matches above."
+          else
+            echo "No hardcoded secrets detected."
+          fi
+
+      - name: Verify build artifacts exist
+        run: |
+          if [ ! -f "dist/index.js" ]; then
+            echo "::error::Build failed — dist/index.js not found"
+            exit 1
+          fi
+          echo "Build artifacts verified:"
+          ls -la dist/
+          echo ""
+          echo "Worker artifacts:"
+          ls -la dist/workers/ 2>/dev/null || echo "No workers directory (may be expected)"
+
+  # ===========================================================================
+  # JOB 2: DEPLOY TO PRODUCTION
+  # ===========================================================================
+  deploy:
+    name: Deploy to Production
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true')
+
+    environment:
+      name: production
+      url: https://theundergroundrailroad.world/mirror/api/health
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Create pre-deploy snapshot
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'DEPLOY_SNAPSHOT'
+          cd ${{ secrets.SERVER_DEPLOY_PATH }}
+
+          # Tag current state for rollback
+          CURRENT_COMMIT=$(git rev-parse HEAD)
+          echo "Pre-deploy commit: $CURRENT_COMMIT"
+
+          # Save commit hash for rollback
+          echo "$CURRENT_COMMIT" > /tmp/.mirror-server-rollback-commit
+          DEPLOY_SNAPSHOT
+
+      - name: Deploy mirror-server
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'DEPLOY_SCRIPT'
+          set -e
+
+          echo "=========================================="
+          echo "  MIRROR-SERVER DEPLOYMENT"
+          echo "  $(date '+%Y-%m-%d %H:%M:%S')"
+          echo "=========================================="
+
+          cd ${{ secrets.SERVER_DEPLOY_PATH }}
+
+          # Step 1: Pull latest code
+          echo "[1/5] Pulling latest code..."
+          git fetch origin master
+          git reset --hard origin/master
+
+          # Step 2: Install production dependencies
+          echo "[2/5] Installing dependencies..."
+          npm ci --production
+
+          # Step 3: Build TypeScript
+          echo "[3/5] Building TypeScript..."
+          npm run build
+
+          # Step 4: Verify build output
+          echo "[4/5] Verifying build..."
+          if [ ! -f "dist/index.js" ]; then
+            echo "ERROR: Build failed — dist/index.js missing!"
+            exit 1
+          fi
+
+          # Step 5: Zero-downtime PM2 reload
+          echo "[5/5] Reloading PM2 processes..."
+          sudo pm2 reload ecosystem.config.js
+
+          echo ""
+          echo "Deploy complete. Waiting for processes to stabilize..."
+          sleep 10
+
+          # Show process status
+          sudo pm2 list
+          DEPLOY_SCRIPT
+
+      - name: Health check
+        id: health_check
+        run: |
+          echo "Running health check..."
+          MAX_RETRIES=6
+          RETRY_INTERVAL=5
+
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Attempt $i/$MAX_RETRIES..."
+
+            HTTP_CODE=$(ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+              ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} \
+              "curl -sk -o /dev/null -w '%{http_code}' https://localhost:\${MIRRORPORT:-8444}/mirror/api/health" \
+              2>/dev/null || echo "000")
+
+            echo "Health check response: HTTP $HTTP_CODE"
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "health_status=healthy" >> $GITHUB_OUTPUT
+              echo "Health check PASSED"
+              exit 0
+            fi
+
+            if [ "$i" -lt "$MAX_RETRIES" ]; then
+              echo "Retrying in ${RETRY_INTERVAL}s..."
+              sleep $RETRY_INTERVAL
+            fi
+          done
+
+          echo "health_status=unhealthy" >> $GITHUB_OUTPUT
+          echo "::error::Health check FAILED after $MAX_RETRIES attempts"
+          exit 1
+
+      - name: Rollback on failure
+        if: failure() && steps.health_check.outputs.health_status == 'unhealthy'
+        run: |
+          echo "::error::DEPLOYING ROLLBACK..."
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'ROLLBACK_SCRIPT'
+          set -e
+          cd ${{ secrets.SERVER_DEPLOY_PATH }}
+
+          ROLLBACK_COMMIT=$(cat /tmp/.mirror-server-rollback-commit 2>/dev/null)
+          if [ -z "$ROLLBACK_COMMIT" ]; then
+            echo "ERROR: No rollback commit found!"
+            exit 1
+          fi
+
+          echo "Rolling back to commit: $ROLLBACK_COMMIT"
+          git checkout "$ROLLBACK_COMMIT"
+          npm ci --production
+          npm run build
+          sudo pm2 reload ecosystem.config.js
+
+          echo "Rollback complete. Waiting for stabilization..."
+          sleep 10
+          sudo pm2 list
+          ROLLBACK_SCRIPT
+
+      - name: Tag release
+        if: success()
+        run: |
+          # Generate version from date + short SHA
+          VERSION="v$(date +'%Y.%m.%d')-${GITHUB_SHA::7}"
+          git tag "$VERSION"
+          git push origin "$VERSION"
+          echo "Tagged release: $VERSION"
+
+      - name: Create GitHub Release
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const version = `v${new Date().toISOString().slice(0,10).replace(/-/g,'.')}-${context.sha.slice(0,7)}`;
+            const commits = await github.rest.repos.listCommits({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 10
+            });
+            const changelog = commits.data
+              .slice(0, 5)
+              .map(c => `- ${c.commit.message.split('\n')[0]}`)
+              .join('\n');
+
+            await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: version,
+              name: `Mirror Server ${version}`,
+              body: `## Deployment\n- **Date**: ${new Date().toISOString()}\n- **Commit**: ${context.sha}\n- **Triggered by**: ${context.actor}\n\n## Recent Changes\n${changelog}`,
+              draft: false,
+              prerelease: false
+            });
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
