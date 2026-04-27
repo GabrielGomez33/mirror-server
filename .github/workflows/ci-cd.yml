@@ -162,23 +162,27 @@ jobs:
           git fetch origin master
           git reset --hard origin/master
 
-          # Step 2: Install production dependencies
-          echo "[2/5] Installing dependencies..."
-          npm ci --production
+          # Step 2: Install all dependencies (dev needed for @types during build)
+          echo "[2/6] Installing dependencies..."
+          npm ci
 
           # Step 3: Build TypeScript
-          echo "[3/5] Building TypeScript..."
+          echo "[3/6] Building TypeScript..."
           npm run build
 
           # Step 4: Verify build output
-          echo "[4/5] Verifying build..."
+          echo "[4/6] Verifying build..."
           if [ ! -f "dist/index.js" ]; then
             echo "ERROR: Build failed — dist/index.js missing!"
             exit 1
           fi
 
-          # Step 5: Zero-downtime PM2 reload
-          echo "[5/5] Reloading PM2 processes..."
+          # Step 5: Prune devDependencies for production
+          echo "[5/6] Pruning dev dependencies..."
+          npm prune --omit=dev
+
+          # Step 6: Zero-downtime PM2 reload
+          echo "[6/6] Reloading PM2 processes..."
           sudo pm2 reload ecosystem.config.js
 
           echo ""
