@@ -19,7 +19,7 @@ import debugRoutes from './routes/debug';
 import intakeRoutes from './routes/intake';
 import dashboardRoutes from './routes/dashboard';
 import journalRoutes from './routes/journal';
-
+import pushRoutes from './routes/push'
 // ============================================================================
 // EXISTING WEBSOCKET SETUP
 // ============================================================================
@@ -311,7 +311,7 @@ APP.use('/mirror/api/debug', debugRoutes);
 APP.use('/mirror/api/intake', intakeRoutes);
 APP.use('/mirror/api/dashboard', dashboardRoutes);
 APP.use('/mirror/api/journal', AuthMiddleware.subscriptionGate as express.RequestHandler, journalRoutes);
-
+APP.use('/mirror/api/push', pushRoutes);
 // ============================================================================
 // MOUNT MIRRORGROUPS ROUTES (PHASE 1 + PHASE 3 + PHASE 4)
 // ============================================================================
@@ -356,6 +356,7 @@ APP.use('/mirror/api/subscription',
   createSubscriptionRoutes(paywallConfig, subscriptionService, paypalProvider)
 );
 console.log('[ROUTES] Subscription routes mounted at /mirror/api/subscription');
+
 
 // ============================================================================
 // @DINA CHAT - Processor runs as SEPARATE PROCESS (via PM2/systemd)
