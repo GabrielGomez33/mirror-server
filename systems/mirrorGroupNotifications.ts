@@ -13,7 +13,7 @@
  *
  * Delivery channels:
  * - WebSocket (real-time in-app)
- * - Push notifications (placeholder for future)
+ * - Web Push (Phase 6a — auto-dispatched when template.channels includes 'push')
  *
  * CHANGES:
  * - Added 'analysis_completed' to GroupNotificationType union and validTypes
@@ -21,11 +21,19 @@
  * - Added sendDirectWebSocketMessage() for raw WebSocket sends (preserves event type)
  * - Added notifyAnalysisCompleted() for sending to group members
  * - Added TruthStream notification types and convenience methods
+ * - Phase 6a: sendNotification() now also dispatches Web Push for templates
+ *   whose channels array includes 'push'. Implementation lives in
+ *   services/pushNotificationDispatcher.ts; this file just calls it.
  */
 
 import { EventEmitter } from 'events';
 import { WebSocket } from 'ws';
 import { mirrorRedis, NotificationQueue } from '../config/redis';
+// Phase 6a: bridges sendNotification() into the Phase 4 Web Push
+// infrastructure. Fire-and-forget — never throws to the caller; any
+// failure inside the dispatcher is logged and swallowed so WebSocket
+// delivery is unaffected.
+import { dispatchPushFromNotification } from '../services/pushNotificationDispatcher';
 
 // ============================================================================
 // ERROR HANDLING UTILITIES
@@ -854,12 +862,18 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
         if (delivered) {
           // Still queue for other channels
           await this.queueNotification(notification);
+          // Phase 6a: also dispatch as Web Push when template.channels
+          // includes 'push'. Fire-and-forget — never blocks delivery.
+          void dispatchPushFromNotification(notification, template);
           return true;
         }
       }
 
       // Queue for processing
-      return await this.queueNotification(notification);
+      const queued = await this.queueNotification(notification);
+      // Phase 6a: also dispatch as Web Push (mirror of the immediate path).
+      void dispatchPushFromNotification(notification, template);
+      return queued;
     } catch (error) {
       logError(`Error sending ${type} notification to user ${userId}`, error);
       return false;

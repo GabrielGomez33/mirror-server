@@ -86,8 +86,18 @@ export interface PushPayload {
   tag?: string;
   /** Notification icon (defaults to /Mirror/pwa-192x192.png in the SW). */
   icon?: string;
+  /** Notification badge icon (small, monochrome). */
+  badge?: string;
   /** Free-form data passed to the SW for deep-link routing. */
   data?: Record<string, unknown>;
+  /** OS app-icon badge count to set after delivery. 0 clears the badge. */
+  unreadCount?: number;
+  /** Don't auto-dismiss the notification — user must interact (good for invites). */
+  requireInteraction?: boolean;
+  /** Silent delivery — no sound/vibration (rarely useful; OS may override). */
+  silent?: boolean;
+  /** Re-alert on tag-replace instead of silently swapping. */
+  renotify?: boolean;
 }
 
 // ============================================================================
