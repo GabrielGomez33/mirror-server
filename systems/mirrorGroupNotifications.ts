@@ -24,6 +24,19 @@
  * - Phase 6a: sendNotification() now also dispatches Web Push for templates
  *   whose channels array includes 'push'. Implementation lives in
  *   services/pushNotificationDispatcher.ts; this file just calls it.
+ * - Phase 6a.5:
+ *   • Registered 'personal_analysis_complete' (was previously falling
+ *     through to raw-WS path because the type wasn't in TEMPLATES).
+ *   • Registered 'chat_message' as a real notification fired from
+ *     ChatMessageManager.broadcastMessage() (had been suppressed for
+ *     duplicate-delivery reasons; client-side dedup now handles that).
+ *   • Bumped chat edit/delete/reaction/read priorities low→normal so
+ *     they don't sit in the 30s queue (felt broken).
+ *   • Improved reaction/read templates to include sender context.
+ *   • Added per-user Page Visibility tracking (markUserVisible /
+ *     markUserHidden / isUserActive). Dispatcher uses isUserActive to
+ *     skip push when the user is foregrounded (in-app WS notification
+ *     covers that case already).
  */
 
 import { EventEmitter } from 'events';
@@ -82,6 +95,8 @@ function isValidGroupNotificationType(type: any): type is GroupNotificationType 
     'dina_processing_started',
     // Phase 6: Analysis completion
     'analysis_completed',
+    // Phase 6a.5: Personal analysis (DINA) completion
+    'personal_analysis_complete',
     // TruthStream
     'ts_review_received',
     'ts_review_classified',
@@ -151,6 +166,8 @@ export type GroupNotificationType =
   |	'dina_processing_started'
   // Phase 6: Analysis completion
   | 'analysis_completed'
+  // Phase 6a.5: Personal analysis (DINA) completion
+  | 'personal_analysis_complete'
   // TruthStream
   | 'ts_review_received'
   | 'ts_review_classified'
@@ -173,6 +190,20 @@ type ValidatedNotificationQueue = NotificationQueue & { type: GroupNotificationT
 export class MirrorGroupNotificationSystem extends EventEmitter {
   private initialized: boolean = false;
   private activeConnections: Map<string, WebSocket> = new Map();
+
+  // Phase 6a.5: per-user Page Visibility state. Updated when the client
+  // sends a `{type:'visibility', state:'visible'|'hidden'}` WS message.
+  // Keyed by userId (string). Value records last-known state and the
+  // timestamp of that change. isUserActive() considers a user active
+  // when they have an open WS AND the last visibility report was
+  // 'visible' within the configured window (default 60s).
+  //
+  // The dispatcher (services/pushNotificationDispatcher.ts) checks
+  // isUserActive() before firing a Web Push — active users get the
+  // in-app WS notification instead, avoiding the "I'm IN the app and
+  // also getting buzzed on my home screen" feedback loop.
+  private userVisibility: Map<string, { state: 'visible' | 'hidden'; timestamp: number }> = new Map();
+  private readonly VISIBILITY_ACTIVE_WINDOW_MS = 60_000;
 
   // Notification templates
   private readonly TEMPLATES: Record<GroupNotificationType, {
@@ -269,14 +300,14 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
     },
     chat_message_edited: {
       title: (data) => `Message Edited`,
-      message: (data) => `A message was edited in ${data.groupName || 'your group'}`,
-      priority: 'low',
+      message: (data) => `${data.senderUsername || 'Someone'} edited a message in ${data.groupName || 'your group'}`,
+      priority: 'normal',
       channels: ['websocket']
     },
     chat_message_deleted: {
       title: (data) => `Message Deleted`,
       message: (data) => `A message was deleted in ${data.groupName || 'your group'}`,
-      priority: 'low',
+      priority: 'normal',
       channels: ['websocket']
     },
     chat_typing: {
@@ -292,15 +323,21 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
       channels: ['websocket']
     },
     chat_reactions_updated: {
-      title: (data) => `Reactions Updated`,
-      message: (data) => `Reactions changed on a message`,
-      priority: 'low',
+      title: (data) => `New Reaction`,
+      message: (data) =>
+        data.reactorUsername
+          ? `${data.reactorUsername} reacted to your message`
+          : `Someone reacted to a message in ${data.groupName || 'your group'}`,
+      priority: 'normal',
       channels: ['websocket']
     },
     chat_message_read: {
       title: (data) => `Message Read`,
-      message: (data) => `Your message was read`,
-      priority: 'low',
+      message: (data) =>
+        data.readerUsername
+          ? `${data.readerUsername} read your message`
+          : `Your message was read`,
+      priority: 'normal',
       channels: ['websocket']
     },
     chat_mention: {
@@ -323,6 +360,19 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
       message: (data) => `Group analysis is ready for "${data.groupName || 'your group'}"`,
       priority: 'immediate',
       channels: ['websocket']
+    },
+
+    // Phase 6a.5: Personal analysis (DINA Truth Mirror Report) completion.
+    // Fired from workers/PersonalAnalysisQueueProcessor.ts after the LLM
+    // finishes generating the user's report.
+    personal_analysis_complete: {
+      title: () => `Your Truth Mirror Report is ready`,
+      message: (data) =>
+        data.analysisType
+          ? `Tap to view your ${data.analysisType} analysis.`
+          : `Tap to view your latest analysis.`,
+      priority: 'immediate',
+      channels: ['websocket', 'push']
     },
 
     // ========================================================================
@@ -465,11 +515,14 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
 
     ws.on('close', () => {
       this.activeConnections.delete(userId);
+      // Phase 6a.5: drop stale visibility on disconnect.
+      this.userVisibility.delete(userId);
     });
 
     ws.on('error', (error) => {
       logError(`WebSocket error for user ${userId}`, error);
       this.activeConnections.delete(userId);
+      this.userVisibility.delete(userId);
     });
 
     console.log(`✅ Registered WebSocket connection for user ${userId}`);
@@ -477,7 +530,51 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
 
   unregisterConnection(userId: string): void {
     this.activeConnections.delete(userId);
+    this.userVisibility.delete(userId);
     console.log(`🔌 Unregistered WebSocket connection for user ${userId}`);
+  }
+
+  // ============================================================================
+  // PHASE 6a.5 — VISIBILITY TRACKING (for push-skip-when-active)
+  // ============================================================================
+
+  /**
+   * Called by the WebSocket message handler when a client posts
+   * `{type:'visibility', state:'visible'}`. Marks the user as
+   * foregrounded — the dispatcher will skip Web Push for them.
+   */
+  markUserVisible(userId: string): void {
+    this.userVisibility.set(userId, { state: 'visible', timestamp: Date.now() });
+  }
+
+  /**
+   * Called when the client posts `{type:'visibility', state:'hidden'}`
+   * (tab backgrounded, app minimized, etc.). User reverts to "may need
+   * push delivery" state.
+   */
+  markUserHidden(userId: string): void {
+    this.userVisibility.set(userId, { state: 'hidden', timestamp: Date.now() });
+  }
+
+  /**
+   * True when the user has BOTH:
+   *   • an open WebSocket connection (so in-app delivery will reach them), AND
+   *   • a recent 'visible' visibility report (within the active window).
+   *
+   * The dispatcher uses this to decide whether to skip Web Push. Conservative
+   * default: if no visibility has been reported yet (user just connected
+   * but hasn't sent a visibility message), we treat them as INACTIVE so
+   * push still fires — better to over-deliver than to silently drop a
+   * notification.
+   */
+  isUserActive(userId: string): boolean {
+    const ws = this.activeConnections.get(userId);
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+
+    const v = this.userVisibility.get(userId);
+    if (!v) return false; // No visibility reported → treat as inactive (push).
+    if (v.state !== 'visible') return false;
+    return Date.now() - v.timestamp < this.VISIBILITY_ACTIVE_WINDOW_MS;
   }
 
   // ============================================================================
@@ -864,7 +961,10 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
           await this.queueNotification(notification);
           // Phase 6a: also dispatch as Web Push when template.channels
           // includes 'push'. Fire-and-forget — never blocks delivery.
-          void dispatchPushFromNotification(notification, template);
+          // Phase 6a.5: pass isUserActive via DI to avoid circular import.
+          void dispatchPushFromNotification(notification, template, {
+            isUserActive: (uid) => this.isUserActive(uid),
+          });
           return true;
         }
       }
@@ -872,7 +972,9 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
       // Queue for processing
       const queued = await this.queueNotification(notification);
       // Phase 6a: also dispatch as Web Push (mirror of the immediate path).
-      void dispatchPushFromNotification(notification, template);
+      void dispatchPushFromNotification(notification, template, {
+        isUserActive: (uid) => this.isUserActive(uid),
+      });
       return queued;
     } catch (error) {
       logError(`Error sending ${type} notification to user ${userId}`, error);
