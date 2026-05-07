@@ -33,8 +33,33 @@
 
 import { pushService, PushPayload } from './pushService';
 import { Logger } from '../utils/logger';
+// IMPORTANT — no top-level import of '../systems/mirrorGroupNotifications'.
+// That file imports THIS file (dispatchPushFromNotification), so a static
+// import here creates a circular dependency. Under Node CommonJS the
+// singleton would resolve to `undefined` at our load time and stay that
+// way for the lifetime of the process — every push call would TypeError.
+//
+// Phase 6a.5 needs to check whether the user is currently active in the
+// app before firing a push. Caller passes the check as an option (see
+// DispatchOptions below). The dispatcher itself has no implicit deps.
 
 const logger = new Logger('PushDispatcher');
+
+// Phase 6a.5: notification types that should set requireInteraction:true
+// on the OS notification. These are higher-stakes events the user should
+// see / dismiss intentionally (vs. chat noise that auto-clears). Anything
+// not in this list — including chat_message — uses the OS default
+// (auto-dismiss after a few seconds).
+const REQUIRE_INTERACTION_TYPES = new Set<string>([
+	'group_invite',
+	'video_call_started',
+	'vote_proposed',
+	'chat_mention',
+	'personal_analysis_complete',
+	'ts_review_received',
+	'ts_milestone_earned',
+	'ts_analysis_complete',
+]);
 
 // ============================================================================
 // MINIMAL TYPES (decoupled from mirrorGroupNotifications.ts internals)
@@ -60,6 +85,17 @@ export interface DispatchableTemplate {
 	priority: 'immediate' | 'normal' | 'low';
 }
 
+/**
+ * Phase 6a.5: caller-provided dependencies. Avoids circular imports.
+ * Currently only `isUserActive` — pass mirrorGroupNotifications.isUserActive
+ * (bound) so the dispatcher can skip push for users currently in the app.
+ * Optional. If omitted, dispatcher falls back to the original 6a behavior
+ * (always fire push when subscriptions exist).
+ */
+export interface DispatchOptions {
+	isUserActive?: (userId: string) => boolean;
+}
+
 // ============================================================================
 // PUBLIC ENTRY POINT
 // ============================================================================
@@ -72,6 +108,7 @@ export interface DispatchableTemplate {
 export async function dispatchPushFromNotification(
 	notification: DispatchableNotification,
 	template: DispatchableTemplate,
+	options: DispatchOptions = {},
 ): Promise<void> {
 	try {
 		// Skip if push isn't a configured channel for this notification type.
@@ -84,6 +121,30 @@ export async function dispatchPushFromNotification(
 				type: notification.type,
 			});
 			return;
+		}
+
+		// Phase 6a.5: skip push if the user is currently active in the app.
+		// `isUserActive` is injected by the caller (see DispatchOptions).
+		// If the check throws (defensive — caller bug, not ours), treat as
+		// inactive and fire push so the notification isn't silently dropped.
+		if (options.isUserActive) {
+			let active = false;
+			try {
+				active = options.isUserActive(String(notification.userId));
+			} catch (err) {
+				logger.warn('isUserActive threw — proceeding with push', {
+					userId: notification.userId,
+					type: notification.type,
+					message: (err as Error)?.message,
+				});
+			}
+			if (active) {
+				logger.info('Push skipped — user is active in app', {
+					userId: notification.userId,
+					type: notification.type,
+				});
+				return;
+			}
 		}
 
 		const payload = buildPushPayload(notification, template);
@@ -130,10 +191,12 @@ function buildPushPayload(
 			notificationType: notification.type,
 			...(notification.content.metadata || {}),
 		},
-		// Render-on-screen hint: 'immediate' priority → require interaction
-		// (won't auto-dismiss after a few seconds) so e.g. video call
-		// invites don't disappear before the user can respond.
-		requireInteraction: _template.priority === 'immediate',
+		// Phase 6a.5: requireInteraction limited to high-stakes types
+		// (invites, calls, votes, mentions, completed analyses). Chat
+		// messages and reactions auto-dismiss like normal notifications;
+		// previously every 'immediate' priority event persisted on the
+		// lock screen which was annoying for active group chats.
+		requireInteraction: REQUIRE_INTERACTION_TYPES.has(notification.type),
 	};
 }
 
@@ -156,12 +219,20 @@ function deriveTag(notification: DispatchableNotification): string {
 	const reviewId = stringOrUndef(meta.reviewId);
 	const dialogueId = stringOrUndef(meta.dialogueId);
 	const messageId = stringOrUndef(meta.messageId);
+	const analysisId = stringOrUndef(meta.analysisId);
 
 	// Type-specific tag derivation. Order: most specific id wins.
 	if (type === 'ts_dialogue_message' && dialogueId) return `${type}:${dialogueId}`;
 	if (type === 'ts_review_received' && reviewId) return `${type}:${reviewId}`;
 	if (type === 'ts_review_classified' && reviewId) return `${type}:${reviewId}`;
+	// Phase 6a.5: each personal analysis gets its own tag so multiple
+	// completion notifications don't collapse into one on the device.
+	if (type === 'personal_analysis_complete' && analysisId) return `${type}:${analysisId}`;
+	// Mentions tagged per-message so each @-mention gets its own
+	// notification (won't collapse with regular chat_message bursts).
 	if (type === 'chat_mention' && messageId) return `${type}:${messageId}`;
+	// Regular chat: collapse all messages from the same group into one
+	// device-side notification (prevents 5 messages = 5 buzzes).
 	if (type === 'chat_message' && groupId) return `${type}:${groupId}`;
 	if (groupId) return `${type}:${groupId}`;
 	if (sessionId) return `${type}:${sessionId}`;
@@ -216,4 +287,4 @@ function stringOrUndef(v: unknown): string | undefined {
 	if (typeof v === 'string') return v;
 	if (typeof v === 'number') return String(v);
 	return undefined;
-}
+}7

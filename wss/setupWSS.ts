@@ -333,6 +333,28 @@ export function SetupWebSocket(
           const raw = data.toString();
           // Handle application-level ping from client
           if (handleAppPing(ws, raw)) return;
+
+          // Phase 6a.5: client visibility reports for push-skip-when-active.
+          // Client (groupsWebSocket.ts) sends `{type:'visibility',
+          // payload:{state:'visible'|'hidden'}}` whenever Page Visibility
+          // changes. Server stores it on mirrorGroupNotifications so the
+          // push dispatcher can skip foregrounded users.
+          try {
+            const parsed = JSON.parse(raw);
+            if (parsed && parsed.type === 'visibility') {
+              const state = parsed.payload?.state ?? parsed.state;
+              const userIdStr = decoded.id.toString();
+              if (state === 'visible') {
+                groupNotifications.markUserVisible(userIdStr);
+              } else if (state === 'hidden') {
+                groupNotifications.markUserHidden(userIdStr);
+              }
+              return;
+            }
+          } catch {
+            // Non-JSON or malformed message — ignore. Existing handlers
+            // (ping/pong) already returned above for legitimate cases.
+          }
           // Other group WS messages can be handled here in the future
         });
 

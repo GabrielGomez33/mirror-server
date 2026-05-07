@@ -566,8 +566,20 @@ export class ChatMessageManager extends EventEmitter {
 
       // Emit event for real-time processing
       // chatWSHandler listens for 'message:sent' and broadcasts via chat WebSocket
-      // (broadcastMessage via mirrorGroupNotifications removed — was causing duplicates)
       this.emit('message:sent', message);
+
+      // Phase 6a.5: re-enabled chat_message notifications via the central
+      // notification system. Originally disabled because the same message
+      // was arriving twice on the client (chat WS + notification WS); the
+      // client now has cross-path dedup (ChatContext.tsx — "Synchronous
+      // dedup across all WebSocket paths"), so re-enabling is safe and
+      // necessary for: (a) populating the in-app Notifications panel,
+      // (b) firing Web Push to subscribed devices via the Phase 6a hook,
+      // and (c) firing chat_mention pushes for any @-mentioned users.
+      // Errors here NEVER affect message-send success — caught + logged.
+      void this.broadcastMessage(message).catch((err) => {
+        logError(`Failed to broadcast notifications for message ${messageId}`, err);
+      });
 
       console.log(`✉️ Message sent: ${messageId} to group ${input.groupId}`);
       return message;
@@ -1666,31 +1678,86 @@ export class ChatMessageManager extends EventEmitter {
   }
 
   private async broadcastMessage(message: ChatMessage): Promise<void> {
-    // Get all group members
+    // Phase 6a.5: query members WITH usernames so we can match @-mentions
+    // by username. Also fetch group name so the notification template
+    // can show "New Message in <group>" instead of "New Message in Group".
     const [members] = await DB.query(
-      `SELECT user_id FROM mirror_group_members
-       WHERE group_id = ? AND status = 'active'`,
+      `SELECT mgm.user_id, u.username
+       FROM mirror_group_members mgm
+       JOIN users u ON u.id = mgm.user_id
+       WHERE mgm.group_id = ? AND mgm.status = 'active'`,
       [message.groupId]
     );
 
-    // Send to all except sender
+    let groupName: string | undefined;
+    try {
+      const [groupRows] = await DB.query(
+        'SELECT name FROM mirror_groups WHERE id = ? LIMIT 1',
+        [message.groupId]
+      );
+      groupName = (groupRows as any[])[0]?.name;
+    } catch {
+      // Non-fatal — templates fall back to 'your group'.
+    }
+
+    // Build mention sets: explicit @username mentions AND @everyone broadcast.
+    const rawMentions = ((message.metadata as any)?.mentions || []) as Array<{
+      username?: string;
+      type?: string;
+      userId?: number;
+    }>;
+    const mentionedUsernames = new Set<string>(
+      rawMentions
+        .filter((m) => m.type !== 'everyone' && m.username)
+        .map((m) => String(m.username).toLowerCase())
+    );
+    const isEveryoneMentioned = rawMentions.some((m) => m.type === 'everyone');
+
+    // Send to all members except sender.
+    // - If the member is @-mentioned → chat:mention (priority + own tag,
+    //   own notification text "X mentioned you in Y").
+    // - Otherwise → chat:message (lower-key, collapses by group on the
+    //   device, populates the in-app panel + fires Web Push if the user
+    //   is subscribed and not currently active in the app).
     for (const member of members as any[]) {
-      if (member.user_id !== message.senderUserId) {
+      if (member.user_id === message.senderUserId) continue;
+
+      const isMentioned =
+        isEveryoneMentioned ||
+        (member.username &&
+          mentionedUsernames.has(String(member.username).toLowerCase()));
+
+      if (isMentioned) {
         await mirrorGroupNotifications.notify(member.user_id, {
-          type: 'chat:message',
+          type: 'chat:mention',
           payload: {
             messageId: message.id,
             groupId: message.groupId,
+            groupName,
             senderUserId: message.senderUserId,
             senderUsername: message.senderUsername,
-            contentType: message.contentType,
-            // Note: Content is encrypted - client must decrypt
-            encryptedContent: true,
             createdAt: message.createdAt.toISOString(),
             clientMessageId: message.clientMessageId,
-          }
+          },
         });
+        continue;
       }
+
+      await mirrorGroupNotifications.notify(member.user_id, {
+        type: 'chat:message',
+        payload: {
+          messageId: message.id,
+          groupId: message.groupId,
+          groupName,
+          senderUserId: message.senderUserId,
+          senderUsername: message.senderUsername,
+          contentType: message.contentType,
+          // Note: Content is encrypted - client must decrypt
+          encryptedContent: true,
+          createdAt: message.createdAt.toISOString(),
+          clientMessageId: message.clientMessageId,
+        },
+      });
     }
   }
 
