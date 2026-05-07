@@ -17,9 +17,21 @@
 #
 # DEPLOYMENT:
 #   - SSH into production server as mirror_app
-#   - Git pull → npm ci → build → PM2 zero-downtime reload
-#   - Health check verification with automatic rollback on failure
+#   - Git pull → npm ci → build → PM2 hard restart all 5 processes
+#   - Worker-online verification (catches workers that fail at startup)
+#   - HTTP health check verification with automatic rollback on failure
 #   - Git tag + GitHub Release on success
+#
+# WHY pm2 restart vs reload:
+#   `restart` is hard-kill + respawn for every process in
+#   ecosystem.config.js. Bulletproof against lingering Redis pub/sub
+#   subscriptions, hung worker shutdown handlers, or any stuck state
+#   that survives a graceful SIGINT. User-perceived impact is minimal
+#   because client-side WebSocket reconnect + HTTP retry covers the
+#   ~1s gap per process; queue workers never affect user requests
+#   directly. The graceful zero-downtime "reload" path occasionally
+#   left workers in inconsistent state (notification system stopped
+#   firing — tracked down via "pm2 restart all" manually fixing it).
 # =============================================================================
 
 name: Mirror Server CI/CD
@@ -108,7 +120,7 @@ jobs:
     name: Deploy to Production
     needs: quality
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     if: |
       (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy == 'true')
@@ -158,7 +170,7 @@ jobs:
           cd ${{ secrets.SERVER_DEPLOY_PATH }}
 
           # Step 1: Pull latest code
-          echo "[1/5] Pulling latest code..."
+          echo "[1/6] Pulling latest code..."
           git fetch origin master
           git reset --hard origin/master
 
@@ -181,23 +193,58 @@ jobs:
           echo "[5/6] Pruning dev dependencies..."
           npm prune --omit=dev
 
-          # Step 6: Zero-downtime PM2 reload
-          echo "[6/6] Reloading PM2 processes..."
-          sudo pm2 reload ecosystem.config.js
+          # Step 6: Hard restart all 5 PM2 processes (was 'reload', changed
+          # to 'restart' for bulletproof reload — graceful path occasionally
+          # left workers in inconsistent state).
+          echo "[6/6] Restarting PM2 processes..."
+          sudo pm2 restart ecosystem.config.js
 
           echo ""
           echo "Deploy complete. Waiting for processes to stabilize..."
-          sleep 10
+          sleep 15
 
           # Show process status
           sudo pm2 list
           DEPLOY_SCRIPT
 
+      - name: Verify all PM2 processes are online
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'PM2_CHECK'
+          set -e
+          # Verify each process listed in ecosystem.config.js is in 'online'
+          # state. A worker that fails at startup (bad import, env var
+          # missing, etc.) won't be caught by the HTTP health check below
+          # — it would just sit in 'errored' state until users notice
+          # missing notifications / unprocessed queue items.
+          OFFLINE=$(sudo pm2 jlist | python3 -c "
+          import json, sys
+          procs = json.load(sys.stdin)
+          expected = {'mirror-server', 'analysis-worker', 'dina-chat-worker', 'truthstream-worker', 'personal-analysis-worker'}
+          alive = {p['name'] for p in procs if p['pm2_env']['status'] == 'online'}
+          missing = expected - alive
+          dead = [(p['name'], p['pm2_env']['status']) for p in procs if p['name'] in expected and p['pm2_env']['status'] != 'online']
+          out = list(missing) + [f\"{n}({s})\" for n, s in dead]
+          if out:
+            print(' '.join(out))
+          ")
+          if [ -n "$OFFLINE" ]; then
+            echo "::error::Processes not online after restart: $OFFLINE"
+            sudo pm2 list
+            exit 1
+          fi
+          echo "All 5 PM2 processes are online."
+          PM2_CHECK
+
       - name: Health check
         id: health_check
         run: |
           echo "Running health check..."
-          MAX_RETRIES=6
+          # 12 retries × 5s + initial sleep = up to ~75s grace period.
+          # Cold restart with Redis/MySQL/DINA reconnect can take longer
+          # than the previous 30s budget, especially if DINA's WebSocket
+          # is briefly unreachable during its own deploy.
+          MAX_RETRIES=12
           RETRY_INTERVAL=5
 
           for i in $(seq 1 $MAX_RETRIES); do
@@ -245,10 +292,12 @@ jobs:
           git checkout "$ROLLBACK_COMMIT"
           npm ci --production
           npm run build
-          sudo pm2 reload ecosystem.config.js
+          # Hard restart on rollback too — same reasoning as the deploy
+          # step (defends against stuck state in workers).
+          sudo pm2 restart ecosystem.config.js
 
           echo "Rollback complete. Waiting for stabilization..."
-          sleep 10
+          sleep 15
           sudo pm2 list
           ROLLBACK_SCRIPT
 
