@@ -24,7 +24,7 @@
 #
 # WHY pm2 restart vs reload:
 #   `restart` is hard-kill + respawn for every process in
-#   ecosystem.config.js. Bulletproof against lingering Redis pub/sub
+#   ecosystem.config.js. Bulletproof protection against lingering Redis pub/sub
 #   subscriptions, hung worker shutdown handlers, or any stuck state
 #   that survives a graceful SIGINT. User-perceived impact is minimal
 #   because client-side WebSocket reconnect + HTTP retry covers the
