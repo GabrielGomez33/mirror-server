@@ -622,13 +622,19 @@ export class ChatMessageManager extends EventEmitter {
 
       const queryParams: any[] = [groupId];
 
-      // Thread filtering
+      // Thread filtering.
+      // Phase 6a.8: when no explicit threadRootId is requested, return
+      // ALL messages (top-level AND replies) so replies appear inline in
+      // the main chat thread. Previously the else branch added
+      // `parent_message_id IS NULL`, which silently hid every reply
+      // after a refresh — the rendered chat would be missing all
+      // reply-style messages until the user opened a thread view.
+      // Mirror's chat UI shows a flat conversation, so inline is the
+      // intent; threading remains available via the explicit
+      // threadRootId option for future per-thread views.
       if (options.threadRootId) {
         query += ` AND m.thread_root_id = ?`;
         queryParams.push(options.threadRootId);
-      } else {
-        // Only get root messages (not replies) in main view
-        query += ` AND m.parent_message_id IS NULL`;
       }
 
       // Soft delete filtering
@@ -1713,12 +1719,36 @@ export class ChatMessageManager extends EventEmitter {
     );
     const isEveryoneMentioned = rawMentions.some((m) => m.type === 'everyone');
 
+    // Phase 6a.8: if this is a threaded reply, look up the parent
+    // message's sender so we can route them a dedicated chat_reply
+    // notification ("X replied to your message") instead of a generic
+    // chat_message. Mentions still take priority — if the parent sender
+    // is also @-mentioned in this reply, they get chat_mention (more
+    // specific signal).
+    let parentSenderUserId: number | null = null;
+    if (message.parentMessageId) {
+      try {
+        const [parentRows] = await DB.query(
+          'SELECT sender_user_id FROM mirror_group_messages WHERE id = ? LIMIT 1',
+          [message.parentMessageId]
+        );
+        const row = (parentRows as any[])[0];
+        if (row && row.sender_user_id !== message.senderUserId) {
+          parentSenderUserId = row.sender_user_id;
+        }
+      } catch {
+        // Non-fatal — fall back to chat_message for the parent sender.
+      }
+    }
+
     // Phase 6a.6: surface what's actually happening so mention bugs are
     // diagnosable from `pm2 logs mirror-server | grep BroadcastMessage`.
     console.log(
       `[BroadcastMessage] message=${message.id} group=${message.groupId} ` +
       `members=${(members as any[]).length} mentions=${rawMentions.length} ` +
-      `everyone=${isEveryoneMentioned} mentionedUsernames=${JSON.stringify(Array.from(mentionedUsernames))}`
+      `everyone=${isEveryoneMentioned} ` +
+      `parent=${message.parentMessageId || 'none'} parentSender=${parentSenderUserId ?? 'none'} ` +
+      `mentionedUsernames=${JSON.stringify(Array.from(mentionedUsernames))}`
     );
 
     // Send to all members except sender.
@@ -1741,6 +1771,28 @@ export class ChatMessageManager extends EventEmitter {
           type: 'chat:mention',
           payload: {
             messageId: message.id,
+            groupId: message.groupId,
+            groupName,
+            senderUserId: message.senderUserId,
+            senderUsername: message.senderUsername,
+            createdAt: message.createdAt.toISOString(),
+            clientMessageId: message.clientMessageId,
+          },
+        });
+        continue;
+      }
+
+      // Phase 6a.8: if this member is the sender of the parent message
+      // (i.e. the reply is directed at them), send chat:reply instead
+      // of the generic chat:message. Carries the parent message id so
+      // the client can scroll-to or render-in-thread.
+      if (parentSenderUserId !== null && member.user_id === parentSenderUserId) {
+        console.log(`[BroadcastMessage] → chat:reply to user=${member.user_id} (${member.username})`);
+        await mirrorGroupNotifications.notify(member.user_id, {
+          type: 'chat:reply',
+          payload: {
+            messageId: message.id,
+            parentMessageId: message.parentMessageId,
             groupId: message.groupId,
             groupName,
             senderUserId: message.senderUserId,

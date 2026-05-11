@@ -91,6 +91,9 @@ function isValidGroupNotificationType(type: any): type is GroupNotificationType 
     'chat_reactions_updated',
     'chat_message_read',
     'chat_mention',
+    // Phase 6a.8: threaded reply notification (sent to parent message's
+    // sender when someone replies directly to their message).
+    'chat_reply',
     //Dina processing status
     'dina_processing_started',
     // Phase 6: Analysis completion
@@ -163,6 +166,8 @@ export type GroupNotificationType =
   | 'chat_reactions_updated'
   | 'chat_message_read'
   | 'chat_mention'
+  // Phase 6a.8: threaded reply
+  | 'chat_reply'
   |	'dina_processing_started'
   // Phase 6: Analysis completion
   | 'analysis_completed'
@@ -343,6 +348,17 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
     chat_mention: {
       title: (data) => `You were mentioned`,
       message: (data) => `${data.senderUsername || 'Someone'} mentioned you in ${data.groupName || 'a group'}`,
+      priority: 'immediate',
+      channels: ['websocket', 'push']
+    },
+    // Phase 6a.8: threaded reply — fires to the original message's sender
+    // when someone replies directly to one of their messages. Distinct
+    // template (and own collapse tag in the dispatcher) so a thread of
+    // replies doesn't get muddled with regular chat_message bursts.
+    chat_reply: {
+      title: () => `New Reply`,
+      message: (data) =>
+        `${data.senderUsername || 'Someone'} replied to your message${data.groupName ? ' in ' + data.groupName : ''}`,
       priority: 'immediate',
       channels: ['websocket', 'push']
     },
