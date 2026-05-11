@@ -184,7 +184,7 @@ function buildPushPayload(
 	return {
 		title: truncate(notification.content.title || 'Mirror', 80),
 		body: truncate(notification.content.message || '', 200),
-		url: sanitizeAndPrefixUrl(notification.content.actionUrl),
+		url: deriveActionUrl(notification),
 		tag: deriveTag(notification),
 		// Deep-link metadata for the SW notificationclick handler.
 		data: {
@@ -198,6 +198,89 @@ function buildPushPayload(
 		// lock screen which was annoying for active group chats.
 		requireInteraction: REQUIRE_INTERACTION_TYPES.has(notification.type),
 	};
+}
+
+/**
+ * Phase 6a.6: derive a deep-link URL based on the notification type and
+ * its metadata. The SW's notificationclick handler reads `payload.url`
+ * and navigates the user there. Without this, every push opens the app
+ * at /Mirror/ root.
+ *
+ * Mirrors the client-side mapping in NotificationContext.tsx
+ * (truthStreamActionMap) so in-app and push deep-links stay consistent.
+ *
+ * Falls back to the notification's own `actionUrl` for types whose
+ * templates set joinUrl (video calls, drawing sessions); falls back to
+ * undefined when no specific URL applies — SW then opens /Mirror/.
+ */
+function deriveActionUrl(notification: DispatchableNotification): string | undefined {
+	const meta = (notification.content.metadata || {}) as Record<string, unknown>;
+	const type = notification.type;
+
+	const groupId = stringOrUndef(meta.groupId);
+	const messageId = stringOrUndef(meta.messageId);
+	const reviewId = stringOrUndef(meta.reviewId);
+	const recipientView = stringOrUndef(meta.recipientView);
+	const analysisId = stringOrUndef(meta.analysisId);
+
+	// TruthStream — mirror the client-side truthStreamActionMap.
+	switch (type) {
+		case 'ts_review_received':
+			return '/Mirror/truthstream?view=received';
+		case 'ts_dialogue_message': {
+			const view = recipientView || 'received';
+			return reviewId
+				? `/Mirror/truthstream?view=${view}&reviewId=${reviewId}`
+				: `/Mirror/truthstream?view=${view}`;
+		}
+		case 'ts_review_classified':
+			return '/Mirror/truthstream?view=received';
+		case 'ts_analysis_complete':
+			return '/Mirror/truthstream?view=analysis';
+		case 'ts_queue_assigned':
+			return '/Mirror/truthstream?view=queue';
+		case 'ts_milestone_earned':
+			return '/Mirror/truthstream?view=overview';
+
+		// Group invites land on the groups index where the user can accept/decline.
+		case 'group_invite':
+			return '/Mirror/groups';
+
+		// Group activity → the specific group.
+		case 'member_joined':
+		case 'analysis_completed':
+		case 'compatibility_updated':
+		case 'conversation_summary':
+			return groupId ? `/Mirror/groups/${groupId}` : '/Mirror/groups';
+
+		// Voting → group's votes view.
+		case 'vote_proposed':
+		case 'vote_completed':
+			return groupId ? `/Mirror/groups/${groupId}` : '/Mirror/groups';
+
+		// Chat: deep-link to the group's chat. Mentions deep-link to the
+		// specific message via query string so the client can scroll to it.
+		case 'chat_message':
+			return groupId ? `/Mirror/groups/${groupId}` : '/Mirror/groups';
+		case 'chat_mention':
+			if (groupId && messageId) return `/Mirror/groups/${groupId}?messageId=${messageId}`;
+			return groupId ? `/Mirror/groups/${groupId}` : '/Mirror/groups';
+
+		// Personal analysis (DINA Truth Mirror Report).
+		case 'personal_analysis_complete':
+			return analysisId
+				? `/Mirror/mymirror?analysisId=${analysisId}`
+				: '/Mirror/mymirror';
+	}
+
+	// Templates that set joinUrl in their data payload (video_call_started,
+	// drawing_session_started). The notify() flow puts this on
+	// content.actionUrl. Sanitize + prefix as before.
+	if (notification.content.actionUrl) {
+		return sanitizeAndPrefixUrl(notification.content.actionUrl);
+	}
+
+	return undefined; // SW falls back to /Mirror/.
 }
 
 /**
@@ -287,4 +370,4 @@ function stringOrUndef(v: unknown): string | undefined {
 	if (typeof v === 'string') return v;
 	if (typeof v === 'number') return String(v);
 	return undefined;
-}7
+}

@@ -1713,6 +1713,14 @@ export class ChatMessageManager extends EventEmitter {
     );
     const isEveryoneMentioned = rawMentions.some((m) => m.type === 'everyone');
 
+    // Phase 6a.6: surface what's actually happening so mention bugs are
+    // diagnosable from `pm2 logs mirror-server | grep BroadcastMessage`.
+    console.log(
+      `[BroadcastMessage] message=${message.id} group=${message.groupId} ` +
+      `members=${(members as any[]).length} mentions=${rawMentions.length} ` +
+      `everyone=${isEveryoneMentioned} mentionedUsernames=${JSON.stringify(Array.from(mentionedUsernames))}`
+    );
+
     // Send to all members except sender.
     // - If the member is @-mentioned → chat:mention (priority + own tag,
     //   own notification text "X mentioned you in Y").
@@ -1728,6 +1736,7 @@ export class ChatMessageManager extends EventEmitter {
           mentionedUsernames.has(String(member.username).toLowerCase()));
 
       if (isMentioned) {
+        console.log(`[BroadcastMessage] → chat:mention to user=${member.user_id} (${member.username})`);
         await mirrorGroupNotifications.notify(member.user_id, {
           type: 'chat:mention',
           payload: {
@@ -1806,10 +1815,41 @@ export class ChatMessageManager extends EventEmitter {
       [groupId]
     );
 
+    // Phase 6a.6: look up the most-recent reactor's username so the
+    // notification template can show "<reactorUsername> reacted to your
+    // message" instead of "Someone reacted to a message in your group".
+    // Best-effort — if the query fails or no reactor exists (e.g. the
+    // last reaction was just removed), the template falls back to the
+    // generic message.
+    let reactorUsername: string | undefined;
+    let groupName: string | undefined;
+    try {
+      const [rows] = await DB.query(
+        `SELECT u.username
+         FROM mirror_group_message_reactions r
+         JOIN users u ON u.id = r.user_id
+         WHERE r.message_id = ?
+         ORDER BY r.created_at DESC LIMIT 1`,
+        [messageId]
+      );
+      reactorUsername = (rows as any[])[0]?.username;
+    } catch {
+      // non-fatal
+    }
+    try {
+      const [groupRows] = await DB.query(
+        'SELECT name FROM mirror_groups WHERE id = ? LIMIT 1',
+        [groupId]
+      );
+      groupName = (groupRows as any[])[0]?.name;
+    } catch {
+      // non-fatal
+    }
+
     for (const member of members as any[]) {
       await mirrorGroupNotifications.notify(member.user_id, {
         type: 'chat:reactions_updated',
-        payload: { messageId, groupId, reactions }
+        payload: { messageId, groupId, groupName, reactions, reactorUsername }
       });
     }
   }
@@ -1824,9 +1864,33 @@ export class ChatMessageManager extends EventEmitter {
     if ((messageRows as any[]).length > 0) {
       const senderId = (messageRows as any[])[0].sender_user_id;
       if (senderId !== userId) {
+        // Phase 6a.6: look up the reader's username so the template can
+        // show "<readerUsername> read your message" instead of the
+        // generic "Your message was read".
+        let readerUsername: string | undefined;
+        let groupName: string | undefined;
+        try {
+          const [rows] = await DB.query(
+            'SELECT username FROM users WHERE id = ? LIMIT 1',
+            [userId]
+          );
+          readerUsername = (rows as any[])[0]?.username;
+        } catch {
+          // non-fatal
+        }
+        try {
+          const [groupRows] = await DB.query(
+            'SELECT name FROM mirror_groups WHERE id = ? LIMIT 1',
+            [groupId]
+          );
+          groupName = (groupRows as any[])[0]?.name;
+        } catch {
+          // non-fatal
+        }
+
         await mirrorGroupNotifications.notify(senderId, {
           type: 'chat:message_read',
-          payload: { messageId, groupId, readBy: userId }
+          payload: { messageId, groupId, groupName, readBy: userId, readerUsername }
         });
       }
     }
