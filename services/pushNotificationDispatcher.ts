@@ -246,25 +246,28 @@ function deriveActionUrl(notification: DispatchableNotification): string | undef
 		case 'group_invite':
 			return '/Mirror/groups';
 
-		// Group activity → the specific group.
+		// Group activity → the specific group via ?groupId= query.
+		// (The route is /Mirror/groups; the page reads groupId from the
+		// query string and opens the corresponding GroupDetailView.)
 		case 'member_joined':
 		case 'analysis_completed':
 		case 'compatibility_updated':
 		case 'conversation_summary':
-			return groupId ? `/Mirror/groups/${groupId}` : '/Mirror/groups';
+			return groupId ? `/Mirror/groups?groupId=${groupId}` : '/Mirror/groups';
 
-		// Voting → group's votes view.
+		// Voting → same group page (vote details inside).
 		case 'vote_proposed':
 		case 'vote_completed':
-			return groupId ? `/Mirror/groups/${groupId}` : '/Mirror/groups';
+			return groupId ? `/Mirror/groups?groupId=${groupId}` : '/Mirror/groups';
 
-		// Chat: deep-link to the group's chat. Mentions deep-link to the
-		// specific message via query string so the client can scroll to it.
+		// Chat: deep-link to the group via query string. Mentions
+		// additionally include the message ID so the chat view can
+		// scroll-to-message on open.
 		case 'chat_message':
-			return groupId ? `/Mirror/groups/${groupId}` : '/Mirror/groups';
+			return groupId ? `/Mirror/groups?groupId=${groupId}` : '/Mirror/groups';
 		case 'chat_mention':
-			if (groupId && messageId) return `/Mirror/groups/${groupId}?messageId=${messageId}`;
-			return groupId ? `/Mirror/groups/${groupId}` : '/Mirror/groups';
+			if (groupId && messageId) return `/Mirror/groups?groupId=${groupId}&messageId=${messageId}`;
+			return groupId ? `/Mirror/groups?groupId=${groupId}` : '/Mirror/groups';
 
 		// Personal analysis (DINA Truth Mirror Report).
 		case 'personal_analysis_complete':
