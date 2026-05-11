@@ -55,6 +55,10 @@ const REQUIRE_INTERACTION_TYPES = new Set<string>([
 	'video_call_started',
 	'vote_proposed',
 	'chat_mention',
+	// Phase 6a.8: direct replies are high-signal (someone is engaging
+	// with the user's specific message) — keep them on the lock screen
+	// until tapped.
+	'chat_reply',
 	'personal_analysis_complete',
 	'ts_review_received',
 	'ts_milestone_earned',
@@ -260,12 +264,18 @@ function deriveActionUrl(notification: DispatchableNotification): string | undef
 		case 'vote_completed':
 			return groupId ? `/Mirror/groups?groupId=${groupId}` : '/Mirror/groups';
 
-		// Chat: deep-link to the group via query string. Mentions
-		// additionally include the message ID so the chat view can
-		// scroll-to-message on open.
+		// Chat: deep-link to the group via query string. Mentions and
+		// replies additionally include the message ID so the chat view
+		// can scroll-to-message on open.
 		case 'chat_message':
 			return groupId ? `/Mirror/groups?groupId=${groupId}` : '/Mirror/groups';
 		case 'chat_mention':
+			if (groupId && messageId) return `/Mirror/groups?groupId=${groupId}&messageId=${messageId}`;
+			return groupId ? `/Mirror/groups?groupId=${groupId}` : '/Mirror/groups';
+		// Phase 6a.8: chat_reply deep-links to the REPLY message itself
+		// (not the parent) so the user sees the new content; their
+		// existing parent message is in scrollback.
+		case 'chat_reply':
 			if (groupId && messageId) return `/Mirror/groups?groupId=${groupId}&messageId=${messageId}`;
 			return groupId ? `/Mirror/groups?groupId=${groupId}` : '/Mirror/groups';
 
@@ -317,6 +327,10 @@ function deriveTag(notification: DispatchableNotification): string {
 	// Mentions tagged per-message so each @-mention gets its own
 	// notification (won't collapse with regular chat_message bursts).
 	if (type === 'chat_mention' && messageId) return `${type}:${messageId}`;
+	// Phase 6a.8: replies tagged per-reply-message so a thread of
+	// replies doesn't collapse on the device — each reply is a
+	// separate signal that someone engaged with the user's content.
+	if (type === 'chat_reply' && messageId) return `${type}:${messageId}`;
 	// Regular chat: collapse all messages from the same group into one
 	// device-side notification (prevents 5 messages = 5 buzzes).
 	if (type === 'chat_message' && groupId) return `${type}:${groupId}`;
