@@ -20,6 +20,7 @@ import intakeRoutes from './routes/intake';
 import dashboardRoutes from './routes/dashboard';
 import journalRoutes from './routes/journal';
 import pushRoutes from './routes/push'
+import notificationPreferencesRoutes from './routes/notificationPreferences';
 // ============================================================================
 // EXISTING WEBSOCKET SETUP
 // ============================================================================
@@ -312,6 +313,8 @@ APP.use('/mirror/api/intake', intakeRoutes);
 APP.use('/mirror/api/dashboard', dashboardRoutes);
 APP.use('/mirror/api/journal', AuthMiddleware.subscriptionGate as express.RequestHandler, journalRoutes);
 APP.use('/mirror/api/push', pushRoutes);
+APP.use('/mirror/api/user/notification-preferences', notificationPreferencesRoutes);
+
 // ============================================================================
 // MOUNT MIRRORGROUPS ROUTES (PHASE 1 + PHASE 3 + PHASE 4)
 // ============================================================================
