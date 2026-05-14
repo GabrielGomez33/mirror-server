@@ -90,14 +90,28 @@ export interface DispatchableTemplate {
 }
 
 /**
- * Phase 6a.5: caller-provided dependencies. Avoids circular imports.
- * Currently only `isUserActive` — pass mirrorGroupNotifications.isUserActive
- * (bound) so the dispatcher can skip push for users currently in the app.
- * Optional. If omitted, dispatcher falls back to the original 6a behavior
- * (always fire push when subscriptions exist).
+ * Phase 6a.5 / 6b: caller-provided dependencies. Avoids circular imports.
+ *
+ *   isUserActive — Phase 6a.5. Sync check; skip push when the user is
+ *     foregrounded in the app (in-app WS notification covers that case).
+ *
+ *   isMuted — Phase 6b. Async check against the per-user notification
+ *     preferences (services/notificationPreferences.ts). Skip push when
+ *     the user has opted out of this event type — either globally or
+ *     for this specific group. Failure to resolve (rejection) is
+ *     treated as "not muted" so a transient DB hiccup doesn't silently
+ *     drop notifications for everyone.
+ *
+ * Both are optional. If omitted, dispatcher falls back to the original
+ * 6a behavior (always fire push when subscriptions exist).
  */
 export interface DispatchOptions {
 	isUserActive?: (userId: string) => boolean;
+	isMuted?: (
+		userId: string,
+		eventType: string,
+		groupId?: string,
+	) => Promise<boolean>;
 }
 
 // ============================================================================
@@ -144,6 +158,39 @@ export async function dispatchPushFromNotification(
 			}
 			if (active) {
 				logger.info('Push skipped — user is active in app', {
+					userId: notification.userId,
+					type: notification.type,
+				});
+				return;
+			}
+		}
+
+		// Phase 6b: skip push if the user has muted this event type
+		// (globally or for the originating group). The check is async
+		// and may hit the DB on cache miss; we ALWAYS wait for it so a
+		// muted user doesn't get a stray push due to a race. Errors
+		// fail-open (treat as not muted) so a transient DB issue
+		// doesn't deny notifications wholesale.
+		if (options.isMuted) {
+			let muted = false;
+			try {
+				const groupId = stringOrUndef(
+					(notification.content.metadata || {} as Record<string, unknown>).groupId,
+				);
+				muted = await options.isMuted(
+					String(notification.userId),
+					notification.type,
+					groupId,
+				);
+			} catch (err) {
+				logger.warn('isMuted threw — proceeding with push', {
+					userId: notification.userId,
+					type: notification.type,
+					message: (err as Error)?.message,
+				});
+			}
+			if (muted) {
+				logger.info('Push skipped — user muted this category', {
 					userId: notification.userId,
 					type: notification.type,
 				});

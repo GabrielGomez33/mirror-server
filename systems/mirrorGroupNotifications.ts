@@ -47,6 +47,11 @@ import { mirrorRedis, NotificationQueue } from '../config/redis';
 // failure inside the dispatcher is logged and swallowed so WebSocket
 // delivery is unaffected.
 import { dispatchPushFromNotification } from '../services/pushNotificationDispatcher';
+// Phase 6b: per-user, per-category, optionally per-group push opt-outs.
+// The dispatcher consults this service before firing a Web Push.
+// In-app WebSocket delivery is NEVER gated — only the push channel is
+// suppressed so users can still find muted activity in the panel.
+import { notificationPreferencesService } from '../services/notificationPreferences';
 
 // ============================================================================
 // ERROR HANDLING UTILITIES
@@ -978,8 +983,12 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
           // Phase 6a: also dispatch as Web Push when template.channels
           // includes 'push'. Fire-and-forget — never blocks delivery.
           // Phase 6a.5: pass isUserActive via DI to avoid circular import.
+          // Phase 6b: pass isMuted so the dispatcher can honor per-user,
+          // per-category (optionally per-group) push opt-outs.
           void dispatchPushFromNotification(notification, template, {
             isUserActive: (uid) => this.isUserActive(uid),
+            isMuted: (uid, eventType, groupId) =>
+              notificationPreferencesService.isMuted(uid, eventType, groupId),
           });
           return true;
         }
@@ -988,8 +997,11 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
       // Queue for processing
       const queued = await this.queueNotification(notification);
       // Phase 6a: also dispatch as Web Push (mirror of the immediate path).
+      // Phase 6b: same per-category mute check.
       void dispatchPushFromNotification(notification, template, {
         isUserActive: (uid) => this.isUserActive(uid),
+        isMuted: (uid, eventType, groupId) =>
+          notificationPreferencesService.isMuted(uid, eventType, groupId),
       });
       return queued;
     } catch (error) {
