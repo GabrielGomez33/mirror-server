@@ -63,6 +63,11 @@ export const CATEGORIES = [
 	'compatibility',
 	'personal_analysis',
 	'truthstream',
+	// Phase 6c: master toggle for the email fallback channel. Not in
+	// TYPE_TO_CATEGORY — controlled directly by the email-fallback service.
+	// Muting this disables ALL email fallbacks for the user (push category
+	// mutes additionally suppress email per-category).
+	'email_fallbacks',
 ] as const;
 
 export type Category = (typeof CATEGORIES)[number];

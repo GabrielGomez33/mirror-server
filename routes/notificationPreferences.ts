@@ -213,6 +213,14 @@ const CATEGORY_CATALOG: readonly CategoryDescriptor[] = [
 		description: 'Reviews, dialogue, classifications, queue, milestones.',
 		perGroupAllowed: false,
 	},
+	// Phase 6c — master toggle for the email fallback channel.
+	{
+		key: 'email_fallbacks',
+		label: 'Email fallback',
+		description:
+			'When a push notification can’t reach any of your devices, email me instead. Only for high-priority events; rate-limited.',
+		perGroupAllowed: false,
+	},
 ];
 
 router.get(
