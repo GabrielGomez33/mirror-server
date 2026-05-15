@@ -52,6 +52,11 @@ import { dispatchPushFromNotification } from '../services/pushNotificationDispat
 // In-app WebSocket delivery is NEVER gated — only the push channel is
 // suppressed so users can still find muted activity in the panel.
 import { notificationPreferencesService } from '../services/notificationPreferences';
+// Phase 6c: email fallback for high-priority push events that didn't
+// reach any device (user has no subscriptions, all expired, etc.).
+// The dispatcher fires onPushOutcome after pushService.send; the
+// fallback service inspects the result and decides whether to email.
+import { dispatchEmailFallback } from '../services/notificationEmailFallback';
 
 // ============================================================================
 // ERROR HANDLING UTILITIES
@@ -985,10 +990,15 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
           // Phase 6a.5: pass isUserActive via DI to avoid circular import.
           // Phase 6b: pass isMuted so the dispatcher can honor per-user,
           // per-category (optionally per-group) push opt-outs.
+          // Phase 6c: pass onPushOutcome so the email-fallback service
+          // can email the user when push reached no devices.
           void dispatchPushFromNotification(notification, template, {
             isUserActive: (uid) => this.isUserActive(uid),
             isMuted: (uid, eventType, groupId) =>
               notificationPreferencesService.isMuted(uid, eventType, groupId),
+            onPushOutcome: (n, t, result) => {
+              void dispatchEmailFallback(n, t, result);
+            },
           });
           return true;
         }
@@ -998,10 +1008,14 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
       const queued = await this.queueNotification(notification);
       // Phase 6a: also dispatch as Web Push (mirror of the immediate path).
       // Phase 6b: same per-category mute check.
+      // Phase 6c: same email-fallback hook.
       void dispatchPushFromNotification(notification, template, {
         isUserActive: (uid) => this.isUserActive(uid),
         isMuted: (uid, eventType, groupId) =>
           notificationPreferencesService.isMuted(uid, eventType, groupId),
+        onPushOutcome: (n, t, result) => {
+          void dispatchEmailFallback(n, t, result);
+        },
       });
       return queued;
     } catch (error) {

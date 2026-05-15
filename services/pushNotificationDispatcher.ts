@@ -90,7 +90,7 @@ export interface DispatchableTemplate {
 }
 
 /**
- * Phase 6a.5 / 6b: caller-provided dependencies. Avoids circular imports.
+ * Phase 6a.5 / 6b / 6c: caller-provided dependencies. Avoids circular imports.
  *
  *   isUserActive — Phase 6a.5. Sync check; skip push when the user is
  *     foregrounded in the app (in-app WS notification covers that case).
@@ -102,7 +102,12 @@ export interface DispatchableTemplate {
  *     treated as "not muted" so a transient DB hiccup doesn't silently
  *     drop notifications for everyone.
  *
- * Both are optional. If omitted, dispatcher falls back to the original
+ *   onPushOutcome — Phase 6c. Fired after pushService.send() returns
+ *     (success OR all-zero). The email fallback service uses this to
+ *     decide whether to send an email when push didn't reach any
+ *     device. Errors inside the hook are swallowed.
+ *
+ * All are optional. If omitted, dispatcher falls back to the original
  * 6a behavior (always fire push when subscriptions exist).
  */
 export interface DispatchOptions {
@@ -112,6 +117,11 @@ export interface DispatchOptions {
 		eventType: string,
 		groupId?: string,
 	) => Promise<boolean>;
+	onPushOutcome?: (
+		notification: DispatchableNotification,
+		template: DispatchableTemplate,
+		result: { sent: number; failed: number; expired: number; skipped: number },
+	) => void;
 }
 
 // ============================================================================
@@ -203,6 +213,24 @@ export async function dispatchPushFromNotification(
 		// Fire-and-forget: pushService.send() already swallows per-device
 		// failures and returns counts. We log + move on regardless.
 		const result = await pushService.send(userIdNum, payload);
+
+		// Phase 6c: notify the caller of the push outcome BEFORE we
+		// short-circuit on zero-counts. The email fallback service uses
+		// this hook to decide whether to send an email when nothing
+		// reached the user's devices. Errors inside the hook are
+		// isolated — they MUST NOT affect push reporting.
+		if (options.onPushOutcome) {
+			try {
+				options.onPushOutcome(notification, template, result);
+			} catch (err) {
+				logger.warn('onPushOutcome hook threw', {
+					userId: notification.userId,
+					type: notification.type,
+					message: (err as Error)?.message,
+				});
+			}
+		}
+
 		if (result.sent === 0 && result.expired === 0 && result.skipped === 0) {
 			// User has no active push subscriptions — common, not an error.
 			return;
