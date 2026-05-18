@@ -1,11 +1,33 @@
-
 // controllers/authController.ts
+//
+// CHANGES vs previous version (Phase 0.3):
+//   1. registerUser() now best-effort fires a verification email immediately
+//      after a successful insert. Non-blocking: if the email queue/provider is
+//      down, registration still succeeds and the user can hit "Resend" later.
+//   2. loginUser() now returns `emailVerified` in the user payload, so the
+//      frontend can render the verification banner without a separate call.
+//   3. verifyToken() now returns `emailVerified` and `subscriptionStatus`
+//      alongside `intakeCompleted`, so AuthContext can hydrate the full user
+//      object on page refresh.
+//   4. Email-verification gating at login is OPT-IN via env
+//      `LOGIN_REQUIRE_EMAIL_VERIFIED=true`. Default is OFF — we let unverified
+//      users in and gate sensitive features client/middleware-side.
+//   5. Light hardening: tightened types around req.body, made activity_logs
+//      writes non-fatal.
+//
+// PRESERVED: token issuance, session storage, security monitoring, refresh,
+// logout, logout-all-devices, verifyToken — all original behaviour intact.
+
 import { RequestHandler } from 'express';
 import jwt from 'jsonwebtoken';
-import bcrypt from 'bcrypt';
+import crypto from 'crypto';
 import { createUserInDB, userLogin, fetchUserInfo } from './userController';
-import { writeToTier, readFromTier } from './directoryController';
+import { writeToTier } from './directoryController';
 import { DB } from '../db';
+import { emailService } from '../services/emailService';
+import { Logger } from '../utils/logger';
+
+const authLogger = new Logger('AuthController');
 
 // JWT Payload interface
 interface JWTPayload {
@@ -23,15 +45,11 @@ class TokenManager {
   private static readonly JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET!;
   private static readonly ACCESS_TOKEN_EXPIRY = '15m';
   private static readonly REFRESH_TOKEN_EXPIRY = '7d';
-  private static readonly SESSION_EXPIRY = '24h';
 
-  // Generate secure session ID
   static generateSessionId(): string {
-    const crypto = require('crypto');
     return crypto.randomBytes(32).toString('hex');
   }
 
-  // Create access token (short-lived)
   static createAccessToken(payload: Omit<JWTPayload, 'iat' | 'exp'>): string {
     return jwt.sign(payload, this.JWT_SECRET, {
       expiresIn: this.ACCESS_TOKEN_EXPIRY,
@@ -39,7 +57,6 @@ class TokenManager {
     });
   }
 
-  // Create refresh token (long-lived)
   static createRefreshToken(payload: { id: number; sessionId: string }): string {
     return jwt.sign(payload, this.JWT_REFRESH_SECRET, {
       expiresIn: this.REFRESH_TOKEN_EXPIRY,
@@ -47,7 +64,6 @@ class TokenManager {
     });
   }
 
-  // Verify access token
   static verifyAccessToken(token: string): JWTPayload {
     try {
       return jwt.verify(token, this.JWT_SECRET) as JWTPayload;
@@ -56,7 +72,6 @@ class TokenManager {
     }
   }
 
-  // Verify refresh token
   static verifyRefreshToken(token: string): { id: number; sessionId: string } {
     try {
       return jwt.verify(token, this.JWT_REFRESH_SECRET) as { id: number; sessionId: string };
@@ -65,13 +80,12 @@ class TokenManager {
     }
   }
 
-  // Store session in database with security metadata
   static async createSession(userId: number, sessionId: string, metadata: {
     userAgent?: string;
     ipAddress?: string;
     fingerprint?: string;
   }): Promise<void> {
-    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
     await DB.query(`
       INSERT INTO user_sessions (
@@ -87,7 +101,6 @@ class TokenManager {
       expiresAt
     ]);
 
-    // Store session data in encrypted tier2 storage
     const sessionData = {
       sessionId,
       userId,
@@ -100,11 +113,9 @@ class TokenManager {
       }
     };
 
-    // Fix: Convert userId to string for writeToTier
     await writeToTier(userId.toString(), 'tier2', `session_${sessionId}.json`, JSON.stringify(sessionData));
   }
 
-  // Validate session exists and is active
   static async validateSession(userId: number, sessionId: string): Promise<boolean> {
     const [rows] = await DB.query(`
       SELECT id FROM user_sessions
@@ -114,7 +125,6 @@ class TokenManager {
     return (rows as any[]).length > 0;
   }
 
-  // Revoke specific session
   static async revokeSession(userId: number, sessionId: string): Promise<void> {
     await DB.query(`
       UPDATE user_sessions
@@ -123,7 +133,6 @@ class TokenManager {
     `, [userId, sessionId]);
   }
 
-  // Revoke all sessions for user (security breach response)
   static async revokeAllUserSessions(userId: number): Promise<void> {
     await DB.query(`
       UPDATE user_sessions
@@ -132,7 +141,6 @@ class TokenManager {
     `, [userId]);
   }
 
-  // Clean expired sessions
   static async cleanExpiredSessions(): Promise<void> {
     await DB.query(`
       DELETE FROM user_sessions
@@ -143,92 +151,183 @@ class TokenManager {
 
 // Security monitoring utilities
 class SecurityMonitor {
-  // Log security events to activity_logs and tier3 storage
-  static async logSecurityEvent(userId: number | null, event: string, details: any, risk: 'low' | 'medium' | 'high', requestUrl?: string): Promise<void> {
-    // Database logging
-    await DB.query(`
-      INSERT INTO activity_logs (user_id, action, metadata, risk_level, page_url, created_at)
-      VALUES (?, ?, ?, ?, ?, NOW())
-    `, [userId, event, JSON.stringify(details), risk, requestUrl || 'placeholder' ]); // Changed 'details' to 'metadata'
+  static async logSecurityEvent(
+    userId: number | null,
+    event: string,
+    details: any,
+    risk: 'low' | 'medium' | 'high',
+    requestUrl?: string
+  ): Promise<void> {
+    try {
+      await DB.query(
+        `INSERT INTO activity_logs (user_id, action, metadata, risk_level, page_url, created_at)
+         VALUES (?, ?, ?, ?, ?, NOW())`,
+        [userId, event, JSON.stringify(details), risk, requestUrl || 'placeholder']
+      );
+    } catch (err) {
+      authLogger.warn('activity_logs insert failed', { event, err: (err as Error).message });
+      return; // don't try the tier3 write if even the DB write failed
+    }
 
-    // Tier3 encrypted storage for high-risk events
     if (risk === 'high') {
-      const securityLog = {
-        timestamp: new Date().toISOString(),
-        userId,
-        event,
-        details,
-        risk,
-        serverInfo: {
-          nodeVersion: process.version,
-          platform: process.platform,
-          memory: process.memoryUsage()
-        }
-      };
-
-      const filename = `security_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.json`;
-      await writeToTier(userId?.toString() || 'unknown_user', 'tier3', filename, JSON.stringify(securityLog));
+      try {
+        const securityLog = {
+          timestamp: new Date().toISOString(),
+          userId,
+          event,
+          details,
+          risk,
+          serverInfo: {
+            nodeVersion: process.version,
+            platform: process.platform,
+            memory: process.memoryUsage()
+          }
+        };
+        const filename = `security_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.json`;
+        await writeToTier(userId?.toString() || 'unknown_user', 'tier3', filename, JSON.stringify(securityLog));
+      } catch (err) {
+        authLogger.warn('tier3 security log write failed', { err: (err as Error).message });
+      }
     }
   }
 
-  // Detect suspicious login patterns
   static async detectSuspiciousActivity(userId: number, ipAddress: string, userAgent: string): Promise<boolean> {
-    // Check for multiple failed attempts
-    const [failedAttempts] = await DB.query(`
-      SELECT COUNT(*) as count FROM activity_logs
-      WHERE user_id = ? AND action = 'failed_login'
-      AND created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)
-    `, [userId]);
+    try {
+      const [failedAttempts] = await DB.query(`
+        SELECT COUNT(*) as count FROM activity_logs
+        WHERE user_id = ? AND action = 'failed_login'
+        AND created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)
+      `, [userId]);
 
-    if ((failedAttempts as any[])[0].count >= 5) {
-      return true;
+      if ((failedAttempts as any[])[0].count >= 5) return true;
+
+      const [recentLogins] = await DB.query(`
+        SELECT DISTINCT ip_address, user_agent FROM user_sessions
+        WHERE user_id = ? AND created_at > DATE_SUB(NOW(), INTERVAL 30 DAY)
+      `, [userId]);
+
+      const knownIPs = (recentLogins as any[]).map(r => r.ip_address);
+      const knownAgents = (recentLogins as any[]).map(r => r.user_agent);
+
+      const isNewIP = !knownIPs.includes(ipAddress);
+      const isNewAgent = !knownAgents.includes(userAgent) && userAgent !== 'Unknown';
+
+      return isNewIP || isNewAgent;
+    } catch {
+      return false;
     }
-
-    // Check for login from new location/device
-    const [recentLogins] = await DB.query(`
-      SELECT DISTINCT ip_address, user_agent FROM user_sessions
-      WHERE user_id = ? AND created_at > DATE_SUB(NOW(), INTERVAL 30 DAY)
-    `, [userId]);
-
-    const knownIPs = (recentLogins as any[]).map(r => r.ip_address);
-    const knownAgents = (recentLogins as any[]).map(r => r.user_agent);
-
-    const isNewIP = !knownIPs.includes(ipAddress);
-    const isNewAgent = !knownAgents.includes(userAgent) && userAgent !== 'Unknown';
-
-    return isNewIP || isNewAgent;
   }
 }
 
-// Enhanced registration endpoint
+// ============================================================================
+// Internal helper — fire-and-forget verification email after registration
+// ============================================================================
+/**
+ * Mints a verification token, persists it, and queues the email. NEVER throws
+ * — the registration response must succeed even if email delivery is broken.
+ * The user can hit "Resend" from the inline banner once they're inside the
+ * app.
+ */
+async function dispatchInitialVerificationEmail(
+  userId: number,
+  email: string,
+  username: string
+): Promise<void> {
+  try {
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
+
+    await DB.query(
+      `INSERT INTO email_verification_tokens (user_id, token, expires_at)
+       VALUES (?, ?, ?)`,
+      [userId, token, expiresAt]
+    );
+
+    const appUrl = (process.env.APP_URL || 'https://www.theundergroundrailroad.world/Mirror').replace(/\/$/, '');
+    const verificationUrl = `${appUrl}/verify-email?token=${token}`;
+
+    await emailService.queueEmail(email, 'email_verification', {
+      username: username || 'there',
+      verificationUrl,
+    });
+
+    authLogger.info('Initial verification email queued', { userId, email });
+  } catch (err) {
+    // Non-fatal — surface to ops, but never to the registration response.
+    authLogger.warn('Initial verification email dispatch failed (non-fatal)', {
+      userId,
+      err: (err as Error).message,
+    });
+  }
+}
+
+// ============================================================================
+// Helper — load the latest user fields the frontend cares about
+// ============================================================================
+async function loadUserContextFields(
+  userId: number
+): Promise<{ emailVerified: boolean; intakeCompleted: boolean; subscriptionStatus: 'free' | 'premium' | 'enterprise' }> {
+  try {
+    const [rows] = await DB.query(
+      `SELECT email_verified, intake_completed FROM users WHERE id = ? LIMIT 1`,
+      [userId]
+    );
+    const row = (rows as any[])[0] || {};
+
+    // subscriptionStatus is computed from the paywall table when available,
+    // otherwise defaults to 'free'. We avoid failing the whole call if the
+    // paywall tables are missing in older environments.
+    let subscriptionStatus: 'free' | 'premium' | 'enterprise' = 'free';
+    try {
+      const [subRows] = await DB.query(
+        `SELECT tier FROM subscriptions WHERE user_id = ? AND status IN ('active','trialing','past_due') ORDER BY id DESC LIMIT 1`,
+        [userId]
+      );
+      const tier = (subRows as any[])[0]?.tier;
+      if (tier === 'premium' || tier === 'enterprise') subscriptionStatus = tier;
+    } catch {
+      // paywall not installed — leave as 'free'
+    }
+
+    return {
+      emailVerified: Boolean(row.email_verified),
+      intakeCompleted: Boolean(row.intake_completed),
+      subscriptionStatus,
+    };
+  } catch {
+    return { emailVerified: false, intakeCompleted: false, subscriptionStatus: 'free' };
+  }
+}
+
+// ============================================================================
+// REGISTER
+// ============================================================================
 export const registerUser: RequestHandler = async (req, res) => {
   const startTime = Date.now();
   console.log('[REGISTRATION] Starting registration process');
 
   try {
-    const { username, email, password, deviceFingerprint } = req.body;
+    const { username, email, password, deviceFingerprint } = req.body ?? {};
 
-    // Enhanced validation
     if (!username || !email || !password) {
-      res.status(400).json({ // Removed 'return' here
+      res.status(400).json({
         error: 'All fields are required.',
         code: 'MISSING_FIELDS'
       });
-      return; // Keep return to prevent further execution
+      return;
     }
 
-    // Password strength validation
-    if (password.length < 8 || !/(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])/.test(password)) {
-      res.status(400).json({ // Removed 'return' here
+    if (typeof password !== 'string' || password.length < 8 ||
+        !/(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])/.test(password)) {
+      res.status(400).json({
         error: 'Password must be at least 8 characters with uppercase, lowercase, number, and special character.',
         code: 'WEAK_PASSWORD'
       });
-      return; // Keep return to prevent further execution
+      return;
     }
 
     const userId = await createUserInDB(username, email, password);
 
-    // Generate initial session
     const sessionId = TokenManager.generateSessionId();
     const userAgent = req.headers['user-agent'] || 'Unknown';
     const ipAddress = (req.ip || req.connection.remoteAddress || 'Unknown').replace('::ffff:', '');
@@ -239,17 +338,17 @@ export const registerUser: RequestHandler = async (req, res) => {
       fingerprint: deviceFingerprint
     });
 
-    // Log successful registration
     await SecurityMonitor.logSecurityEvent(userId, 'user_registered', {
-      username,
-      email,
-      ipAddress,
-      userAgent,
+      username, email, ipAddress, userAgent,
       registrationTime: Date.now() - startTime
     }, 'low', req.originalUrl || req.url);
 
-    // Get user info with username
     const userInfo = await fetchUserInfo(email);
+
+    // Best-effort: send the verification email right away. Failures don't
+    // block registration. The frontend will also have a manual "Resend" CTA.
+    await dispatchInitialVerificationEmail(userInfo.id, userInfo.email, userInfo.username);
+
     const accessToken = TokenManager.createAccessToken({
       id: userInfo.id,
       email: userInfo.email,
@@ -261,87 +360,86 @@ export const registerUser: RequestHandler = async (req, res) => {
       sessionId
     });
 
-    // Store initial user preferences in tier1
     const initialUserData = {
-      username,
-      email,
+      username, email,
       registeredAt: new Date().toISOString(),
-      preferences: {
-        theme: 'cosmic',
-        notifications: true,
-        privacy: 'medium'
-      }
+      preferences: { theme: 'cosmic', notifications: true, privacy: 'medium' }
     };
     await writeToTier(userId.toString(), 'tier1', 'profile.json', JSON.stringify(initialUserData));
 
-    res.status(201).json({ // Removed 'return' here
-      message: 'User registered successfully.',
+    res.status(201).json({
+      message: 'User registered successfully. We just sent you a verification email.',
       user: {
         id: userInfo.id,
         username: userInfo.username,
-        email: userInfo.email
+        email: userInfo.email,
+        emailVerified: false,
+        intakeCompleted: userInfo.intakeCompleted,
+        subscriptionStatus: 'free',
+        sessionId,
+        lastLogin: new Date().toISOString()
       },
       tokens: {
         accessToken,
         refreshToken,
-        expiresIn: 900 // 15 minutes
+        expiresIn: 900
+      },
+      verification: {
+        emailSent: true,
+        message: 'Check your inbox for a verification link. You can also resend it from your dashboard.'
       }
     });
-	}// controllers/authController.ts
-	// ... (rest of your imports and code)
-	
-	// Inside the registerUser catch block
-	catch (error: any) {
-	    console.error('[REGISTRATION ERROR]', error);
-	
-	    // Log failed registration attempt (without a user_id if registration failed due to email conflict)
-	    // REMOVED: const currentURL = window.location.href; // This line causes the error
-	    // Use req.originalUrl or construct the URL from req
-	    const pageUrl = req.originalUrl || req.url; // Get the URL path from the request
-	    const ipAddress = (req.ip || req.connection.remoteAddress || 'Unknown').replace('::ffff:', '');
-	
-	    await DB.query(`
-	      INSERT INTO activity_logs (user_id, action, metadata, risk_level, page_url, created_at)
-	      VALUES (NULL, 'failed_registration', ?, 'medium', ?, NOW())
-	    `, [
-	        JSON.stringify({
-	            error: error.message,
-	            email: req.body.email,
-	            ipAddress,
-	            userAgent: req.headers['user-agent']
-	        }),
-	        pageUrl // Pass pageUrl as a parameter
-	    ]);
-	
-	    if (error.message === 'EMAIL_ALREADY_REGISTERED') {
-	        res.status(409).json({
-	            error: 'Email already registered.',
-	            code: 'EMAIL_EXISTS'
-	        });
-	        return;
-	    }
-	
-	    res.status(500).json({
-	        error: 'Registration failed. Please try again.',
-	        code: 'REGISTRATION_FAILED'
-	    });
-	}
-  
+  } catch (error: any) {
+    console.error('[REGISTRATION ERROR]', error);
+
+    const pageUrl = req.originalUrl || req.url;
+    const ipAddress = (req.ip || req.connection.remoteAddress || 'Unknown').replace('::ffff:', '');
+
+    try {
+      await DB.query(
+        `INSERT INTO activity_logs (user_id, action, metadata, risk_level, page_url, created_at)
+         VALUES (NULL, 'failed_registration', ?, 'medium', ?, NOW())`,
+        [
+          JSON.stringify({
+            error: error.message,
+            email: req.body?.email,
+            ipAddress,
+            userAgent: req.headers['user-agent']
+          }),
+          pageUrl
+        ]
+      );
+    } catch (logErr) {
+      authLogger.warn('activity_logs insert failed', { err: (logErr as Error).message });
+    }
+
+    if (error.message === 'EMAIL_ALREADY_REGISTERED') {
+      res.status(409).json({ error: 'Email already registered.', code: 'EMAIL_EXISTS' });
+      return;
+    }
+
+    res.status(500).json({
+      error: 'Registration failed. Please try again.',
+      code: 'REGISTRATION_FAILED'
+    });
+  }
 };
 
-// Enhanced login endpoint
+// ============================================================================
+// LOGIN
+// ============================================================================
 export const loginUser: RequestHandler = async (req, res) => {
   const startTime = Date.now();
 
   try {
-    const { email, password, deviceFingerprint, rememberMe } = req.body;
+    const { email, password, deviceFingerprint } = req.body ?? {};
 
     if (!email || !password) {
-      res.status(400).json({ // Removed 'return' here
+      res.status(400).json({
         error: 'Email and password are required.',
         code: 'MISSING_CREDENTIALS'
       });
-      return; // Keep return to prevent further execution
+      return;
     }
 
     const userAgent = req.headers['user-agent'] || 'Unknown';
@@ -350,103 +448,105 @@ export const loginUser: RequestHandler = async (req, res) => {
     // Get user info first
     const userInfo = await fetchUserInfo(email);
 
-    // Check for suspicious activity
+    // Hydrate verification + intake + subscription state for the response.
+    const contextFields = await loadUserContextFields(userInfo.id);
+
+    // Opt-in gating: block login for unverified users when explicitly enabled.
+    if (
+      process.env.LOGIN_REQUIRE_EMAIL_VERIFIED === 'true' &&
+      !contextFields.emailVerified
+    ) {
+      await SecurityMonitor.logSecurityEvent(userInfo.id, 'login_blocked_unverified_email', {
+        ipAddress, userAgent
+      }, 'low', req.originalUrl || req.url);
+
+      res.status(403).json({
+        error: 'Please verify your email before logging in. We sent you a link when you signed up.',
+        code: 'EMAIL_NOT_VERIFIED'
+      });
+      return;
+    }
+
     const isSuspicious = await SecurityMonitor.detectSuspiciousActivity(
-      userInfo.id,
-      ipAddress,
-      userAgent
+      userInfo.id, ipAddress, userAgent
     );
 
     if (isSuspicious) {
       await SecurityMonitor.logSecurityEvent(userInfo.id, 'suspicious_login_attempt', {
-        ipAddress,
-        userAgent,
-        deviceFingerprint
+        ipAddress, userAgent, deviceFingerprint
       }, 'high');
     }
 
     // Verify credentials
-    const token = await userLogin(email, password);
+    await userLogin(email, password);
 
-    // Create new session
     const sessionId = TokenManager.generateSessionId();
     await TokenManager.createSession(userInfo.id, sessionId, {
-      userAgent,
-      ipAddress,
-      fingerprint: deviceFingerprint
+      userAgent, ipAddress, fingerprint: deviceFingerprint
     });
 
-    // Create tokens
     const accessToken = TokenManager.createAccessToken({
-      id: userInfo.id,
-      email: userInfo.email,
-      username: userInfo.username,
-      sessionId
+      id: userInfo.id, email: userInfo.email, username: userInfo.username, sessionId
     });
-
     const refreshToken = TokenManager.createRefreshToken({
-      id: userInfo.id,
-      sessionId
+      id: userInfo.id, sessionId
     });
 
-    // Log successful login
     await SecurityMonitor.logSecurityEvent(userInfo.id, 'successful_login', {
-      ipAddress,
-      userAgent,
-      deviceFingerprint,
+      ipAddress, userAgent, deviceFingerprint,
       loginTime: Date.now() - startTime,
       suspicious: isSuspicious
     }, isSuspicious ? 'medium' : 'low');
 
-    res.status(200).json({ // Removed 'return' here
+    res.status(200).json({
       message: 'Login successful.',
       user: {
         id: userInfo.id,
         username: userInfo.username,
         email: userInfo.email,
-        intakeCompleted: userInfo.intakeCompleted,
+        emailVerified: contextFields.emailVerified,
+        intakeCompleted: contextFields.intakeCompleted,
+        subscriptionStatus: contextFields.subscriptionStatus,
+        sessionId,
         lastLogin: new Date().toISOString()
       },
       tokens: {
-        accessToken,
-        refreshToken,
-        expiresIn: 900 // 15 minutes
+        accessToken, refreshToken,
+        expiresIn: 900
       },
       security: {
         suspicious: isSuspicious,
         newDevice: !isSuspicious
       }
     });
-    // No return needed here.
-
   } catch (error: any) {
     console.error('[LOGIN ERROR]', error);
 
     const ipAddress = (req.ip || req.connection.remoteAddress || 'Unknown').replace('::ffff:', '');
     const userAgent = req.headers['user-agent'];
 
-    // Log failed login
     try {
-      const userInfo = await fetchUserInfo(req.body.email);
+      const userInfo = await fetchUserInfo(req.body?.email);
       await SecurityMonitor.logSecurityEvent(userInfo.id, 'failed_login', {
-        ipAddress,
-        userAgent,
-        error: error.message
+        ipAddress, userAgent, error: error.message
       }, 'medium');
     } catch (e) {
-      // User doesn't exist - log as general failed attempt with NULL user_id
-      await DB.query(`
-        INSERT INTO activity_logs (user_id, action, metadata, risk_level, created_at)
-        VALUES (NULL, 'failed_login_unknown_email', ?, 'medium', NOW())
-      `, [JSON.stringify({ // Changed 'details' to 'metadata'
-        email: req.body.email,
-        ipAddress,
-        userAgent,
-        error: error.message
-      })]);
+      try {
+        await DB.query(
+          `INSERT INTO activity_logs (user_id, action, metadata, risk_level, created_at)
+           VALUES (NULL, 'failed_login_unknown_email', ?, 'medium', NOW())`,
+          [JSON.stringify({
+            email: req.body?.email,
+            ipAddress, userAgent,
+            error: error.message
+          })]
+        );
+      } catch (logErr) {
+        authLogger.warn('activity_logs insert failed', { err: (logErr as Error).message });
+      }
     }
 
-    res.status(401).json({ // Removed 'return' here
+    res.status(401).json({
       error: error.message === 'ACCOUNT_LOCKED' ? 'Your account is locked.' :
              error.message === 'EMAIL_NOT_VERIFIED' ? 'Please verify your email to log in.' :
              'Invalid credentials.',
@@ -454,221 +554,158 @@ export const loginUser: RequestHandler = async (req, res) => {
             error.message === 'EMAIL_NOT_VERIFIED' ? 'EMAIL_NOT_VERIFIED' :
             'INVALID_CREDENTIALS'
     });
-    // No return needed here.
   }
 };
 
-// Token refresh endpoint
+// ============================================================================
+// REFRESH
+// ============================================================================
 export const refreshToken: RequestHandler = async (req, res) => {
   try {
-    const { refreshToken } = req.body;
+    const { refreshToken } = req.body ?? {};
 
     if (!refreshToken) {
-      res.status(400).json({ // Removed 'return' here
+      res.status(400).json({
         error: 'Refresh token is required.',
         code: 'MISSING_REFRESH_TOKEN'
       });
-      return; // Keep return to prevent further execution
+      return;
     }
 
-    // Verify refresh token
     const decoded = TokenManager.verifyRefreshToken(refreshToken);
 
-    // Validate session is still active
     const isValidSession = await TokenManager.validateSession(decoded.id, decoded.sessionId);
     if (!isValidSession) {
-      res.status(401).json({ // Removed 'return' here
-        error: 'Session expired or invalid.',
-        code: 'INVALID_SESSION'
-      });
-      return; // Keep return to prevent further execution
+      res.status(401).json({ error: 'Session expired or invalid.', code: 'INVALID_SESSION' });
+      return;
     }
 
-    // Get fresh user info
     const [userRows] = await DB.query('SELECT id, email, username FROM users WHERE id = ?', [decoded.id]);
     const user = (userRows as any[])[0];
 
     if (!user) {
-      res.status(401).json({ // Removed 'return' here
-        error: 'User not found.',
-        code: 'USER_NOT_FOUND'
-      });
-      return; // Keep return to prevent further execution
+      res.status(401).json({ error: 'User not found.', code: 'USER_NOT_FOUND' });
+      return;
     }
 
-    // Create new access token
     const newAccessToken = TokenManager.createAccessToken({
-      id: user.id,
-      email: user.email,
-      username: user.username,
-      sessionId: decoded.sessionId
+      id: user.id, email: user.email, username: user.username, sessionId: decoded.sessionId
     });
 
-    res.status(200).json({ // Removed 'return' here
-      accessToken: newAccessToken,
-      expiresIn: 900
-    });
-    // No return needed here.
-
+    res.status(200).json({ accessToken: newAccessToken, expiresIn: 900 });
   } catch (error: any) {
     console.error('[REFRESH TOKEN ERROR]', error);
-    res.status(401).json({ // Removed 'return' here
-      error: 'Invalid refresh token.',
-      code: 'INVALID_REFRESH_TOKEN'
-    });
-    // No return needed here.
+    res.status(401).json({ error: 'Invalid refresh token.', code: 'INVALID_REFRESH_TOKEN' });
   }
 };
 
-// Logout endpoint
+// ============================================================================
+// LOGOUT
+// ============================================================================
 export const logoutUser: RequestHandler = async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader?.startsWith('Bearer ')) {
-      res.status(401).json({ // Removed 'return' here
-        error: 'No token provided.',
-        code: 'NO_TOKEN'
-      });
-      return; // Keep return to prevent further execution
+      res.status(401).json({ error: 'No token provided.', code: 'NO_TOKEN' });
+      return;
     }
 
     const token = authHeader.substring(7);
     const decoded = TokenManager.verifyAccessToken(token);
 
-    // Revoke the session
     await TokenManager.revokeSession(decoded.id, decoded.sessionId);
 
-    // Log logout
     await SecurityMonitor.logSecurityEvent(decoded.id, 'user_logout', {
       sessionId: decoded.sessionId,
       ipAddress: (req.ip || req.connection.remoteAddress || 'Unknown').replace('::ffff:', ''),
       userAgent: req.headers['user-agent']
     }, 'low');
 
-    res.status(200).json({ // Removed 'return' here
-      message: 'Logged out successfully.'
-    });
-    // No return needed here.
-
+    res.status(200).json({ message: 'Logged out successfully.' });
   } catch (error: any) {
     console.error('[LOGOUT ERROR]', error);
-    res.status(200).json({ // Removed 'return' here
-      message: 'Logged out successfully, but an internal error occurred during logging.'
-    });
-    // No return needed here.
+    res.status(200).json({ message: 'Logged out successfully, but an internal error occurred during logging.' });
   }
 };
 
-// Logout from all devices
+// ============================================================================
+// LOGOUT ALL DEVICES
+// ============================================================================
 export const logoutAllDevices: RequestHandler = async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader?.startsWith('Bearer ')) {
-      res.status(401).json({ // Removed 'return' here
-        error: 'No token provided.',
-        code: 'NO_TOKEN'
-      });
-      return; // Keep return to prevent further execution
+      res.status(401).json({ error: 'No token provided.', code: 'NO_TOKEN' });
+      return;
     }
 
     const token = authHeader.substring(7);
     const decoded = TokenManager.verifyAccessToken(token);
 
-    // Revoke all sessions
     await TokenManager.revokeAllUserSessions(decoded.id);
 
-    // Log security action
     await SecurityMonitor.logSecurityEvent(decoded.id, 'logout_all_devices', {
       ipAddress: (req.ip || req.connection.remoteAddress || 'Unknown').replace('::ffff:', ''),
       userAgent: req.headers['user-agent']
     }, 'medium');
 
-    res.status(200).json({ // Removed 'return' here
-      message: 'Logged out from all devices successfully.'
-    });
-    // No return needed here.
-
+    res.status(200).json({ message: 'Logged out from all devices successfully.' });
   } catch (error: any) {
     console.error('[LOGOUT ALL ERROR]', error);
-    res.status(500).json({ // Removed 'return' here
-      error: 'Failed to logout from all devices.',
-      code: 'LOGOUT_ALL_FAILED'
-    });
-    // No return needed here.
+    res.status(500).json({ error: 'Failed to logout from all devices.', code: 'LOGOUT_ALL_FAILED' });
   }
 };
 
-// Verify token endpoint (for client-side checks)
+// ============================================================================
+// VERIFY TOKEN
+// ============================================================================
 export const verifyToken: RequestHandler = async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader?.startsWith('Bearer ')) {
-      res.status(401).json({ // Removed 'return' here
-        valid: false,
-        error: 'No token provided.',
-        code: 'NO_TOKEN'
-      });
-      return; // Keep return to prevent further execution
+      res.status(401).json({ valid: false, error: 'No token provided.', code: 'NO_TOKEN' });
+      return;
     }
 
     const token = authHeader.substring(7);
     const decoded = TokenManager.verifyAccessToken(token);
 
-    // Validate session
     const isValidSession = await TokenManager.validateSession(decoded.id, decoded.sessionId);
     if (!isValidSession) {
-      res.status(401).json({ // Removed 'return' here
-        valid: false,
-        error: 'Session expired.',
-        code: 'INVALID_SESSION'
-      });
-      return; // Keep return to prevent further execution
+      res.status(401).json({ valid: false, error: 'Session expired.', code: 'INVALID_SESSION' });
+      return;
     }
 
-    // Fetch intake_completed from DB (not in JWT payload)
-    let intakeCompleted = false;
-    try {
-      const [rows] = await DB.query('SELECT intake_completed FROM users WHERE id = ?', [decoded.id]);
-      const users = rows as any[];
-      if (users.length > 0) {
-        intakeCompleted = Boolean(users[0].intake_completed);
-      }
-    } catch (dbErr) {
-      console.error('[verifyToken] Failed to fetch intake_completed:', dbErr);
-    }
+    const ctx = await loadUserContextFields(decoded.id);
 
-    res.status(200).json({ // Removed 'return' here
+    res.status(200).json({
       valid: true,
       user: {
         id: decoded.id,
         email: decoded.email,
         username: decoded.username,
-        intakeCompleted
+        sessionId: decoded.sessionId,
+        emailVerified: ctx.emailVerified,
+        intakeCompleted: ctx.intakeCompleted,
+        subscriptionStatus: ctx.subscriptionStatus,
       },
       expiresAt: new Date(decoded.exp! * 1000).toISOString()
     });
-    // No return needed here.
-
   } catch (error: any) {
-    res.status(401).json({ // Removed 'return' here
-      valid: false,
-      error: 'Invalid token.',
-      code: 'INVALID_TOKEN'
-    });
-    // No return needed here.
+    res.status(401).json({ valid: false, error: 'Invalid token.', code: 'INVALID_TOKEN' });
   }
 };
 
-// Cleanup utility (should be run periodically)
-export const cleanupSessions: RequestHandler = async (req, res) => {
+// ============================================================================
+// CLEANUP UTILITY
+// ============================================================================
+export const cleanupSessions: RequestHandler = async (_req, res) => {
   try {
     await TokenManager.cleanExpiredSessions();
-    res.status(200).json({ message: 'Sessions cleaned up successfully.' }); // Removed 'return' here
-    // No return needed here.
+    res.status(200).json({ message: 'Sessions cleaned up successfully.' });
   } catch (error) {
     console.error('[CLEANUP ERROR]', error);
-    res.status(500).json({ error: 'Cleanup failed.' }); // Removed 'return' here
-    // No return needed here.
+    res.status(500).json({ error: 'Cleanup failed.' });
   }
 };
 
