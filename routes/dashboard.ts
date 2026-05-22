@@ -1,4 +1,12 @@
 // routes/dashboard.ts - COMPLETE DATA EXTRACTION VERSION
+//
+// CHANGE (Phase 1a, refinement):
+//   - extractCompleteEmotionalData() now also returns photoFileRef so the
+//     global-dashboard avatar dropdown can render the captured intake photo
+//     via /mirror/api/storage/retrieve. The photoFileRef is the same shape
+//     already stored by SubmitStep (filename / tier / size / mimetype /
+//     uploadedAt / originalname). No other behaviour changes.
+//
 import express, { RequestHandler } from 'express';
 import jwt from 'jsonwebtoken';
 import { IntakeDataManager } from '../controllers/intakeController';
@@ -224,7 +232,11 @@ function extractCompleteEmotionalData(intakeData: any): any {
       landmarks: face.landmarks ? Object.keys(face.landmarks).length : 0
     },
     dominantEmotion: getDominantEmotion(face.expressions),
-    emotionalSpectrum: getEmotionalSpectrum(face.expressions)
+    emotionalSpectrum: getEmotionalSpectrum(face.expressions),
+    // Echoes the storage reference for the captured photo so the client can
+    // build a secure /storage/retrieve URL. Mirrors the pattern already used
+    // by extractCompleteVoiceData for voiceFileRef.
+    photoFileRef: intakeData.photoFileRef || null
   };
 }
 
