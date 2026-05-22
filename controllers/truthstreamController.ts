@@ -2144,14 +2144,27 @@ export async function getAnalysisTrends(req: AuthenticatedRequest, res: Response
 // Call this BEFORE deleting the user row from the users table.
 // The CASCADE foreign keys on user_id will handle the rest (profile,
 // received reviews, analyses, milestones, feedback requests, etc.).
+//
+// IMPORTANT — `truth_stream_reviews.queue_id` references `truth_stream_queue(id)`
+// with the implicit RESTRICT rule (no ON DELETE clause was set when that table
+// was created). That means when DELETE FROM users CASCADEs into
+// truth_stream_queue (via reviewer_id / reviewee_id), any review row still
+// pointing at one of those queue rows BLOCKS the entire delete. Production
+// confirmed this exact failure mode. We have to remove the blocking reviews
+// AND the queue rows ourselves before the user row goes away.
 // ============================================================================
 
 /**
  * Clean up TruthStream data for a user BEFORE their account is deleted.
  *
- * Preserves reviews this user wrote for others (sets reviewer_id to NULL)
- * so the reviewee doesn't lose valuable feedback. Everything owned by
- * this user is cleaned up by CASCADE after the users row is deleted.
+ * Pre-deletes reviews + queue rows tied to this user so the CASCADE chain
+ * starting at DELETE FROM users does not die against the RESTRICT FK
+ * `fk_ts_review_queue` on `truth_stream_reviews.queue_id`.
+ *
+ * Trade-off: reviews this user wrote for others can no longer be preserved
+ * once their queue assignment is gone. If we want to keep that data, the
+ * schema needs a migration making `truth_stream_reviews.queue_id` nullable
+ * with ON DELETE SET NULL.
  *
  * @param userId - The ID of the user being deleted
  * @returns true if cleanup succeeded, false if it failed (non-blocking)
@@ -2161,22 +2174,47 @@ export async function cleanupUserTruthStreamData(userId: number): Promise<boolea
   try {
     await connection.beginTransaction();
 
-    // 1. Preserve reviews this user wrote for other people
-    //    Nullify reviewer_id so the review content remains for the reviewee
+    // 1. Break the queue_id RESTRICT chain BEFORE we touch queue rows.
+    //    Delete every review tied to a queue assignment this user participated
+    //    in (as reviewer or reviewee). Children of those reviews (votes,
+    //    dialogues, hostility log) CASCADE on review_id, so they go too.
+    //
+    //    Two-step subquery to avoid MySQL's "can't UPDATE/DELETE and SELECT
+    //    from the same table in one statement" error: collect ids, then delete.
+    const [queueRowsToBeRemoved] = await connection.query(
+      `SELECT id FROM truth_stream_queue
+       WHERE reviewer_id = ? OR reviewee_id = ?`,
+      [userId, userId]
+    );
+    const queueIds = Array.isArray(queueRowsToBeRemoved)
+      ? (queueRowsToBeRemoved as Array<{ id: string }>).map(r => r.id)
+      : [];
+
+    if (queueIds.length > 0) {
+      await connection.query(
+        'DELETE FROM truth_stream_reviews WHERE queue_id IN (?)',
+        [queueIds]
+      );
+    }
+
+    // 2. Belt-and-braces: any review where reviewer_id is still this user
+    //    (e.g. reviews not tied to a queue row matched above — shouldn't
+    //    exist given the schema, but harmless) gets reviewer_id NULLed.
     await connection.query(
       'UPDATE truth_stream_reviews SET reviewer_id = NULL WHERE reviewer_id = ?',
       [userId]
     );
 
-    // 2. Cancel incomplete queue assignments where this user was reviewer
-    //    Completed queue items will be cleaned up by CASCADE on reviewee side
+    // 3. Remove every queue row involving this user, regardless of status.
+    //    With step 1 done, no review references these queue rows.
     await connection.query(
-      `DELETE FROM truth_stream_queue
-       WHERE reviewer_id = ? AND status IN ('pending', 'in_progress')`,
-      [userId]
+      'DELETE FROM truth_stream_queue WHERE reviewer_id = ? OR reviewee_id = ?',
+      [userId, userId]
     );
 
-    // 3. Mark dialogues from this user as system messages (identity removed)
+    // 4. Mark dialogues from this user as system messages (identity removed)
+    //    NB: dialogues attached to reviews we just deleted in step 1 are
+    //    already gone via CASCADE on review_id. This catches anything left.
     await connection.query(
       `UPDATE truth_stream_dialogues
        SET author_user_id = NULL,
@@ -2186,7 +2224,7 @@ export async function cleanupUserTruthStreamData(userId: number): Promise<boolea
       [userId]
     );
 
-    // 4. Cancel any pending processing jobs for this user
+    // 5. Cancel any pending processing jobs for this user
     await connection.query(
       `UPDATE truth_stream_processing_queue
        SET status = 'failed', error_message = 'User account deleted'
@@ -2194,7 +2232,7 @@ export async function cleanupUserTruthStreamData(userId: number): Promise<boolea
       [userId]
     );
 
-    // 5. Remove hostility log entries where this user was the reviewer
+    // 6. Remove hostility log entries where this user was the reviewer
     //    (audit trail for their own reviews is no longer meaningful)
     await connection.query(
       'DELETE FROM truth_stream_hostility_log WHERE reviewer_id = ?',
@@ -2202,7 +2240,9 @@ export async function cleanupUserTruthStreamData(userId: number): Promise<boolea
     );
 
     await connection.commit();
-    logger.info(`TruthStream cleanup completed for user ${userId}`);
+    logger.info(`TruthStream cleanup completed for user ${userId}`, {
+      queueRowsRemoved: queueIds.length,
+    });
     return true;
   } catch (error: any) {
     await connection.rollback();
@@ -2212,4 +2252,3 @@ export async function cleanupUserTruthStreamData(userId: number): Promise<boolea
     connection.release();
   }
 }
-
