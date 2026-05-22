@@ -879,10 +879,19 @@ export const deleteAccount: RequestHandler = async (req, res) => {
     await deleteUserFromDB(String(userId), userId);
   } catch (err) {
     console.error('[DELETE ACCOUNT] deleteUserFromDB threw', err);
+    const message = (err as Error)?.message || 'unknown';
     await SecurityMonitor.logSecurityEvent(userId, 'account_deletion_local_failed', {
-      error: (err as Error)?.message || 'unknown',
+      error: message,
     }, 'high');
-    res.status(500).json({ error: 'Account deletion failed.', code: 'LOCAL_DELETE_FAILED' });
+    // Caller is already JWT-authenticated and password-verified, so it's
+    // safe — and very useful for debugging FK-constraint surprises — to
+    // pass the underlying message back. Truncated to keep ridiculous SQL
+    // dumps out of the response body.
+    res.status(500).json({
+      error: 'Account deletion failed.',
+      code: 'LOCAL_DELETE_FAILED',
+      detail: message.slice(0, 500),
+    });
     return;
   }
 

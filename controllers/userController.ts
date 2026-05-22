@@ -1,4 +1,21 @@
 // controllers/userController.ts
+//
+// CHANGES vs previous version (Phase 2a — account deletion hardening):
+//   - deleteUserFromDB is now transactional and explicitly purges every
+//     dependent table BEFORE deleting the users row. The previous version
+//     trusted `ON DELETE CASCADE` to clean up downstream tables, but in
+//     production at least one FK was missing/restrictive, which made the
+//     final `DELETE FROM users` blow up with a 500 after directories and
+//     TruthStream were already cleaned up — leaving the account in a
+//     half-deleted state.
+//   - Missing-table errors are tolerated per-step so a fresh environment
+//     (or one mid-migration) does not break the whole flow.
+//   - Returns nothing on success; throws with a descriptive message on
+//     failure so authController.deleteAccount can surface it.
+//
+// PRESERVED: createUserInDB, userLogin, createJWT, updateUserPassword,
+// updateUserEmail, fetchUserInfo, searchUsers, all handlers.
+//
 
 import bcrypt from 'bcrypt';
 import path from 'path';
@@ -46,35 +63,195 @@ export async function createUserInDB(username: string, email: string, password: 
 export async function deleteUserFromDB(userId: string, adminUserId: number): Promise<void> {
   console.log(`[DeleteUserFromDB]: Attempting to delete user ${userId}`);
 
+  const userIdNum = parseInt(userId, 10);
+  if (!Number.isFinite(userIdNum) || userIdNum <= 0) {
+    throw new Error(`Invalid userId: ${userId}`);
+  }
+
+  // ----------------------------------------------------------------------
+  // Phase 1: filesystem cleanup (idempotent — secureDeleteDirectory uses
+  // fs.rm with { force: true } so a missing dir is fine on retry).
+  // ----------------------------------------------------------------------
   try {
-    // Create context for the deletion operation
     const context: DataAccessContext = {
-      userId: parseInt(userId),
+      userId: userIdNum,
       accessedBy: adminUserId,
       reason: 'user_account_deletion'
     };
-
-    // Delete user directories with proper context
     await deleteUserDirectories(userId, context);
+  } catch (fsError) {
+    // Filesystem cleanup is best-effort. We log and continue — the user
+    // is still entitled to have their DB rows removed even if the disk
+    // delete partially failed.
+    console.warn(`[DeleteUserFromDB]: directory cleanup warning for user ${userId}:`, fsError);
+  }
 
-    // Clean up TruthStream data BEFORE deleting the user row.
-    // This preserves reviews the user wrote for others (sets reviewer_id to NULL)
-    // while allowing CASCADE to clean up everything owned by the user.
-    try {
-      await cleanupUserTruthStreamData(parseInt(userId, 10));
-      console.log(`[DeleteUserFromDB]: TruthStream data cleaned up for user ${userId}`);
-    } catch (tsError) {
-      // Log but don't block user deletion — the DB trigger is a safety net
-      console.warn(`[DeleteUserFromDB]: TruthStream cleanup warning for user ${userId}:`, tsError);
+  // ----------------------------------------------------------------------
+  // Phase 2: TruthStream cleanup (re-anonymises reviews this user wrote
+  // for others; cascades on rows they own). Already idempotent.
+  // ----------------------------------------------------------------------
+  try {
+    await cleanupUserTruthStreamData(userIdNum);
+    console.log(`[DeleteUserFromDB]: TruthStream data cleaned up for user ${userId}`);
+  } catch (tsError) {
+    console.warn(`[DeleteUserFromDB]: TruthStream cleanup warning for user ${userId}:`, tsError);
+  }
+
+  // ----------------------------------------------------------------------
+  // Phase 3: transactional DB purge.
+  //
+  // Why explicit deletes when most FKs say ON DELETE CASCADE? Because at
+  // least one table in production does not (or has been re-created without
+  // the CASCADE rule), and a single restrictive FK is enough to block the
+  // final `DELETE FROM users`. The previous implementation trusted CASCADE
+  // and surfaced a 500 to the client after directories and TruthStream had
+  // already been cleaned up, leaving zombie accounts.
+  //
+  // We list every known per-user table. Tables protected by CASCADE on
+  // users(id) become no-ops here (CASCADE has already wiped them). Tables
+  // NOT protected by CASCADE are wiped explicitly. Missing tables are
+  // tolerated.
+  //
+  // Order: child tables that reference *other* mirror-server tables go
+  // first (e.g. group_message_reactions before mirror_group_messages),
+  // then per-user-owned tables, finally users itself.
+  // ----------------------------------------------------------------------
+  type Step = { sql: string; params: any[]; tolerant: boolean; label: string };
+
+  const steps: Step[] = [
+    // -- Session / auth state ------------------------------------------
+    { label: 'user_sessions', tolerant: true,
+      sql: 'DELETE FROM user_sessions WHERE user_id = ?', params: [userIdNum] },
+    { label: 'email_verification_tokens', tolerant: true,
+      sql: 'DELETE FROM email_verification_tokens WHERE user_id = ?', params: [userIdNum] },
+    { label: 'password_reset_tokens', tolerant: true,
+      sql: 'DELETE FROM password_reset_tokens WHERE user_id = ?', params: [userIdNum] },
+
+    // -- Activity / audit / access logs ---------------------------------
+    { label: 'activity_logs', tolerant: true,
+      sql: 'DELETE FROM activity_logs WHERE user_id = ?', params: [userIdNum] },
+    { label: 'data_access_log[user_id]', tolerant: true,
+      sql: 'DELETE FROM data_access_log WHERE user_id = ?', params: [userIdNum] },
+    { label: 'data_access_log[accessed_by]', tolerant: true,
+      sql: 'DELETE FROM data_access_log WHERE accessed_by = ?', params: [userIdNum] },
+
+    // -- Intake / personal analyses ------------------------------------
+    { label: 'intake_metadata', tolerant: true,
+      sql: 'DELETE FROM intake_metadata WHERE user_id = ?', params: [userIdNum] },
+    { label: 'personal_analyses', tolerant: true,
+      sql: 'DELETE FROM personal_analyses WHERE user_id = ?', params: [userIdNum] },
+
+    // -- Subscriptions / usage -----------------------------------------
+    { label: 'subscription_events', tolerant: true,
+      sql: 'DELETE FROM subscription_events WHERE user_id = ?', params: [userIdNum] },
+    { label: 'subscriptions', tolerant: true,
+      sql: 'DELETE FROM subscriptions WHERE user_id = ?', params: [userIdNum] },
+    { label: 'user_subscriptions', tolerant: true,
+      sql: 'DELETE FROM user_subscriptions WHERE user_id = ?', params: [userIdNum] },
+    { label: 'usage_tracking', tolerant: true,
+      sql: 'DELETE FROM usage_tracking WHERE user_id = ?', params: [userIdNum] },
+
+    // -- Notifications --------------------------------------------------
+    { label: 'user_notification_preferences', tolerant: true,
+      sql: 'DELETE FROM user_notification_preferences WHERE user_id = ?', params: [userIdNum] },
+    { label: 'push_subscriptions', tolerant: true,
+      sql: 'DELETE FROM push_subscriptions WHERE user_id = ?', params: [userIdNum] },
+
+    // -- Journal --------------------------------------------------------
+    { label: 'mirror_journal_analytics', tolerant: true,
+      sql: 'DELETE FROM mirror_journal_analytics WHERE user_id = ?', params: [userIdNum] },
+    { label: 'mirror_journal_entries', tolerant: true,
+      sql: 'DELETE FROM mirror_journal_entries WHERE user_id = ?', params: [userIdNum] },
+
+    // -- Group chat children (CASCADE-covered but explicit is safe) ----
+    { label: 'mirror_group_message_reactions', tolerant: true,
+      sql: 'DELETE FROM mirror_group_message_reactions WHERE user_id = ?', params: [userIdNum] },
+    { label: 'mirror_group_message_reads', tolerant: true,
+      sql: 'DELETE FROM mirror_group_message_reads WHERE user_id = ?', params: [userIdNum] },
+    { label: 'mirror_group_typing_indicators', tolerant: true,
+      sql: 'DELETE FROM mirror_group_typing_indicators WHERE user_id = ?', params: [userIdNum] },
+    { label: 'mirror_group_presence', tolerant: true,
+      sql: 'DELETE FROM mirror_group_presence WHERE user_id = ?', params: [userIdNum] },
+    { label: 'mirror_group_message_mentions', tolerant: true,
+      sql: 'DELETE FROM mirror_group_message_mentions WHERE mentioned_user_id = ?', params: [userIdNum] },
+    { label: 'mirror_group_message_pins[pinned_by]', tolerant: true,
+      sql: 'DELETE FROM mirror_group_message_pins WHERE pinned_by_user_id = ?', params: [userIdNum] },
+    { label: 'mirror_group_message_attachments[uploader]', tolerant: true,
+      sql: 'DELETE FROM mirror_group_message_attachments WHERE uploader_user_id = ?', params: [userIdNum] },
+    { label: 'mirror_group_chat_preferences', tolerant: true,
+      sql: 'DELETE FROM mirror_group_chat_preferences WHERE user_id = ?', params: [userIdNum] },
+    { label: 'mirror_group_message_queue', tolerant: true,
+      sql: 'DELETE FROM mirror_group_message_queue WHERE recipient_user_id = ?', params: [userIdNum] },
+    { label: 'mirror_group_messages[sender]', tolerant: true,
+      sql: 'DELETE FROM mirror_group_messages WHERE sender_user_id = ?', params: [userIdNum] },
+
+    // -- Group membership / requests / shared data ---------------------
+    { label: 'mirror_group_shared_data', tolerant: true,
+      sql: 'DELETE FROM mirror_group_shared_data WHERE user_id = ?', params: [userIdNum] },
+    { label: 'mirror_group_join_requests', tolerant: true,
+      sql: 'DELETE FROM mirror_group_join_requests WHERE user_id = ?', params: [userIdNum] },
+    { label: 'mirror_group_members', tolerant: true,
+      sql: 'DELETE FROM mirror_group_members WHERE user_id = ?', params: [userIdNum] },
+
+    // -- Vote / insight / transcript children (TS module covers some) --
+    { label: 'mirror_group_votes_responses', tolerant: true,
+      sql: 'DELETE FROM mirror_group_votes_responses WHERE user_id = ?', params: [userIdNum] },
+    { label: 'mirror_group_vote_proposals', tolerant: true,
+      sql: 'DELETE FROM mirror_group_vote_proposals WHERE proposer_user_id = ?', params: [userIdNum] },
+    { label: 'mirror_group_transcripts', tolerant: true,
+      sql: 'DELETE FROM mirror_group_transcripts WHERE speaker_user_id = ?', params: [userIdNum] },
+
+    // -- Groups owned BY this user (created_by). Children CASCADE on
+    //    mirror_groups, so this last group delete clears any remaining
+    //    rows in subsidiary tables. -------------------------------------
+    { label: 'mirror_groups[created_by]', tolerant: true,
+      sql: 'DELETE FROM mirror_groups WHERE created_by = ?', params: [userIdNum] },
+
+    // -- Finally: users -------------------------------------------------
+    { label: 'users', tolerant: false,
+      sql: 'DELETE FROM users WHERE id = ?', params: [userIdNum] },
+  ];
+
+  const connection = await DB.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    for (const step of steps) {
+      try {
+        const [result] = await connection.query(step.sql, step.params);
+        const affected = Number((result as any)?.affectedRows ?? 0);
+        if (affected > 0) {
+          console.log(`[DeleteUserFromDB]: ${step.label} -> ${affected} row(s) deleted`);
+        }
+      } catch (stepErr: any) {
+        const msg: string = stepErr?.message || String(stepErr);
+        const code: string = stepErr?.code || '';
+
+        // Tables that don't exist in this environment are tolerated.
+        const isMissingTable =
+          code === 'ER_NO_SUCH_TABLE'
+          || code === 'ER_BAD_FIELD_ERROR'
+          || /doesn't exist|Unknown column/i.test(msg);
+
+        if (step.tolerant && isMissingTable) {
+          console.warn(`[DeleteUserFromDB]: skipping ${step.label} — ${msg.slice(0, 160)}`);
+          continue;
+        }
+
+        // Anything else is fatal — roll the whole thing back so we don't
+        // half-delete the account.
+        throw new Error(`${step.label}: ${msg}`);
+      }
     }
 
-    // Delete user from database
-    await DB.query('DELETE FROM users WHERE id = ?', [userId]);
-
+    await connection.commit();
     console.log(`[DeleteUserFromDB]: Successfully deleted user ${userId}`);
   } catch (error) {
+    try { await connection.rollback(); } catch { /* non-fatal */ }
     console.error(`[DeleteUserFromDB ERROR]: Failed to delete user ${userId}:`, error);
     throw new Error(`Failed to delete user: ${(error as Error).message}`);
+  } finally {
+    try { connection.release(); } catch { /* non-fatal */ }
   }
 }
 
