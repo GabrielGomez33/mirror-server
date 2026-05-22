@@ -1,6 +1,16 @@
 // controllers/authController.ts
 //
-// CHANGES vs previous version (Phase 0.3):
+// CHANGES vs previous version (Phase 2a — account deletion):
+//   - Added deleteAccount() handler. Authenticated via JWT (user identity
+//     comes from req.user, never from the body). Requires the user's
+//     current password as a second factor and a literal "DELETE" string in
+//     the body to defeat accidental triggering. After local cleanup, it
+//     best-effort notifies the Dina mirror module so Dina-side analyses,
+//     contexts, embeddings, notifications etc. are purged too. Local
+//     deletion is the source of truth — a Dina-side failure is logged but
+//     does not roll back the local delete.
+//
+// CHANGES vs Phase 0.3:
 //   1. registerUser() now best-effort fires a verification email immediately
 //      after a successful insert. Non-blocking: if the email queue/provider is
 //      down, registration still succeeds and the user can hit "Resend" later.
@@ -21,7 +31,8 @@
 import { RequestHandler } from 'express';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
-import { createUserInDB, userLogin, fetchUserInfo } from './userController';
+import bcrypt from 'bcrypt';
+import { createUserInDB, userLogin, fetchUserInfo, deleteUserFromDB } from './userController';
 import { writeToTier } from './directoryController';
 import { DB } from '../db';
 import { emailService } from '../services/emailService';
@@ -707,6 +718,201 @@ export const cleanupSessions: RequestHandler = async (_req, res) => {
     console.error('[CLEANUP ERROR]', error);
     res.status(500).json({ error: 'Cleanup failed.' });
   }
+};
+
+// ============================================================================
+// ACCOUNT DELETION
+// ============================================================================
+//
+// Pipeline:
+//   1. Identity            — JWT-verified via AuthMiddleware.verifyToken
+//                            (route-level). req.user.id is the only userId
+//                            we ever trust. Body inputs are *credentials*,
+//                            never identity.
+//   2. Intent              — body must contain confirmation === "DELETE"
+//                            (typed by the user in the modal).
+//   3. Re-auth             — body must contain password matching the stored
+//                            bcrypt hash. Defeats stolen-session deletion.
+//   4. Local purge         — deleteUserFromDB() handles files + DB cascade +
+//                            TruthStream review re-anonymisation.
+//   5. Dina-side purge     — best-effort fire-and-wait HTTP POST to the
+//                            Dina mirror module. A failure here is logged
+//                            but does NOT roll back local deletion. The
+//                            local DB is the source of truth; Dina-side
+//                            data without a corresponding user row is
+//                            orphaned and harmless until garbage-collected.
+//   6. Session revocation  — all device sessions wiped so the (now-invalid)
+//                            JWT cannot be used to hit other endpoints
+//                            before its natural expiry.
+//
+// Idempotency: each downstream call is safe to retry. If the client retries
+// after a server-side error, deleteUserFromDB short-circuits cleanly because
+// the user row is already gone.
+// ============================================================================
+
+const DINA_PURGE_TIMEOUT_MS = 15000;
+
+async function notifyDinaPurge(userId: number, sessionId: string | undefined): Promise<{
+  notified: boolean;
+  detail?: string;
+}> {
+  const base = process.env.DINA_SERVER_URL || 'https://theundergroundrailroad.world';
+  const url = `${base.replace(/\/$/, '')}/api/mirror/purge-user`;
+  const serviceKey = process.env.DINA_SERVICE_KEY || process.env.DINA_API_KEY || '';
+
+  if (!serviceKey) {
+    authLogger.warn('notifyDinaPurge: no DINA_SERVICE_KEY/DINA_API_KEY env — skipping Dina-side purge', { userId });
+    return { notified: false, detail: 'no_service_key' };
+  }
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${serviceKey}`,
+        'User-Agent': 'Mirror-Server/2.0.0 account-deletion',
+      },
+      body: JSON.stringify({
+        userId: String(userId),
+        sessionId: sessionId || null,
+        reason: 'user_account_deletion',
+        requestedAt: new Date().toISOString(),
+      }),
+      signal: AbortSignal.timeout(DINA_PURGE_TIMEOUT_MS),
+    });
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      authLogger.warn('notifyDinaPurge: Dina returned non-OK status', {
+        userId,
+        status: response.status,
+        body: text.slice(0, 240),
+      });
+      return { notified: false, detail: `dina_status_${response.status}` };
+    }
+
+    return { notified: true };
+  } catch (err: any) {
+    authLogger.warn('notifyDinaPurge: Dina purge call failed', {
+      userId,
+      error: err?.message || String(err),
+    });
+    return { notified: false, detail: 'network_error' };
+  }
+}
+
+export const deleteAccount: RequestHandler = async (req, res) => {
+  // Identity from JWT — never from body. AuthMiddleware.verifyToken has
+  // already populated req.user before we get here.
+  const authed = (req as any).user as { id?: number; email?: string; sessionId?: string } | undefined;
+  const userId = Number(authed?.id);
+  if (!userId || Number.isNaN(userId)) {
+    res.status(401).json({ error: 'Authentication required.', code: 'NO_AUTH' });
+    return;
+  }
+
+  const body = (req.body || {}) as { password?: unknown; confirmation?: unknown };
+  const password = typeof body.password === 'string' ? body.password : '';
+  const confirmation = typeof body.confirmation === 'string' ? body.confirmation : '';
+
+  if (!password) {
+    res.status(400).json({ error: 'Current password is required.', code: 'PASSWORD_REQUIRED' });
+    return;
+  }
+  if (confirmation.toUpperCase() !== 'DELETE') {
+    res.status(400).json({
+      error: 'Confirmation text does not match.',
+      code: 'CONFIRMATION_MISMATCH',
+    });
+    return;
+  }
+  // Hard bound — prevents pathological inputs reaching bcrypt.compare which
+  // is happy to grind for 72+ chars on a single request.
+  if (password.length > 256) {
+    res.status(400).json({ error: 'Invalid credentials.', code: 'INVALID_CREDENTIALS' });
+    return;
+  }
+
+  // Verify password
+  let storedHash: string | null = null;
+  let storedEmail = '';
+  try {
+    const [rows] = await DB.query(
+      'SELECT password_hash, email FROM users WHERE id = ? LIMIT 1',
+      [userId]
+    );
+    const userRow = (rows as any[])[0];
+    if (!userRow) {
+      // Either the user was already deleted, or the token is for a non-
+      // existent user. Either way: treat as already-deleted (idempotent).
+      res.status(200).json({ message: 'Account already deleted.' });
+      return;
+    }
+    storedHash = String(userRow.password_hash || '');
+    storedEmail = String(userRow.email || '');
+  } catch (err) {
+    console.error('[DELETE ACCOUNT] Failed to load user for password check', err);
+    res.status(500).json({ error: 'Account deletion failed.', code: 'INTERNAL_ERROR' });
+    return;
+  }
+
+  let passwordOk = false;
+  try {
+    passwordOk = await bcrypt.compare(password, storedHash || '');
+  } catch (err) {
+    console.error('[DELETE ACCOUNT] bcrypt.compare threw', err);
+    passwordOk = false;
+  }
+
+  if (!passwordOk) {
+    await SecurityMonitor.logSecurityEvent(userId, 'account_deletion_password_failed', {
+      ipAddress: (req.ip || req.connection.remoteAddress || 'Unknown').replace('::ffff:', ''),
+      userAgent: req.headers['user-agent'] || 'Unknown',
+    }, 'medium');
+    res.status(401).json({ error: 'Invalid password.', code: 'INVALID_CREDENTIALS' });
+    return;
+  }
+
+  // Local purge (source of truth)
+  try {
+    await deleteUserFromDB(String(userId), userId);
+  } catch (err) {
+    console.error('[DELETE ACCOUNT] deleteUserFromDB threw', err);
+    await SecurityMonitor.logSecurityEvent(userId, 'account_deletion_local_failed', {
+      error: (err as Error)?.message || 'unknown',
+    }, 'high');
+    res.status(500).json({ error: 'Account deletion failed.', code: 'LOCAL_DELETE_FAILED' });
+    return;
+  }
+
+  // Best-effort Dina-side purge. Awaited (so the client knows what happened)
+  // but a failure here doesn't unwind the local delete.
+  const dinaResult = await notifyDinaPurge(userId, authed?.sessionId);
+
+  // Revoke any remaining sessions defensively. The CASCADE in deleteUserFromDB
+  // should already have removed user_sessions rows; this is a belt-and-braces
+  // call in case the FK constraint isn't present in some environment.
+  try {
+    await TokenManager.revokeAllUserSessions(userId);
+  } catch {
+    /* non-fatal — user row is already gone */
+  }
+
+  // Audit trail
+  await SecurityMonitor.logSecurityEvent(userId, 'account_deleted', {
+    email: storedEmail,
+    ipAddress: (req.ip || req.connection.remoteAddress || 'Unknown').replace('::ffff:', ''),
+    userAgent: req.headers['user-agent'] || 'Unknown',
+    dinaNotified: dinaResult.notified,
+    dinaDetail: dinaResult.detail || null,
+  }, 'high');
+
+  res.status(200).json({
+    message: 'Account deleted successfully.',
+    dinaNotified: dinaResult.notified,
+    ...(dinaResult.detail ? { dinaDetail: dinaResult.detail } : {}),
+  });
 };
 
 export { TokenManager, SecurityMonitor };

@@ -1,6 +1,12 @@
 // routes/auth.ts
 //
-// CHANGES vs previous version (Phase 0.3):
+// CHANGES vs previous version (Phase 2a — account deletion):
+//   - Added DELETE /delete-account (authenticated, password re-prompt + typed
+//     "DELETE" confirmation). Wipes the user from this server AND fires a
+//     best-effort purge notification at the Dina mirror module so Dina-side
+//     analyses, contexts, embeddings, notifications etc. are cleared too.
+//
+// CHANGES vs Phase 0.3:
 //   - Added /forgot-password (request reset link)
 //   - Added /reset-password (apply new password with token)
 //   - Added /reset-password/validate (GET — does NOT consume the token)
@@ -17,6 +23,7 @@ import {
   refreshToken,
   logoutUser,
   logoutAllDevices,
+  deleteAccount,
 } from '../controllers/authController';
 import {
   sendVerificationEmail,
@@ -41,6 +48,19 @@ router.post('/refresh', refreshToken);
 router.get('/verify', verifyToken);
 router.post('/logout', logoutUser);
 router.post('/logout-all', logoutAllDevices);
+
+// ----------------------------------------------------------------------------
+// Account deletion
+// ----------------------------------------------------------------------------
+// Always requires a valid JWT — the body's password is a *second* factor,
+// not a substitute. Body must also include `confirmation: "DELETE"` to defeat
+// accidental triggering. The handler deletes local data first (source of
+// truth) then best-effort notifies the Dina mirror module to purge its side.
+router.delete(
+  '/delete-account',
+  AuthMiddleware.verifyToken as express.RequestHandler,
+  deleteAccount
+);
 
 // ----------------------------------------------------------------------------
 // Email verification
