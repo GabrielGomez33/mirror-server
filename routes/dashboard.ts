@@ -223,12 +223,25 @@ function extractCompleteEmotionalData(intakeData: any): any {
   const face = intakeData.faceAnalysis;
   console.log(`😊 Extracting complete emotional data:`, Object.keys(face));
 
+  // face-api.js stores the detection confidence under `_score` (its internal
+  // FaceDetection field name). The previous `face.detection?.confidence` read
+  // never resolved against that shape, so the dashboard always saw `0`.
+  // We prefer `_score`, fall back to a renamed `confidence` (if a future
+  // pipeline normalizes it), and clamp to [0, 1] before returning.
+  const rawConfidence =
+    typeof face.detection?._score === 'number'
+      ? face.detection._score
+      : typeof face.detection?.confidence === 'number'
+        ? face.detection.confidence
+        : 0;
+  const confidence = Math.max(0, Math.min(1, rawConfidence));
+
   return {
     available: true,
     expressions: face.expressions || {},
     facialAngles: face.angle || {},
     detection: {
-      confidence: face.detection?.confidence || 0,
+      confidence,
       landmarks: face.landmarks ? Object.keys(face.landmarks).length : 0
     },
     dominantEmotion: getDominantEmotion(face.expressions),
