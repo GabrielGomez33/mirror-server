@@ -13,6 +13,26 @@
 //   - Returns nothing on success; throws with a descriptive message on
 //     failure so authController.deleteAccount can surface it.
 //
+// CHANGES vs previous version (Phase 2a follow-up — FK audit + guard):
+//   - Authoritative FK inventory was pulled from production's
+//     information_schema (DELETE_RULE per FK into users(id)). Three FKs
+//     are RESTRICT and therefore block the parent delete unless we
+//     explicitly clear them first:
+//         mirror_groups.owner_user_id       (mirror_groups_ibfk_1)
+//         mirror_group_sessions.started_by  (mirror_group_sessions_ibfk_2)
+//         mirror_group_audit_log.user_id    (mirror_group_audit_log_ibfk_1)
+//     The previous revision only handled mirror_groups; the other two
+//     were missing and caused 500s for any user who started a group
+//     session or generated audit-log entries.
+//   - Added verifyNoRestrictBlockers() — runs just before `DELETE FROM
+//     users` inside the transaction, queries information_schema for every
+//     RESTRICT/NO_ACTION FK pointing at users(id), counts remaining rows
+//     per FK, and if any are non-zero throws a precise error naming the
+//     offending tables. This means if a future migration adds a new
+//     RESTRICT FK and someone forgets to add a delete step here, the
+//     deletion aborts cleanly with a clear message instead of the cryptic
+//     `FK constraint fails` from MySQL.
+//
 // PRESERVED: createUserInDB, userLogin, createJWT, updateUserPassword,
 // updateUserEmail, fetchUserInfo, searchUsers, all handlers.
 //
@@ -58,6 +78,94 @@ export async function createUserInDB(username: string, email: string, password: 
 
   // Return the user ID
   return userId;
+}
+
+// =============================================================================
+// FK BLOCKER VERIFICATION
+// =============================================================================
+//
+// Runs inside the deletion transaction, after every dependent delete step and
+// before the final `DELETE FROM users`. Queries information_schema for every
+// RESTRICT/NO_ACTION FK pointing at users(id) in the current DB, counts how
+// many rows still reference this user_id for each, and throws a precise error
+// listing the offending tables if any rows remain.
+//
+// Why this exists:
+//   The original bug ("Cannot delete or update a parent row…") was caused by
+//   a single RESTRICT FK (mirror_groups.owner_user_id) that the deletion
+//   path missed. MySQL's error message doesn't tell you WHICH table.column
+//   has the offending row(s), and the deletion happens AFTER filesystem
+//   cleanup, so a missed FK produces zombie accounts.
+//
+//   This guard catches the next "missed RESTRICT FK" automatically and
+//   tells the next developer exactly what to add to the step list. It is
+//   schema-driven, so a freshly-added FK with no matching code change
+//   immediately fails the deletion (loudly, with a clear message) rather
+//   than silently breaking it.
+//
+// Cost: ~one fast information_schema query plus N tiny COUNT(*) queries,
+//   where N is the count of RESTRICT/NO_ACTION FKs into users(id) (3 as
+//   of this writing). Runs once per deletion. Negligible.
+
+interface FkRow {
+  TABLE_NAME: string;
+  COLUMN_NAME: string;
+  CONSTRAINT_NAME: string;
+}
+
+async function verifyNoRestrictBlockers(connection: any, userIdNum: number): Promise<void> {
+  const [fkRows] = await connection.query(
+    `SELECT kcu.TABLE_NAME, kcu.COLUMN_NAME, rc.CONSTRAINT_NAME
+       FROM information_schema.REFERENTIAL_CONSTRAINTS rc
+       JOIN information_schema.KEY_COLUMN_USAGE kcu
+         ON  rc.CONSTRAINT_NAME   = kcu.CONSTRAINT_NAME
+         AND rc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA
+      WHERE rc.CONSTRAINT_SCHEMA = DATABASE()
+        AND kcu.REFERENCED_TABLE_NAME = 'users'
+        AND rc.DELETE_RULE IN ('RESTRICT', 'NO ACTION')`
+  );
+
+  const fks: FkRow[] = Array.isArray(fkRows) ? (fkRows as FkRow[]) : [];
+
+  const blockers: Array<{ table: string; column: string; constraint: string; count: number }> = [];
+  for (const fk of fks) {
+    // Identifiers come from information_schema (MySQL's own catalogue),
+    // not user input. Still wrap in backticks defensively.
+    const sql = `SELECT COUNT(*) AS n FROM \`${fk.TABLE_NAME}\` WHERE \`${fk.COLUMN_NAME}\` = ?`;
+    try {
+      const [rows]: any = await connection.query(sql, [userIdNum]);
+      const n = Number(rows?.[0]?.n ?? 0);
+      if (n > 0) {
+        blockers.push({
+          table: fk.TABLE_NAME,
+          column: fk.COLUMN_NAME,
+          constraint: fk.CONSTRAINT_NAME,
+          count: n,
+        });
+      }
+    } catch (err: any) {
+      // If the count itself fails (table dropped mid-transaction, etc.),
+      // treat as a blocker so we fail loudly instead of letting the
+      // parent delete crash with the generic FK error.
+      blockers.push({
+        table: fk.TABLE_NAME,
+        column: fk.COLUMN_NAME,
+        constraint: fk.CONSTRAINT_NAME,
+        count: -1,
+      });
+      console.warn(`[verifyNoRestrictBlockers]: count check failed for ${fk.TABLE_NAME}.${fk.COLUMN_NAME}: ${err?.message || err}`);
+    }
+  }
+
+  if (blockers.length > 0) {
+    const detail = blockers
+      .map(b => `${b.table}.${b.column} (${b.constraint}) → ${b.count === -1 ? 'count_failed' : b.count + ' row(s)'}`)
+      .join('; ');
+    throw new Error(
+      `RESTRICT FK rows still reference user ${userIdNum}: ${detail}. ` +
+      `Add explicit DELETE step(s) for these tables to deleteUserFromDB.`
+    );
+  }
 }
 
 export async function deleteUserFromDB(userId: string, adminUserId: number): Promise<void> {
@@ -201,48 +309,79 @@ export async function deleteUserFromDB(userId: string, adminUserId: number): Pro
     { label: 'mirror_group_transcripts', tolerant: true,
       sql: 'DELETE FROM mirror_group_transcripts WHERE speaker_user_id = ?', params: [userIdNum] },
 
-    // -- Groups owned BY this user (created_by). Children CASCADE on
-    //    mirror_groups, so this last group delete clears any remaining
-    //    rows in subsidiary tables. -------------------------------------
-    { label: 'mirror_groups[created_by]', tolerant: true,
+    // -- RESTRICT FKs into users(id) -----------------------------------
+    //    Pulled from production's information_schema (May 2026). These
+    //    THREE FKs use ON DELETE RESTRICT, so the parent `DELETE FROM
+    //    users` will fail unless we explicitly clear each one first.
+    //    Adding a new RESTRICT FK without a delete step here will trip
+    //    verifyNoRestrictBlockers() below and fail loudly — fix it by
+    //    adding the missing DELETE in this section.
+    { label: 'mirror_group_audit_log[user_id] (RESTRICT)', tolerant: true,
+      sql: 'DELETE FROM mirror_group_audit_log WHERE user_id = ?', params: [userIdNum] },
+    { label: 'mirror_group_sessions[started_by] (RESTRICT)', tolerant: true,
+      sql: 'DELETE FROM mirror_group_sessions WHERE started_by = ?', params: [userIdNum] },
+    { label: 'mirror_groups[owner_user_id] (RESTRICT)', tolerant: true,
+      sql: 'DELETE FROM mirror_groups WHERE owner_user_id = ?', params: [userIdNum] },
+    // Legacy schema column kept for back-compat (no-op on prod, which
+    // uses owner_user_id). Children of mirror_groups CASCADE.
+    { label: 'mirror_groups[created_by] (legacy)', tolerant: true,
       sql: 'DELETE FROM mirror_groups WHERE created_by = ?', params: [userIdNum] },
-
-    // -- Finally: users -------------------------------------------------
-    { label: 'users', tolerant: false,
-      sql: 'DELETE FROM users WHERE id = ?', params: [userIdNum] },
   ];
+
+  // The `users` delete is run AFTER the verification guard, not as part
+  // of the step list — that way the guard sits between the dependent
+  // deletes and the parent delete, and catches any RESTRICT-blocked row
+  // we missed.
+  const finalUsersDelete: Step = {
+    label: 'users', tolerant: false,
+    sql: 'DELETE FROM users WHERE id = ?', params: [userIdNum],
+  };
+
+  const runStep = async (connection: any, step: Step): Promise<void> => {
+    try {
+      const [result] = await connection.query(step.sql, step.params);
+      const affected = Number((result as any)?.affectedRows ?? 0);
+      if (affected > 0) {
+        console.log(`[DeleteUserFromDB]: ${step.label} -> ${affected} row(s) deleted`);
+      }
+    } catch (stepErr: any) {
+      const msg: string = stepErr?.message || String(stepErr);
+      const code: string = stepErr?.code || '';
+
+      // Tables that don't exist in this environment are tolerated.
+      const isMissingTable =
+        code === 'ER_NO_SUCH_TABLE'
+        || code === 'ER_BAD_FIELD_ERROR'
+        || /doesn't exist|Unknown column/i.test(msg);
+
+      if (step.tolerant && isMissingTable) {
+        console.warn(`[DeleteUserFromDB]: skipping ${step.label} — ${msg.slice(0, 160)}`);
+        return;
+      }
+
+      // Anything else is fatal — caller will roll the whole thing back
+      // so we don't half-delete the account.
+      throw new Error(`${step.label}: ${msg}`);
+    }
+  };
 
   const connection = await DB.getConnection();
   try {
     await connection.beginTransaction();
 
     for (const step of steps) {
-      try {
-        const [result] = await connection.query(step.sql, step.params);
-        const affected = Number((result as any)?.affectedRows ?? 0);
-        if (affected > 0) {
-          console.log(`[DeleteUserFromDB]: ${step.label} -> ${affected} row(s) deleted`);
-        }
-      } catch (stepErr: any) {
-        const msg: string = stepErr?.message || String(stepErr);
-        const code: string = stepErr?.code || '';
-
-        // Tables that don't exist in this environment are tolerated.
-        const isMissingTable =
-          code === 'ER_NO_SUCH_TABLE'
-          || code === 'ER_BAD_FIELD_ERROR'
-          || /doesn't exist|Unknown column/i.test(msg);
-
-        if (step.tolerant && isMissingTable) {
-          console.warn(`[DeleteUserFromDB]: skipping ${step.label} — ${msg.slice(0, 160)}`);
-          continue;
-        }
-
-        // Anything else is fatal — roll the whole thing back so we don't
-        // half-delete the account.
-        throw new Error(`${step.label}: ${msg}`);
-      }
+      await runStep(connection, step);
     }
+
+    // Belt-and-suspenders guard: verify no RESTRICT/NO_ACTION FK row
+    // referencing this user remains. If anything still does, the parent
+    // `DELETE FROM users` would fail with the cryptic
+    // `Cannot delete or update a parent row: a foreign key constraint
+    // fails (...)` — instead we abort here with a precise diagnostic
+    // that names every offending table.column and its row count.
+    await verifyNoRestrictBlockers(connection, userIdNum);
+
+    await runStep(connection, finalUsersDelete);
 
     await connection.commit();
     console.log(`[DeleteUserFromDB]: Successfully deleted user ${userId}`);
