@@ -757,12 +757,12 @@ async function notifyDinaPurge(userId: number, sessionId: string | undefined): P
   detail?: string;
 }> {
   const base = process.env.DINA_SERVER_URL || 'https://theundergroundrailroad.world';
-  // Dina-server mounts its router at `/api/v1`, not `/api`, so the full
-  // endpoint is /api/v1/mirror/purge-user. (See dina-server's
-  // src/api/routes/index.ts: `apiPath = ${basePath}/api/v1` and
-  // `app.use(apiPath, apiRouter)`.) An override env var is provided in case
-  // the base path ever moves.
-  const path = process.env.DINA_PURGE_PATH || '/api/v1/mirror/purge-user';
+  // Dina-server lives behind the `/dina` Apache prefix (see dina-server's
+  // src/index.ts: `setupAPI(app, dinaCore, '/dina')`) and mounts its API
+  // router at `${basePath}/api/v1`. Final external path is
+  // /dina/api/v1/mirror/purge-user. An override env var is provided in
+  // case the prefix ever moves.
+  const path = process.env.DINA_PURGE_PATH || '/dina/api/v1/mirror/purge-user';
   const url = `${base.replace(/\/$/, '')}${path.startsWith('/') ? path : '/' + path}`;
 
   // Dina-server gates internal-only routes with `requireServiceAuth`, which
