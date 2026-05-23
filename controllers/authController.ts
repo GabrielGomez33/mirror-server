@@ -758,21 +758,28 @@ async function notifyDinaPurge(userId: number, sessionId: string | undefined): P
 }> {
   const base = process.env.DINA_SERVER_URL || 'https://theundergroundrailroad.world';
   const url = `${base.replace(/\/$/, '')}/api/mirror/purge-user`;
-  const serviceKey = process.env.DINA_SERVICE_KEY || process.env.DINA_API_KEY || '';
 
-  if (!serviceKey) {
-    authLogger.warn('notifyDinaPurge: no DINA_SERVICE_KEY/DINA_API_KEY env — skipping Dina-side purge', { userId });
-    return { notified: false, detail: 'no_service_key' };
-  }
+  // Dina-server gates internal-only routes with `requireServiceAuth`, which
+  // reads `X-Service-Key` and timing-safe-compares it against
+  // `MIRROR_SERVICE_KEY` on the dina-server side. If neither side has that
+  // env var configured, dina-server logs a warning and lets the call
+  // through (backwards-compatible fallback) — so this still works on a
+  // fresh deploy without operator action, and tightens automatically the
+  // moment the env var is set on both fleets.
+  const serviceKey = process.env.MIRROR_SERVICE_KEY || '';
 
   try {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'User-Agent': 'Mirror-Server/2.0.0 account-deletion',
+    };
+    if (serviceKey) {
+      headers['X-Service-Key'] = serviceKey;
+    }
+
     const response = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${serviceKey}`,
-        'User-Agent': 'Mirror-Server/2.0.0 account-deletion',
-      },
+      headers,
       body: JSON.stringify({
         userId: String(userId),
         sessionId: sessionId || null,
