@@ -33,11 +33,44 @@ function getUserId(req: unknown): number | null {
   return typeof id === 'number' && id > 0 ? id : null;
 }
 
-/** Normalize an IP, stripping the IPv4-mapped-IPv6 prefix. */
-function clientIp(req: { ip?: string; socket?: { remoteAddress?: string } }): string | null {
-  const raw = req.ip || req.socket?.remoteAddress || '';
-  const cleaned = raw.replace('::ffff:', '').trim();
-  return cleaned.length > 0 ? cleaned.slice(0, 45) : null;
+/**
+ * Resolve the real client IP.
+ *
+ * mirror-server runs behind a reverse proxy (Apache), so `req.ip` and
+ * `req.socket.remoteAddress` are the proxy's loopback address (127.0.0.1) —
+ * NOT the visitor. The genuine client IP is carried in the forwarded
+ * headers the proxy appends. We read those first, then fall back to the
+ * socket only when no proxy header is present (direct/local requests).
+ *
+ *   X-Forwarded-For: "<client>, <proxy1>, <proxy2>"  → take the first hop
+ *   X-Real-IP:       "<client>"                       → single value
+ *
+ * NOTE: this trusts the proxy to set/append these headers correctly, which
+ * is true for our Apache front end (the app is not exposed directly). If
+ * you'd rather fix this globally for every IP-logging path, set
+ * `app.set('trust proxy', true)` in index.ts and Express will populate
+ * req.ip from X-Forwarded-For for you — see NOTES-consent-pipeline.md.
+ */
+function clientIp(req: {
+  headers?: Record<string, string | string[] | undefined>;
+  ip?: string;
+  socket?: { remoteAddress?: string };
+}): string | null {
+  const headers = req.headers || {};
+
+  const xff = headers['x-forwarded-for'];
+  const xffValue = Array.isArray(xff) ? xff[0] : xff;
+  const fromXff = xffValue ? xffValue.split(',')[0] : '';
+
+  const xReal = headers['x-real-ip'];
+  const fromReal = Array.isArray(xReal) ? xReal[0] : xReal;
+
+  const candidate = (fromXff || fromReal || req.ip || req.socket?.remoteAddress || '')
+    .toString()
+    .replace('::ffff:', '')
+    .trim();
+
+  return candidate.length > 0 ? candidate.slice(0, 45) : null;
 }
 
 /**
