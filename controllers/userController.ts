@@ -449,39 +449,13 @@ export async function fetchUserInfo(email: string): Promise<{ id: number; email:
 
 // === EXPRESS HANDLERS ===
 
-export const updateUserPasswordHandler: RequestHandler = async (req, res) => {
-  const { userId, newPassword } = req.body;
-
-  if (!userId || !newPassword) {
-    res.status(400).json({ error: 'Missing parameters' });
-    return;
-  }
-
-  try {
-    await updateUserPassword(userId, newPassword);
-    res.status(200).json({ message: 'Password updated successfully' });
-  } catch (err) {
-    console.error('[Password Update Error]', err);
-    res.status(500).json({ error: 'Failed to update password' });
-  }
-};
-
-export const updateUserEmailHandler: RequestHandler = async (req, res) => {
-  const { userId, newEmail } = req.body;
-
-  if (!userId || !newEmail) {
-    res.status(400).json({ error: 'Missing parameters' });
-    return;
-  }
-
-  try {
-    await updateUserEmail(userId, newEmail);
-    res.status(200).json({ message: 'Email updated successfully' });
-  } catch (err) {
-    console.error('[Email Update Error]', err);
-    res.status(500).json({ error: 'Failed to update email' });
-  }
-};
+// NOTE: the body-`userId` `updateUserPasswordHandler` / `updateUserEmailHandler`
+// were deleted here. They were unauthenticated and trusted a body-supplied
+// userId, allowing account takeover. Credential changes now go through the
+// authenticated, identity-from-JWT handlers in authController
+// (changePassword / changeEmail), wired at /mirror/api/auth/* and re-exposed
+// (JWT-gated) at /mirror/api/user/update-*. The low-level updateUserPassword /
+// updateUserEmail helpers above are retained for internal/admin use.
 
 export const deleteUserHandler: RequestHandler = async (req, res) => {
   const { userId, adminUserId } = req.body;
