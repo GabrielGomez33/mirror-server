@@ -937,4 +937,391 @@ export const deleteAccount: RequestHandler = async (req, res) => {
   });
 };
 
+// ============================================================================
+// SELF-SERVICE CREDENTIAL CHANGES — change password / change email
+// ============================================================================
+//
+// Both flows share the non-negotiables proven out by deleteAccount:
+//   - Identity comes from req.user.id (JWT), NEVER from the body. The body
+//     only ever carries *credentials* (the current password) and the new
+//     value being set.
+//   - The current password is re-verified with bcrypt before any change, so a
+//     stolen/forgotten session can't silently rotate a victim's credentials.
+//   - Inputs are length-bounded before they reach bcrypt.compare (which will
+//     happily grind on 72+ char inputs) and validated against the same policy
+//     used at registration.
+//   - Errors are generic where leaking would help an attacker (bad password ->
+//     INVALID_CREDENTIALS) and specific where it only helps the legitimate
+//     user (weak password, email in use).
+//
+// Email change uses a *re-verify* model: the new address is never written to
+// users.email until the owner of that address clicks a single-use link. Until
+// then the change lives in pending_email_changes (see migration 013).
+// ----------------------------------------------------------------------------
+
+// Same rule enforced by registerUser(): >=8 chars, with lower/upper/digit/special.
+const PASSWORD_POLICY = /(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])/;
+const PASSWORD_SALT_ROUNDS = 10; // matches SALT_ROUNDS in userController
+const MAX_PASSWORD_INPUT = 256;  // hard bound before bcrypt.compare/hash
+
+function isStrongPassword(pw: unknown): pw is string {
+  return typeof pw === 'string'
+    && pw.length >= 8
+    && pw.length <= MAX_PASSWORD_INPUT
+    && PASSWORD_POLICY.test(pw);
+}
+
+// RFC-5322-lite: good enough to reject obvious garbage without false negatives
+// on real addresses. The authoritative check is the verification click.
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const EMAIL_CHANGE_TOKEN_BYTES = 32;          // -> 64 hex chars (CHAR(64))
+const EMAIL_CHANGE_EXPIRY_HOURS = 24;
+const EMAIL_CHANGE_RESEND_COOLDOWN_MS = 60_000; // 1 min between requests
+const EMAIL_CHANGE_MAX_PENDING = 3;
+
+function clientIp(req: Parameters<RequestHandler>[0]): string {
+  return (req.ip || req.connection?.remoteAddress || 'Unknown').replace('::ffff:', '');
+}
+
+/**
+ * POST /mirror/api/auth/change-password   (JWT-protected)
+ * Body: { currentPassword, newPassword }
+ *
+ * Re-auths with the current password, applies the new one, and revokes every
+ * OTHER device session (the current session is preserved so the user isn't
+ * bounced out of the tab they just used). Idempotent-safe: no-op-equal
+ * passwords are rejected up front.
+ */
+export const changePassword: RequestHandler = async (req, res) => {
+  const authed = (req as any).user as { id?: number; sessionId?: string } | undefined;
+  const userId = Number(authed?.id);
+  if (!userId || Number.isNaN(userId)) {
+    res.status(401).json({ error: 'Authentication required.', code: 'NO_AUTH' });
+    return;
+  }
+
+  const body = (req.body || {}) as { currentPassword?: unknown; oldPassword?: unknown; newPassword?: unknown };
+  // Accept either `currentPassword` (canonical) or `oldPassword` (legacy client).
+  const currentPassword = typeof body.currentPassword === 'string'
+    ? body.currentPassword
+    : typeof body.oldPassword === 'string' ? body.oldPassword : '';
+  const newPassword = typeof body.newPassword === 'string' ? body.newPassword : '';
+
+  if (!currentPassword || !newPassword) {
+    res.status(400).json({ error: 'Current and new password are required.', code: 'MISSING_FIELDS' });
+    return;
+  }
+  if (currentPassword.length > MAX_PASSWORD_INPUT) {
+    res.status(401).json({ error: 'Invalid credentials.', code: 'INVALID_CREDENTIALS' });
+    return;
+  }
+  if (!isStrongPassword(newPassword)) {
+    res.status(400).json({
+      error: 'Password must be at least 8 characters with uppercase, lowercase, number, and special character.',
+      code: 'WEAK_PASSWORD',
+    });
+    return;
+  }
+  if (newPassword === currentPassword) {
+    res.status(400).json({ error: 'New password must be different from the current one.', code: 'PASSWORD_UNCHANGED' });
+    return;
+  }
+
+  let storedHash = '';
+  try {
+    const [rows] = await DB.query('SELECT password_hash FROM users WHERE id = ? LIMIT 1', [userId]);
+    const row = (rows as any[])[0];
+    if (!row) {
+      res.status(401).json({ error: 'Authentication required.', code: 'NO_AUTH' });
+      return;
+    }
+    storedHash = String(row.password_hash || '');
+  } catch (err) {
+    authLogger.error('changePassword: failed to load user', err as Error, { userId });
+    res.status(500).json({ error: 'Could not change password.', code: 'INTERNAL_ERROR' });
+    return;
+  }
+
+  let ok = false;
+  try { ok = await bcrypt.compare(currentPassword, storedHash); } catch { ok = false; }
+  if (!ok) {
+    await SecurityMonitor.logSecurityEvent(userId, 'password_change_failed', {
+      reason: 'bad_current_password', ipAddress: clientIp(req), userAgent: req.headers['user-agent'] || 'Unknown',
+    }, 'medium', req.originalUrl || req.url);
+    res.status(401).json({ error: 'Current password is incorrect.', code: 'INVALID_CREDENTIALS' });
+    return;
+  }
+
+  try {
+    const newHash = await bcrypt.hash(newPassword, PASSWORD_SALT_ROUNDS);
+    await DB.query('UPDATE users SET password_hash = ? WHERE id = ?', [newHash, userId]);
+  } catch (err) {
+    authLogger.error('changePassword: hash/update failed', err as Error, { userId });
+    res.status(500).json({ error: 'Could not change password.', code: 'INTERNAL_ERROR' });
+    return;
+  }
+
+  // Security hygiene: a password rotation invalidates every OTHER session.
+  // The current session is kept so the user stays signed in where they are.
+  try {
+    await DB.query(
+      `UPDATE user_sessions SET revoked = TRUE, revoked_at = NOW()
+       WHERE user_id = ? AND revoked = FALSE AND session_id != ?`,
+      [userId, authed?.sessionId || '']
+    );
+  } catch (err) {
+    authLogger.warn('changePassword: other-session revoke failed (non-fatal)', { userId, err: (err as Error).message });
+  }
+
+  await SecurityMonitor.logSecurityEvent(userId, 'password_changed', {
+    ipAddress: clientIp(req), userAgent: req.headers['user-agent'] || 'Unknown',
+  }, 'high', req.originalUrl || req.url);
+
+  res.status(200).json({ message: 'Password changed. Other devices have been signed out.' });
+};
+
+/**
+ * POST /mirror/api/auth/change-email   (JWT-protected)
+ * Body: { newEmail, currentPassword }
+ *
+ * Re-auths, then stages a pending change and emails a single-use link to the
+ * NEW address. users.email is NOT touched until that link is confirmed.
+ * Responses are intentionally uniform so an attacker who guesses a session
+ * can't probe which addresses already exist (we still 409 on a duplicate the
+ * legitimate user would want to know about — the address is theirs to pick).
+ */
+export const changeEmail: RequestHandler = async (req, res) => {
+  const authed = (req as any).user as { id?: number; email?: string } | undefined;
+  const userId = Number(authed?.id);
+  if (!userId || Number.isNaN(userId)) {
+    res.status(401).json({ error: 'Authentication required.', code: 'NO_AUTH' });
+    return;
+  }
+
+  const body = (req.body || {}) as { newEmail?: unknown; currentPassword?: unknown; password?: unknown };
+  const newEmailRaw = typeof body.newEmail === 'string' ? body.newEmail : '';
+  const currentPassword = typeof body.currentPassword === 'string'
+    ? body.currentPassword
+    : typeof body.password === 'string' ? body.password : '';
+  const newEmail = newEmailRaw.trim().toLowerCase();
+
+  if (!newEmail || !currentPassword) {
+    res.status(400).json({ error: 'New email and current password are required.', code: 'MISSING_FIELDS' });
+    return;
+  }
+  if (newEmail.length > 255 || !EMAIL_RE.test(newEmail)) {
+    res.status(400).json({ error: 'Please enter a valid email address.', code: 'INVALID_EMAIL' });
+    return;
+  }
+  if (currentPassword.length > MAX_PASSWORD_INPUT) {
+    res.status(401).json({ error: 'Invalid credentials.', code: 'INVALID_CREDENTIALS' });
+    return;
+  }
+
+  // Load current user (hash + current email) and re-auth.
+  let storedHash = '';
+  let currentEmail = '';
+  let username = 'there';
+  try {
+    const [rows] = await DB.query('SELECT password_hash, email, username FROM users WHERE id = ? LIMIT 1', [userId]);
+    const row = (rows as any[])[0];
+    if (!row) {
+      res.status(401).json({ error: 'Authentication required.', code: 'NO_AUTH' });
+      return;
+    }
+    storedHash = String(row.password_hash || '');
+    currentEmail = String(row.email || '').toLowerCase();
+    username = String(row.username || 'there');
+  } catch (err) {
+    authLogger.error('changeEmail: failed to load user', err as Error, { userId });
+    res.status(500).json({ error: 'Could not start email change.', code: 'INTERNAL_ERROR' });
+    return;
+  }
+
+  let ok = false;
+  try { ok = await bcrypt.compare(currentPassword, storedHash); } catch { ok = false; }
+  if (!ok) {
+    await SecurityMonitor.logSecurityEvent(userId, 'email_change_failed', {
+      reason: 'bad_current_password', ipAddress: clientIp(req), userAgent: req.headers['user-agent'] || 'Unknown',
+    }, 'medium', req.originalUrl || req.url);
+    res.status(401).json({ error: 'Current password is incorrect.', code: 'INVALID_CREDENTIALS' });
+    return;
+  }
+
+  if (newEmail === currentEmail) {
+    res.status(400).json({ error: 'That is already your email address.', code: 'EMAIL_UNCHANGED' });
+    return;
+  }
+
+  // Uniqueness: reject if the address belongs to a DIFFERENT account.
+  try {
+    const [dupe] = await DB.query('SELECT id FROM users WHERE LOWER(email) = ? AND id != ? LIMIT 1', [newEmail, userId]);
+    if ((dupe as any[]).length > 0) {
+      res.status(409).json({ error: 'That email address is already in use.', code: 'EMAIL_IN_USE' });
+      return;
+    }
+  } catch (err) {
+    authLogger.error('changeEmail: uniqueness check failed', err as Error, { userId });
+    res.status(500).json({ error: 'Could not start email change.', code: 'INTERNAL_ERROR' });
+    return;
+  }
+
+  // Rate-limit: cooldown since last pending request + cap on active pendings.
+  try {
+    const [recent] = await DB.query(
+      `SELECT created_at FROM pending_email_changes
+       WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`,
+      [userId]
+    );
+    const last = (recent as any[])[0];
+    if (last && Date.now() - new Date(last.created_at).getTime() < EMAIL_CHANGE_RESEND_COOLDOWN_MS) {
+      res.status(429).json({ error: 'Please wait a minute before requesting another change.', code: 'RATE_LIMITED' });
+      return;
+    }
+    const [pendingCount] = await DB.query(
+      `SELECT COUNT(*) AS count FROM pending_email_changes
+       WHERE user_id = ? AND used_at IS NULL AND expires_at > NOW()`,
+      [userId]
+    );
+    if ((pendingCount as any[])[0].count >= EMAIL_CHANGE_MAX_PENDING) {
+      // Invalidate the backlog so the user isn't permanently wedged.
+      await DB.query(
+        `UPDATE pending_email_changes SET used_at = NOW()
+         WHERE user_id = ? AND used_at IS NULL`,
+        [userId]
+      );
+    }
+  } catch (err) {
+    authLogger.warn('changeEmail: rate-limit check failed (continuing)', { userId, err: (err as Error).message });
+  }
+
+  // Stage the pending change + email the token to the NEW address.
+  const token = crypto.randomBytes(EMAIL_CHANGE_TOKEN_BYTES).toString('hex');
+  const expiresAt = new Date(Date.now() + EMAIL_CHANGE_EXPIRY_HOURS * 60 * 60 * 1000);
+  try {
+    await DB.query(
+      `INSERT INTO pending_email_changes (user_id, new_email, token, expires_at)
+       VALUES (?, ?, ?, ?)`,
+      [userId, newEmail, token, expiresAt]
+    );
+  } catch (err) {
+    authLogger.error('changeEmail: failed to persist pending change', err as Error, { userId });
+    res.status(500).json({ error: 'Could not start email change.', code: 'INTERNAL_ERROR' });
+    return;
+  }
+
+  const appUrl = process.env.APP_URL || 'https://www.theundergroundrailroad.world/Mirror';
+  const verificationUrl = `${appUrl}/verify-email-change?token=${token}`;
+  const result = await emailService.sendTemplate(newEmail, 'email_change_verification', {
+    username,
+    verificationUrl,
+    newEmail,
+  });
+  if (!result.success) {
+    authLogger.error('changeEmail: verification email send failed', new Error(result.error || 'Unknown'), { userId });
+    res.status(503).json({ error: 'Could not send the confirmation email. Please try again shortly.', code: 'EMAIL_SEND_FAILED' });
+    return;
+  }
+
+  await SecurityMonitor.logSecurityEvent(userId, 'email_change_requested', {
+    // Never log the full target address at non-high risk; keep an obfuscated hint.
+    newEmailHint: newEmail.replace(/^(.).*(@.*)$/, '$1***$2'),
+    ipAddress: clientIp(req), userAgent: req.headers['user-agent'] || 'Unknown',
+  }, 'high', req.originalUrl || req.url);
+
+  res.status(200).json({
+    message: `Confirmation link sent to ${newEmail}. Click it to finish changing your email.`,
+    expiresIn: `${EMAIL_CHANGE_EXPIRY_HOURS} hours`,
+  });
+};
+
+/**
+ * POST /mirror/api/auth/change-email/confirm   (UNauthenticated — the token IS
+ * the credential, exactly like /verify-email).
+ * Body: { token }
+ *
+ * Applies the pending change: users.email = new_email, email_verified = 1.
+ * Re-checks uniqueness at apply-time (the address could have been taken in the
+ * window between request and click) and invalidates the row + the user's other
+ * pendings. Distinct status codes let the client render precise messaging.
+ */
+export const confirmEmailChange: RequestHandler = async (req, res) => {
+  const token = typeof (req.body || {}).token === 'string' ? (req.body as any).token : '';
+  if (!token || !/^[a-f0-9]{64}$/.test(token)) {
+    res.status(400).json({ error: 'Invalid or missing confirmation token.', code: 'INVALID_TOKEN' });
+    return;
+  }
+
+  let record: any = null;
+  try {
+    const [rows] = await DB.query(
+      `SELECT id, user_id, new_email, expires_at, used_at FROM pending_email_changes WHERE token = ? LIMIT 1`,
+      [token]
+    );
+    record = (rows as any[])[0] || null;
+  } catch (err) {
+    authLogger.error('confirmEmailChange: lookup failed', err as Error);
+    res.status(500).json({ error: 'Could not confirm email change.', code: 'INTERNAL_ERROR' });
+    return;
+  }
+
+  if (!record) {
+    res.status(404).json({ error: 'This confirmation link is invalid.', code: 'TOKEN_NOT_FOUND' });
+    return;
+  }
+  if (record.used_at) {
+    res.status(410).json({ error: 'This confirmation link has already been used.', code: 'TOKEN_USED' });
+    return;
+  }
+  if (new Date(record.expires_at) < new Date()) {
+    res.status(410).json({ error: 'This confirmation link has expired. Please request a new email change.', code: 'TOKEN_EXPIRED' });
+    return;
+  }
+
+  const userId = Number(record.user_id);
+  const newEmail = String(record.new_email || '').toLowerCase();
+
+  // Re-check uniqueness at apply time (TOCTOU window since the request).
+  try {
+    const [dupe] = await DB.query('SELECT id FROM users WHERE LOWER(email) = ? AND id != ? LIMIT 1', [newEmail, userId]);
+    if ((dupe as any[]).length > 0) {
+      await DB.query('UPDATE pending_email_changes SET used_at = NOW() WHERE id = ?', [record.id]);
+      res.status(409).json({ error: 'That email address is no longer available.', code: 'EMAIL_IN_USE' });
+      return;
+    }
+  } catch (err) {
+    authLogger.error('confirmEmailChange: uniqueness re-check failed', err as Error, { userId });
+    res.status(500).json({ error: 'Could not confirm email change.', code: 'INTERNAL_ERROR' });
+    return;
+  }
+
+  try {
+    await DB.query('UPDATE users SET email = ?, email_verified = 1 WHERE id = ?', [newEmail, userId]);
+    await DB.query('UPDATE pending_email_changes SET used_at = NOW() WHERE id = ?', [record.id]);
+    // Invalidate the user's other pending changes.
+    await DB.query(
+      `UPDATE pending_email_changes SET used_at = NOW()
+       WHERE user_id = ? AND used_at IS NULL AND id != ?`,
+      [userId, record.id]
+    );
+  } catch (err: any) {
+    // A race could still trip the users.email UNIQUE constraint.
+    if (err?.code === 'ER_DUP_ENTRY') {
+      await DB.query('UPDATE pending_email_changes SET used_at = NOW() WHERE id = ?', [record.id]).catch(() => {});
+      res.status(409).json({ error: 'That email address is no longer available.', code: 'EMAIL_IN_USE' });
+      return;
+    }
+    authLogger.error('confirmEmailChange: apply failed', err as Error, { userId });
+    res.status(500).json({ error: 'Could not confirm email change.', code: 'INTERNAL_ERROR' });
+    return;
+  }
+
+  await SecurityMonitor.logSecurityEvent(userId, 'email_changed', {
+    newEmailHint: newEmail.replace(/^(.).*(@.*)$/, '$1***$2'),
+    ipAddress: clientIp(req), userAgent: req.headers['user-agent'] || 'Unknown',
+  }, 'high', req.originalUrl || req.url);
+
+  res.status(200).json({ message: 'Your email address has been updated.', email: newEmail });
+};
+
 export { TokenManager, SecurityMonitor };

@@ -57,6 +57,7 @@ export interface EmailQueueItem {
 export type EmailTemplateName =
   | 'welcome'
   | 'email_verification'
+  | 'email_change_verification'
   | 'password_reset'
   | 'payment_confirmed'
   | 'payment_failed'
@@ -116,6 +117,30 @@ const EMAIL_TEMPLATES: Record<EmailTemplateName, {
       </div>
     `,
     text: (data) => `Verify your Mirror email by visiting: ${data.verificationUrl} — This link expires in 24 hours.`,
+  },
+
+  email_change_verification: {
+    subject: 'Confirm your new Mirror email',
+    html: (data) => `
+      <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; background: #0a0a0f; color: #e0e0e0;">
+        <div style="text-align: center; margin-bottom: 32px;">
+          <h1 style="color: #ffffff; font-size: 28px; margin: 0;">Mirror</h1>
+        </div>
+        <div style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 32px;">
+          <h2 style="color: #fff; margin: 0 0 16px;">Confirm your new email</h2>
+          <p style="color: #ccc; line-height: 1.6;">Hi ${data.username || 'there'},</p>
+          <p style="color: #ccc; line-height: 1.6;">A request was made to change your Mirror account email to <strong style="color:#fff;">${data.newEmail}</strong>. Click the button below to confirm this address. This link expires in 24 hours and can be used only once.</p>
+          <div style="text-align: center; margin: 32px 0;">
+            <a href="${data.verificationUrl}" style="display: inline-block; background: linear-gradient(135deg, #6366f1, #8b5cf6); color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600;">Confirm Email Change</a>
+          </div>
+          <p style="color: #888; font-size: 13px;">If the button doesn't work, copy this link: ${data.verificationUrl}</p>
+          <hr style="border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 24px 0;" />
+          <p style="color: #888; font-size: 13px; line-height: 1.6;"><strong style="color: #ccc;">Didn't request this?</strong> Your email hasn't changed and no action is needed — this link will expire on its own. Consider changing your password if you didn't initiate this.</p>
+        </div>
+        <p style="color: #666; font-size: 12px; text-align: center; margin-top: 32px;">Mirror — &copy; ${new Date().getFullYear()}</p>
+      </div>
+    `,
+    text: (data) => `Hi ${data.username || 'there'},\n\nConfirm your new Mirror email (${data.newEmail}) using this link (valid for 24 hours):\n${data.verificationUrl}\n\nIf you didn't request this, ignore this email — your address hasn't changed.`,
   },
 
   password_reset: {

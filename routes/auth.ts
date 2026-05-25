@@ -30,6 +30,9 @@ import {
   logoutUser,
   logoutAllDevices,
   deleteAccount,
+  changePassword,
+  changeEmail,
+  confirmEmailChange,
 } from '../controllers/authController';
 import {
   sendVerificationEmail,
@@ -71,6 +74,30 @@ router.delete(
   AuthMiddleware.verifyToken as express.RequestHandler,
   deleteAccount
 );
+
+// ----------------------------------------------------------------------------
+// Self-service credential changes
+// ----------------------------------------------------------------------------
+// /change-password      — authenticated. Body carries the current password
+//                         (re-auth) + the new password. Rotating the password
+//                         revokes all OTHER device sessions.
+// /change-email         — authenticated. Body carries the new address + current
+//                         password (re-auth). Stages a pending change and emails
+//                         a single-use confirmation link to the NEW address;
+//                         users.email is untouched until that link is clicked.
+// /change-email/confirm — UNauthenticated by design: the emailed token is the
+//                         credential (same model as /verify-email).
+router.post(
+  '/change-password',
+  AuthMiddleware.verifyToken as express.RequestHandler,
+  changePassword
+);
+router.post(
+  '/change-email',
+  AuthMiddleware.verifyToken as express.RequestHandler,
+  changeEmail
+);
+router.post('/change-email/confirm', confirmEmailChange);
 
 // ----------------------------------------------------------------------------
 // Email verification
