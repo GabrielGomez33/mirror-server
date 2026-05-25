@@ -1,5 +1,11 @@
 // routes/auth.ts
 //
+// CHANGES vs Phase 2a (consent pipeline):
+//   - Added POST /accept-terms (authenticated) — records the user's
+//     acceptance of a legal document version into user_consent.
+//   - Added GET /consent-status (authenticated) — returns the latest
+//     accepted version per document, used by the client ConsentGate.
+//
 // CHANGES vs previous version (Phase 2a — account deletion):
 //   - Added DELETE /delete-account (authenticated, password re-prompt + typed
 //     "DELETE" confirmation). Wipes the user from this server AND fires a
@@ -35,6 +41,10 @@ import {
   resetPassword,
   validateResetToken,
 } from '../controllers/passwordResetController';
+import {
+  acceptTermsHandler,
+  getConsentStatusHandler,
+} from '../controllers/consentController';
 import AuthMiddleware from '../middleware/authMiddleware';
 
 const router = express.Router();
@@ -90,5 +100,23 @@ router.get(
 router.post('/forgot-password', requestPasswordReset);
 router.get('/reset-password/validate', validateResetToken);
 router.post('/reset-password', resetPassword);
+
+// ----------------------------------------------------------------------------
+// Consent (Terms & Conditions acceptance)
+// ----------------------------------------------------------------------------
+// Both require a valid JWT — the user must be authenticated to record or read
+// their own consent. The registration flow calls /accept-terms immediately
+// after sign-up; the client ConsentGate uses /consent-status to detect users
+// who must (re-)accept the current version.
+router.post(
+  '/accept-terms',
+  AuthMiddleware.verifyToken as express.RequestHandler,
+  acceptTermsHandler
+);
+router.get(
+  '/consent-status',
+  AuthMiddleware.verifyToken as express.RequestHandler,
+  getConsentStatusHandler
+);
 
 export default router;
