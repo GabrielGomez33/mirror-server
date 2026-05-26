@@ -277,10 +277,10 @@ async function dispatchInitialVerificationEmail(
 // ============================================================================
 async function loadUserContextFields(
   userId: number
-): Promise<{ emailVerified: boolean; intakeCompleted: boolean; subscriptionStatus: 'free' | 'premium' | 'enterprise' }> {
+): Promise<{ email: string; emailVerified: boolean; intakeCompleted: boolean; subscriptionStatus: 'free' | 'premium' | 'enterprise' }> {
   try {
     const [rows] = await DB.query(
-      `SELECT email_verified, intake_completed FROM users WHERE id = ? LIMIT 1`,
+      `SELECT email, email_verified, intake_completed FROM users WHERE id = ? LIMIT 1`,
       [userId]
     );
     const row = (rows as any[])[0] || {};
@@ -301,12 +301,13 @@ async function loadUserContextFields(
     }
 
     return {
+      email: String(row.email || ''),
       emailVerified: Boolean(row.email_verified),
       intakeCompleted: Boolean(row.intake_completed),
       subscriptionStatus,
     };
   } catch {
-    return { emailVerified: false, intakeCompleted: false, subscriptionStatus: 'free' };
+    return { email: '', emailVerified: false, intakeCompleted: false, subscriptionStatus: 'free' };
   }
 }
 
@@ -693,7 +694,9 @@ export const verifyToken: RequestHandler = async (req, res) => {
       valid: true,
       user: {
         id: decoded.id,
-        email: decoded.email,
+        // Live from DB so an email change is reflected on refresh without
+        // needing a new access token (the JWT still carries the old address).
+        email: ctx.email || decoded.email,
         username: decoded.username,
         sessionId: decoded.sessionId,
         emailVerified: ctx.emailVerified,
