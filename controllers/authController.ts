@@ -1211,7 +1211,9 @@ export const changeEmail: RequestHandler = async (req, res) => {
   }
 
   const appUrl = process.env.APP_URL || 'https://www.theundergroundrailroad.world/Mirror';
-  const verificationUrl = `${appUrl}/verify-email-change?token=${token}`;
+  // Reuse the existing /verify-email route (which the host already serves) with
+  // type=change so we don't depend on a new SPA-fallback path being configured.
+  const verificationUrl = `${appUrl}/verify-email?type=change&token=${token}`;
   const result = await emailService.sendTemplate(newEmail, 'email_change_verification', {
     username,
     verificationUrl,
