@@ -572,7 +572,7 @@ export async function sendTest(input: CampaignInput, toEmail: string): Promise<{
   const result = await emailService.sendCustom(
     {
       to,
-      subject: `[TEST] ${input.subject}`,
+      subject: `[TEST] ${personalizeText(input.subject, ctx)}`,
       html: personalize(html, ctx),
       text: personalizeText(text, ctx),
       replyTo: process.env.EMAIL_REPLY_TO,
@@ -705,7 +705,9 @@ export async function processCampaignBatch(campaignId: number): Promise<{ pendin
           text: personalizeText(text, ctx),
           replyTo: process.env.EMAIL_REPLY_TO,
           headers: { 'List-Unsubscribe': `<${unsubUrl}>`, 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' },
-          tags: ['broadcast', `campaign:${campaignId}`],
+          // Resend rejects tag names containing characters outside [A-Za-z0-9_-]
+          // — keep the separator an underscore, not a colon.
+          tags: ['broadcast', `campaign_${campaignId}`],
           attachments,
         },
         { dryRun },
@@ -745,11 +747,20 @@ export async function processCampaignBatch(campaignId: number): Promise<{ pendin
     const pendingRemaining = Number((pendRows as any[])[0]?.n || 0);
 
     if (pendingRemaining === 0) {
-      await DB.query(
-        `UPDATE email_campaigns SET status='sent', completed_at=NOW() WHERE id=? AND status='sending'`,
+      // Decide final status from counters (already refreshed above). If
+      // nothing was actually delivered (every attempt failed) the campaign
+      // is `failed`, not `sent` — surfacing it as `sent` would lie in the UI.
+      const [counts] = await DB.query(
+        `SELECT sent_count, failed_count FROM email_campaigns WHERE id=?`,
         [campaignId],
       );
-      logger.info('Campaign completed', { campaignId });
+      const row = (counts as any[])[0] || { sent_count: 0, failed_count: 0 };
+      const finalStatus = Number(row.sent_count) === 0 && Number(row.failed_count) > 0 ? 'failed' : 'sent';
+      await DB.query(
+        `UPDATE email_campaigns SET status=?, completed_at=NOW() WHERE id=? AND status='sending'`,
+        [finalStatus, campaignId],
+      );
+      logger.info('Campaign completed', { campaignId, finalStatus });
     }
 
     return { pendingRemaining, processed };
