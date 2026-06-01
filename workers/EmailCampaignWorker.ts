@@ -12,6 +12,11 @@
 // Run standalone: node dist/workers/EmailCampaignWorker.js
 // ============================================================================
 
+// IMPORTANT: import db.ts FIRST. db.ts calls dotenv.config() at the top, which
+// must run BEFORE mirrorRedis instantiates its ioredis client — otherwise the
+// client connects without REDIS_PASSWORD and the worker dies on startup with
+// NOAUTH. Every other worker imports DB first for the same reason.
+import { DB } from '../db';
 import { Logger } from '../utils/logger';
 import { mirrorRedis } from '../config/redis';
 import { tick } from '../services/emailBroadcastService';
