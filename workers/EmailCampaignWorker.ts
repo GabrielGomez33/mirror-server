@@ -12,11 +12,12 @@
 // Run standalone: node dist/workers/EmailCampaignWorker.js
 // ============================================================================
 
-// IMPORTANT: import db.ts FIRST. db.ts calls dotenv.config() at the top, which
-// must run BEFORE mirrorRedis instantiates its ioredis client — otherwise the
-// client connects without REDIS_PASSWORD and the worker dies on startup with
-// NOAUTH. Every other worker imports DB first for the same reason.
-import { DB } from '../db';
+// Load env vars BEFORE any module that touches process.env at import time
+// (e.g. config/redis instantiates ioredis in its constructor and would connect
+// without REDIS_PASSWORD → NOAUTH). A BARE side-effect import is preserved
+// verbatim by TypeScript; a named import whose binding is never referenced
+// (`import { DB } from '../db'`) gets elided from the compiled output.
+import 'dotenv/config';
 import { Logger } from '../utils/logger';
 import { mirrorRedis } from '../config/redis';
 import { tick } from '../services/emailBroadcastService';
