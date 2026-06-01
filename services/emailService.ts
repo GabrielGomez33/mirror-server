@@ -9,6 +9,20 @@
 //   - Added `password_reset` template (matches the existing dark-glass aesthetic).
 //   - EmailTemplateName union extended with `password_reset`.
 //   - No behavioural changes to the existing flows.
+//
+// CHANGES (Admin Broadcast support):
+//   - EmailMessage now carries optional `attachments` and `headers`.
+//     `headers` lets the broadcast layer attach RFC-8058 `List-Unsubscribe`
+//     and `List-Unsubscribe-Post` for one-click unsubscribe.
+//   - Both providers (Resend, Brevo) forward attachments + custom headers.
+//   - `send()` accepts an options bag with `dryRun`; when dry-run is on
+//     (explicit, or global EMAIL_DRY_RUN=true) the provider is NOT called —
+//     we log and return a synthetic success. Lets non-prod exercise the full
+//     broadcast pipeline without delivering mail.
+//   - `sendCustom()` is a thin, intention-revealing alias of `send()` for the
+//     broadcast layer (fully pre-compiled subject/html/text).
+//   - Existing transactional flows are untouched: broadcast rendering and the
+//     suppression list live in services/emailBroadcastService.ts, not here.
 // ============================================================================
 
 import { Logger } from '../utils/logger';
@@ -27,6 +41,14 @@ export interface EmailProvider {
   verifyConnection(): Promise<boolean>;
 }
 
+export interface EmailAttachment {
+  filename: string;
+  /** Base64-encoded file content. */
+  content: string;
+  /** MIME type, e.g. 'application/pdf'. Optional; providers infer if omitted. */
+  contentType?: string;
+}
+
 export interface EmailMessage {
   to: string;
   subject: string;
@@ -35,12 +57,20 @@ export interface EmailMessage {
   from?: string;
   replyTo?: string;
   tags?: string[];
+  attachments?: EmailAttachment[];
+  /** Extra MIME headers, e.g. List-Unsubscribe. */
+  headers?: Record<string, string>;
 }
 
 export interface EmailSendResult {
   success: boolean;
   messageId?: string;
   error?: string;
+}
+
+export interface EmailSendOptions {
+  /** When true, do not call the provider — log and return synthetic success. */
+  dryRun?: boolean;
 }
 
 export interface EmailQueueItem {
@@ -277,6 +307,12 @@ class ResendProvider implements EmailProvider {
           text: email.text,
           reply_to: email.replyTo,
           tags: email.tags?.map(t => ({ name: t, value: 'true' })),
+          headers: email.headers,
+          attachments: email.attachments?.map(a => ({
+            filename: a.filename,
+            content: a.content,
+            content_type: a.contentType,
+          })),
         }),
       });
 
@@ -333,6 +369,11 @@ class BrevoProvider implements EmailProvider {
           textContent: email.text,
           replyTo: email.replyTo ? { email: email.replyTo } : undefined,
           tags: email.tags,
+          headers: email.headers,
+          attachment: email.attachments?.map(a => ({
+            name: a.filename,
+            content: a.content,
+          })),
         }),
       });
 
@@ -370,11 +411,13 @@ export class EmailService {
   private fromName: string;
   private appUrl: string;
   private enabled: boolean = false;
+  private globalDryRun: boolean = false;
 
   constructor() {
     this.fromAddress = process.env.EMAIL_FROM_ADDRESS || 'noreply@theundergroundrailroad.world';
     this.fromName = process.env.EMAIL_FROM_NAME || 'Mirror';
     this.appUrl = process.env.APP_URL || 'https://www.theundergroundrailroad.world/Mirror';
+    this.globalDryRun = (process.env.EMAIL_DRY_RUN || '').toLowerCase() === 'true';
     this.initializeProvider();
   }
 
@@ -400,18 +443,38 @@ export class EmailService {
     }
 
     this.enabled = true;
-    logger.info(`Email service initialized with provider: ${providerName}`);
+    logger.info(`Email service initialized with provider: ${providerName}${this.globalDryRun ? ' (GLOBAL DRY-RUN)' : ''}`);
   }
 
   isEnabled(): boolean {
     return this.enabled;
   }
 
+  /** From address used on outbound mail, e.g. for List-Unsubscribe mailto. */
+  getFromAddress(): string {
+    return this.fromAddress;
+  }
+
+  getAppUrl(): string {
+    return this.appUrl;
+  }
+
   // ========================================================================
   // DIRECT SEND
   // ========================================================================
 
-  async send(message: EmailMessage): Promise<EmailSendResult> {
+  async send(message: EmailMessage, options?: EmailSendOptions): Promise<EmailSendResult> {
+    const dryRun = options?.dryRun === true || this.globalDryRun;
+
+    if (dryRun) {
+      logger.info('Email DRY-RUN (not sent)', {
+        to: message.to,
+        subject: message.subject,
+        attachments: message.attachments?.length || 0,
+      });
+      return { success: true, messageId: `dryrun_${Date.now()}` };
+    }
+
     if (!this.provider) {
       logger.warn('Email send skipped — no provider configured', { to: message.to, subject: message.subject });
       return { success: false, error: 'Email service not configured' };
@@ -434,6 +497,14 @@ export class EmailService {
       logger.error('Email send exception', error, { to: message.to });
       return { success: false, error: error.message };
     }
+  }
+
+  /**
+   * Intention-revealing alias of send() for the broadcast layer, which passes
+   * fully pre-compiled subject/html/text plus List-Unsubscribe headers.
+   */
+  async sendCustom(message: EmailMessage, options?: EmailSendOptions): Promise<EmailSendResult> {
+    return this.send(message, options);
   }
 
   // ========================================================================

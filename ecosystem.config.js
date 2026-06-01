@@ -209,5 +209,43 @@ module.exports = {
       kill_timeout: 15000,
       shutdown_with_message: true,
     },
+
+    // ========================================================================
+    // WORKER: Email Campaign Processor (Admin broadcasts)
+    // ========================================================================
+    // Polls for due scheduled campaigns and dispatches in-flight campaigns in
+    // rate-limited batches. DB-driven + idempotent, so a hard restart resumes
+    // cleanly with no double-sends. Low memory footprint.
+    {
+      name: 'email-campaign-worker',
+      script: path.join(DIST, 'workers', 'EmailCampaignWorker.js'),
+      cwd: CWD,
+
+      // Restart policy
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: '10s',
+      restart_delay: 5000,
+
+      // Resource limits
+      max_memory_restart: '256M',
+
+      // Logging
+      out_file: path.join(LOGS, 'email-campaign-worker-out.log'),
+      error_file: path.join(LOGS, 'email-campaign-worker-error.log'),
+      log_file: path.join(LOGS, 'email-campaign-worker-combined.log'),
+      merge_logs: true,
+      log_date_format: 'YYYY-MM-DD HH:mm:ss.SSS',
+
+      // Environment
+      env: {
+        ...sharedEnv,
+      },
+
+      // Graceful shutdown — give an in-flight batch time to finish (the worker
+      // waits up to 12s in its SIGTERM handler).
+      kill_timeout: 15000,
+      shutdown_with_message: true,
+    },
   ],
 };

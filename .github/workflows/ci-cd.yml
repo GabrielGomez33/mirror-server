@@ -17,7 +17,7 @@
 #
 # DEPLOYMENT:
 #   - SSH into production server as mirror_app
-#   - Git pull → npm ci → build → PM2 hard restart all 5 processes
+#   - Git pull → npm ci → build → PM2 hard restart all 6 processes
 #   - Worker-online verification (catches workers that fail at startup)
 #   - HTTP health check verification with automatic rollback on failure
 #   - Git tag + GitHub Release on success
@@ -193,7 +193,7 @@ jobs:
           echo "[5/6] Pruning dev dependencies..."
           npm prune --omit=dev
 
-          # Step 6: Hard restart all 5 PM2 processes (was 'reload', changed
+          # Step 6: Hard restart all 6 PM2 processes (was 'reload', changed
           # to 'restart' for bulletproof reload — graceful path occasionally
           # left workers in inconsistent state).
           echo "[6/6] Restarting PM2 processes..."
@@ -220,7 +220,7 @@ jobs:
           OFFLINE=$(sudo pm2 jlist | python3 -c "
           import json, sys
           procs = json.load(sys.stdin)
-          expected = {'mirror-server', 'analysis-worker', 'dina-chat-worker', 'truthstream-worker', 'personal-analysis-worker'}
+          expected = {'mirror-server', 'analysis-worker', 'dina-chat-worker', 'truthstream-worker', 'personal-analysis-worker', 'email-campaign-worker'}
           alive = {p['name'] for p in procs if p['pm2_env']['status'] == 'online'}
           missing = expected - alive
           dead = [(p['name'], p['pm2_env']['status']) for p in procs if p['name'] in expected and p['pm2_env']['status'] != 'online']
@@ -233,7 +233,7 @@ jobs:
             sudo pm2 list
             exit 1
           fi
-          echo "All 5 PM2 processes are online."
+          echo "All 6 PM2 processes are online."
           PM2_CHECK
 
       - name: Health check

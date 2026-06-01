@@ -101,6 +101,12 @@ import { createSubscriptionRoutes } from './routes/subscriptionRoutes';
 import { emailService } from './services/emailService';
 
 // ============================================================================
+// ADMIN EMAIL BROADCASTS (internal-secret gated) + public unsubscribe/webhooks
+// ============================================================================
+import adminEmailRoutes from './routes/adminEmail';
+import emailPublicRoutes from './routes/emailPublic';
+
+// ============================================================================
 // ERROR HANDLING UTILITIES
 // ============================================================================
 
@@ -264,6 +270,13 @@ APP.use(((req, res, next) => {
   next();
 }) as express.RequestHandler);
 
+// Admin email API accepts base64 attachments, so it needs a larger body limit.
+// Registered BEFORE the global 100kb parser: express.json no-ops once a body is
+// parsed, so this path-scoped parser wins for /mirror/api/admin/email and the
+// global limit still protects every other route. Reached only via the internal
+// shared secret (requireInternalSecret) over localhost.
+APP.use('/mirror/api/admin/email', express.json({ limit: process.env.EMAIL_JSON_LIMIT || '12mb', strict: true }) as express.RequestHandler);
+
 // Request body parsing with size limits
 APP.use(express.json({ limit: '100kb', strict: true }));
 APP.use(express.urlencoded({ extended: false, limit: '50kb' }));
@@ -314,6 +327,17 @@ APP.use('/mirror/api/dashboard', dashboardRoutes);
 APP.use('/mirror/api/journal', AuthMiddleware.subscriptionGate as express.RequestHandler, journalRoutes);
 APP.use('/mirror/api/push', pushRoutes);
 APP.use('/mirror/api/user/notification-preferences', notificationPreferencesRoutes);
+
+// Public email endpoints — NO auth/subscription gate (recipients click links
+// from their inbox; provider webhooks have no session). Protected internally
+// by an HMAC unsubscribe token and a shared webhook secret. Must stay ungated.
+APP.use('/mirror/api/email', emailPublicRoutes);
+console.log('[ROUTES] Public email routes mounted at /mirror/api/email (unsubscribe + webhooks)');
+
+// Admin email broadcasts — reached only by the admin-server over localhost,
+// gated by the internal shared secret inside the router (requireInternalSecret).
+APP.use('/mirror/api/admin/email', adminEmailRoutes);
+console.log('[ROUTES] Admin email routes mounted at /mirror/api/admin/email');
 
 // ============================================================================
 // MOUNT MIRRORGROUPS ROUTES (PHASE 1 + PHASE 3 + PHASE 4)
