@@ -77,6 +77,17 @@ export class MirrorRedisManager extends EventEmitter {
   // Track channel-specific callbacks for general-purpose subscribe
   private channelCallbacks: Map<string, (message: string) => void> = new Map();
 
+  // Guards the single 'message' listener attach on `this.subscriber` for
+  // the general-purpose subscribe() path. Without this, every call to
+  // subscribe() would append another listener to ioredis's EventEmitter —
+  // Node's EventEmitter does NOT dedupe by function reference — and each
+  // incoming pub/sub message would invoke the routing dispatcher
+  // (handleSubscriberMessage) once per subscribe() call ever made. That
+  // duplicated every Dina broadcast (chat:message, dina:processing_start,
+  // dina:stream_*) on the wire because setupWSS.ts subscribes to two
+  // channels at startup.
+  private messageListenerAttached: boolean = false;
+
   // Configuration
   private readonly host: string;
   private readonly port: number;
@@ -511,9 +522,19 @@ export class MirrorRedisManager extends EventEmitter {
 
       await this.subscriber.subscribe(channel);
 
-      // Attach a message listener that routes to the correct callback
-      // (Uses a named function reference so we don't stack duplicate listeners)
-      this.subscriber.on('message', this.handleSubscriberMessage);
+      // CRITICAL: attach the routing listener exactly ONCE per subscriber
+      // instance. Node's EventEmitter does not deduplicate listeners by
+      // function reference — calling .on('message', fn) twice fires `fn`
+      // twice for every event. The prior code added a listener per
+      // subscribe() call, so every Redis pub/sub message was dispatched N
+      // times (N = number of subscribed channels), which surfaced as
+      // duplicate Dina events (chat:message, dina:processing_start, etc.)
+      // on the WebSocket. The `messageListenerAttached` guard ensures
+      // exactly one dispatcher even if new channels are added later.
+      if (!this.messageListenerAttached) {
+        this.subscriber.on('message', this.handleSubscriberMessage);
+        this.messageListenerAttached = true;
+      }
 
       console.log(`✅ Subscribed to channel: ${channel}`);
       return true;
