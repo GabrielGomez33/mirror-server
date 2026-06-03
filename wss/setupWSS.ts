@@ -465,10 +465,19 @@ export function SetupWebSocket(
           }
         });
 
-        // Handle disconnection
+        // Handle disconnection.
+        //
+        // CRITICAL: we pass `ws` so `unregisterUser` can verify identity.
+        // On mobile reconnect races, this close event can fire AFTER a
+        // newer connection has already replaced this user's entry in the
+        // chatWSHandler.users map. Without the ws-identity guard inside
+        // unregisterUser, the stale close would wipe the new entry,
+        // emptying groupSubscriptions for the user and silently dropping
+        // every subsequent broadcast (including all dina:* events) until
+        // the user refreshes.
         ws.on('close', () => {
           console.log(`Chat WebSocket connection closed for user ${decoded.id}`);
-          chatWSHandler.unregisterUser(decoded.id);
+          chatWSHandler.unregisterUser(decoded.id, ws);
           connectedUserIds.delete(decoded.id);
           // Update last_active on disconnect (last seen time)
           updateLastActive(decoded.id);
@@ -476,7 +485,7 @@ export function SetupWebSocket(
 
         ws.on('error', (error) => {
           logError(`Chat WebSocket error for user ${decoded.id}`, error);
-          chatWSHandler.unregisterUser(decoded.id);
+          chatWSHandler.unregisterUser(decoded.id, ws);
           connectedUserIds.delete(decoded.id);
           updateLastActive(decoded.id);
         });

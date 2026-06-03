@@ -166,7 +166,14 @@ export class ChatWSHandler extends EventEmitter {
   }
 
   /**
-   * Register a user's WebSocket connection
+   * Register a user's WebSocket connection.
+   *
+   * Mobile networks routinely drop and re-establish WS connections during
+   * background→foreground transitions, captive-portal switches, and signal
+   * blips. When that happens the OLD socket's `close` event fires
+   * asynchronously, AFTER the new connection has already been registered.
+   * To prevent the stale close-handler from wiping the new registration,
+   * `unregisterUser` checks WS identity — see comment there.
    */
   registerUser(user: {
     userId: number;
@@ -199,24 +206,44 @@ export class ChatWSHandler extends EventEmitter {
   }
 
   /**
-   * Unregister a user's WebSocket connection
+   * Unregister a user's WebSocket connection.
+   *
+   * The optional `ws` parameter is the socket that fired the close/error
+   * event triggering this call. When supplied, we only act if the user's
+   * CURRENT registration is owned by that same socket. Without this guard,
+   * the close event from a stale connection (e.g. after a mobile reconnect
+   * race) would tear down the brand-new registration — leaving the user's
+   * groupSubscriptions emptied and `users.get(userId)` undefined, so every
+   * subsequent broadcast (including all `dina:*` events) silently no-ops
+   * for that user. Manifested in the wild as: "Dina works then doesn't
+   * then works; responses only appear after refresh."
+   *
+   * Callers that genuinely want to force-unregister regardless of which
+   * socket owns the entry can omit `ws`.
    */
-  unregisterUser(userId: number): void {
+  unregisterUser(userId: number, ws?: WebSocket): void {
     const user = this.users.get(userId);
-    if (user) {
-      // Remove from all group subscriptions
-      for (const groupId of user.activeGroups) {
-        this.removeFromGroup(userId, groupId);
-      }
+    if (!user) return;
 
-      // Set offline presence
-      for (const groupId of user.activeGroups) {
-        this.handlePresenceChange(userId, groupId, 'offline');
-      }
-
-      this.users.delete(userId);
-      console.log(`👤 Chat user unregistered: ${userId}`);
+    // Stale-WS guard: a close event from an old socket must not wipe a
+    // newer registration that already replaced it.
+    if (ws && user.ws !== ws) {
+      console.log(`👤 Chat unregisterUser: skipping stale close for user ${userId} (newer connection has taken over)`);
+      return;
     }
+
+    // Remove from all group subscriptions
+    for (const groupId of user.activeGroups) {
+      this.removeFromGroup(userId, groupId);
+    }
+
+    // Set offline presence
+    for (const groupId of user.activeGroups) {
+      this.handlePresenceChange(userId, groupId, 'offline');
+    }
+
+    this.users.delete(userId);
+    console.log(`👤 Chat user unregistered: ${userId}`);
   }
 
   // ============================================================================
@@ -559,14 +586,32 @@ export class ChatWSHandler extends EventEmitter {
       const [userRows] = await DB.query('SELECT username FROM users WHERE id = ?', [userId]);
       const username = (userRows as any[])[0]?.username;
 
-      // Send confirmation
+      // Protocol contract: resolve the client's sendWithAck Promise FIRST
+      // with a chat:ack carrying the requestId — every other handler in
+      // this file (send/edit/delete/markRead/add/removeReaction) does the
+      // same, and the client (chatWebSocket.ts) routes pending requests
+      // by requestId. Without this ack, the client's join Promise sits
+      // until its 10s timeout, leaving the chat UI in a "joining" state
+      // and reliably visible on mobile reconnects.
+      this.sendToUser(userId, {
+        type: 'chat:ack',
+        payload: {
+          success: true,
+          groupId: payload.groupId,
+          subscriberCount: subscribers.size,
+        },
+        requestId,
+      });
+
+      // Then emit the semantic event so any chat:group_joined handlers
+      // (e.g. UI subscriber-count badges) still fire. No requestId here —
+      // this is a notification, not a response to a specific request.
       this.sendToUser(userId, {
         type: 'chat:group_joined',
         payload: {
           groupId: payload.groupId,
           subscriberCount: subscribers.size,
         },
-        requestId,
       });
 
       // Notify other group members
@@ -599,11 +644,17 @@ export class ChatWSHandler extends EventEmitter {
       // Update presence to offline for this group
       await chatMessageManager.updatePresence(payload.groupId, userId, 'offline');
 
-      // Send confirmation
+      // Same protocol pattern as handleJoinGroup: ack first (resolves the
+      // client's pending request), then emit the semantic event.
+      this.sendToUser(userId, {
+        type: 'chat:ack',
+        payload: { success: true, groupId: payload.groupId, left: true },
+        requestId,
+      });
+
       this.sendToUser(userId, {
         type: 'chat:group_left',
         payload: { groupId: payload.groupId },
-        requestId,
       });
 
       // Notify other group members
