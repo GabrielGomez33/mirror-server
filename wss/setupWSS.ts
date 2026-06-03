@@ -4,6 +4,10 @@
 // Phase 5.2: last_active tracking on connect/disconnect
 // Phase 6: Robust connection management with native ping/pong
 // Phase 6.1: Analysis completion event bridge via Redis pub/sub
+// Phase 7: Multi-connection per user (Goal #3)
+//   * Chat WS now keys by per-connection connId, not userId.
+//   * Groups WS now keys activeConnections by userId → Set<WebSocket>.
+//   * No more "kick existing" on register — multi-device support.
 
 import { WebSocketServer, WebSocket } from 'ws';
 import { IncomingMessage } from 'http';
@@ -43,8 +47,23 @@ const PONG_TIMEOUT = 10_000;
 // CONNECTED USERS TRACKING (for online status)
 // ============================================================================
 
-// Track all users with active WebSocket connections (group WS + chat WS)
-const connectedUserIds: Set<number> = new Set();
+// Track all users with active WebSocket connections (group WS + chat WS).
+// Multi-connection per user: userId → count of live connections. The user
+// is "online" while the count is > 0.
+const connectedUserCounts: Map<number, number> = new Map();
+
+function addConnectedUser(userId: number): void {
+  connectedUserCounts.set(userId, (connectedUserCounts.get(userId) ?? 0) + 1);
+}
+
+function removeConnectedUser(userId: number): void {
+  const next = (connectedUserCounts.get(userId) ?? 1) - 1;
+  if (next <= 0) {
+    connectedUserCounts.delete(userId);
+  } else {
+    connectedUserCounts.set(userId, next);
+  }
+}
 
 // Track all managed WebSocket connections for heartbeat sweeping
 interface ManagedConnection {
@@ -71,14 +90,14 @@ function updateLastActive(userId: number): void {
  * This checks both group notification WS and chat WS connections.
  */
 export function isUserOnline(userId: number): boolean {
-  return connectedUserIds.has(userId) || chatWSHandler.isUserConnected(userId);
+  return connectedUserCounts.has(userId) || chatWSHandler.isUserConnected(userId);
 }
 
 /**
  * Get all currently connected user IDs.
  */
 export function getConnectedUserIds(): number[] {
-  return Array.from(connectedUserIds);
+  return Array.from(connectedUserCounts.keys());
 }
 
 /**
@@ -223,13 +242,16 @@ export function SetupWebSocket(
   //   2. All surviving connections get a new ping frame sent.
   // The ws library's native ping/pong uses WebSocket control frames (opcode 0x9/0xA).
   // Browsers respond to these automatically at the protocol level - no client JS needed.
+  //
+  // With multi-connection-per-user, the sweep is what reaps abandoned
+  // tabs / crashed browsers without disturbing live ones.
   heartbeatSweepTimer = setInterval(() => {
     for (const conn of managedConnections) {
       if (!conn.isAlive) {
         // Did not respond to previous ping - connection is dead
         console.log(`[WS-HEARTBEAT] Dead connection detected (user=${conn.userId}, route=${conn.route}), terminating`);
         conn.ws.terminate();
-        // 'close' event handler will clean up managedConnections + connectedUserIds
+        // 'close' event handler will clean up managedConnections + connectedUserCounts
         continue;
       }
 
@@ -323,7 +345,7 @@ export function SetupWebSocket(
 
         // Track connection for liveness monitoring + update last_active
         trackConnection(ws, decoded.id, '/mirror/groups/ws');
-        connectedUserIds.add(decoded.id);
+        addConnectedUser(decoded.id);
         updateLastActive(decoded.id);
 
         groupNotifications.registerConnection(decoded.id.toString(), ws);
@@ -337,17 +359,19 @@ export function SetupWebSocket(
           // Phase 6a.5: client visibility reports for push-skip-when-active.
           // Client (groupsWebSocket.ts) sends `{type:'visibility',
           // payload:{state:'visible'|'hidden'}}` whenever Page Visibility
-          // changes. Server stores it on mirrorGroupNotifications so the
-          // push dispatcher can skip foregrounded users.
+          // changes. Server stores it per-connection on
+          // mirrorGroupNotifications so the push dispatcher can skip
+          // foregrounded users (active = ANY connection of theirs is
+          // visible).
           try {
             const parsed = JSON.parse(raw);
             if (parsed && parsed.type === 'visibility') {
               const state = parsed.payload?.state ?? parsed.state;
               const userIdStr = decoded.id.toString();
               if (state === 'visible') {
-                groupNotifications.markUserVisible(userIdStr);
+                groupNotifications.markUserVisible(userIdStr, ws);
               } else if (state === 'hidden') {
-                groupNotifications.markUserHidden(userIdStr);
+                groupNotifications.markUserHidden(userIdStr, ws);
               }
               return;
             }
@@ -360,16 +384,16 @@ export function SetupWebSocket(
 
         ws.on('close', () => {
           console.log(`Group WebSocket connection closed for user ${decoded.id}`);
-          groupNotifications.unregisterConnection(decoded.id.toString());
-          connectedUserIds.delete(decoded.id);
+          groupNotifications.unregisterConnection(decoded.id.toString(), ws);
+          removeConnectedUser(decoded.id);
           // Update last_active on disconnect (last seen time)
           updateLastActive(decoded.id);
         });
 
         ws.on('error', (error) => {
           logError(`Group WebSocket error for user ${decoded.id}`, error);
-          groupNotifications.unregisterConnection(decoded.id.toString());
-          connectedUserIds.delete(decoded.id);
+          groupNotifications.unregisterConnection(decoded.id.toString(), ws);
+          removeConnectedUser(decoded.id);
           updateLastActive(decoded.id);
         });
 
@@ -439,16 +463,22 @@ export function SetupWebSocket(
 
         // Track connection for liveness monitoring + update last_active
         trackConnection(ws, decoded.id, '/mirror/groups/chat');
-        connectedUserIds.add(decoded.id);
+        addConnectedUser(decoded.id);
         updateLastActive(decoded.id);
 
-        // Register with chat handler
+        // Register with chat handler — returns a per-connection record
+        // with a unique connId. We capture it in this closure and pass
+        // it to handleMessage / unregisterUser so the chat handler can
+        // address THIS specific connection without ambiguity even when
+        // the same user has many open connections.
         const chatUser = chatWSHandler.registerUser({
           userId: decoded.id,
           username: decoded.username,
           email: decoded.email,
           sessionId: decoded.sessionId,
         }, ws);
+
+        const connId = chatUser.connId;
 
         // Set device type
         chatUser.deviceType = deviceType;
@@ -459,34 +489,28 @@ export function SetupWebSocket(
             const raw = data.toString();
             // Handle application-level ping from client
             if (handleAppPing(ws, raw)) return;
-            await chatWSHandler.handleMessage(decoded.id, raw);
+            await chatWSHandler.handleMessage(connId, raw);
           } catch (error) {
             logError(`Chat message handling error for user ${decoded.id}`, error);
           }
         });
 
-        // Handle disconnection.
-        //
-        // CRITICAL: we pass `ws` so `unregisterUser` can verify identity.
-        // On mobile reconnect races, this close event can fire AFTER a
-        // newer connection has already replaced this user's entry in the
-        // chatWSHandler.users map. Without the ws-identity guard inside
-        // unregisterUser, the stale close would wipe the new entry,
-        // emptying groupSubscriptions for the user and silently dropping
-        // every subsequent broadcast (including all dina:* events) until
-        // the user refreshes.
+        // Handle disconnection — unregister ONLY this specific connId,
+        // leaving any other connections for the same userId untouched.
+        // The chat handler's unregisterUser is idempotent if the connId
+        // has already been removed.
         ws.on('close', () => {
-          console.log(`Chat WebSocket connection closed for user ${decoded.id}`);
-          chatWSHandler.unregisterUser(decoded.id, ws);
-          connectedUserIds.delete(decoded.id);
+          console.log(`Chat WebSocket connection closed for user ${decoded.id} conn=${connId.slice(0, 8)}`);
+          chatWSHandler.unregisterUser(connId);
+          removeConnectedUser(decoded.id);
           // Update last_active on disconnect (last seen time)
           updateLastActive(decoded.id);
         });
 
         ws.on('error', (error) => {
-          logError(`Chat WebSocket error for user ${decoded.id}`, error);
-          chatWSHandler.unregisterUser(decoded.id, ws);
-          connectedUserIds.delete(decoded.id);
+          logError(`Chat WebSocket error for user ${decoded.id} conn=${connId.slice(0, 8)}`, error);
+          chatWSHandler.unregisterUser(connId);
+          removeConnectedUser(decoded.id);
           updateLastActive(decoded.id);
         });
 
@@ -556,11 +580,12 @@ export function getWebSocketHealth(): {
           '/mirror/groups/chat': 'JWT required'
         },
         chat: {
-          connectedUsers: chatStats.connectedUsers,
+          connections: chatStats.connectedConnections,
+          uniqueUsers: chatStats.connectedUsers,
           activeGroups: chatStats.activeGroups,
           totalSubscriptions: chatStats.totalSubscriptions
         },
-        connectedUserIds: connectedUserIds.size,
+        connectedUserCount: connectedUserCounts.size,
         totalManagedConnections: managedConnections.size,
       }
     };
@@ -588,10 +613,10 @@ export async function shutdownWebSocket(): Promise<void> {
   }
 
   // Update last_active for all connected users before shutdown
-  for (const userId of connectedUserIds) {
+  for (const userId of connectedUserCounts.keys()) {
     updateLastActive(userId);
   }
-  connectedUserIds.clear();
+  connectedUserCounts.clear();
 
   // Close all managed connections gracefully
   for (const conn of managedConnections) {
