@@ -7,6 +7,17 @@
 // - Presence updates
 // - Read receipts
 // - Reactions
+//
+// MULTI-CONNECTION DESIGN (Goal #3)
+// ----------------------------------
+// Every WebSocket connection is keyed by a unique `connId` (uuid). A single
+// user may have unlimited concurrent connections (multiple devices, multiple
+// tabs, PWA + browser) and each connection is fully independent — own
+// activeGroups, own subscription set membership, own ack-routing target.
+// Dead/stale connections are reaped by the server-side heartbeat sweep in
+// setupWSS.ts (30s interval). There is intentionally NO "kick on register"
+// behavior — that was the cause of the multi-device ping-pong disconnect
+// cycle.
 // ============================================================================
 
 import { WebSocket } from 'ws';
@@ -21,6 +32,8 @@ import { DB } from '../db';
 // ============================================================================
 
 export interface ChatWSUser {
+  /** Unique per-connection identifier. A single userId may have many. */
+  connId: string;
   userId: number;
   username: string;
   email: string;
@@ -132,11 +145,18 @@ function logError(context: string, error: unknown): void {
 // ============================================================================
 
 export class ChatWSHandler extends EventEmitter {
-  private users: Map<number, ChatWSUser> = new Map();
-  private groupSubscriptions: Map<string, Set<number>> = new Map();
+  /** connId → ChatWSUser. One entry per live WebSocket. */
+  private connections: Map<string, ChatWSUser> = new Map();
+
+  /** userId → set of connIds. Reverse index for fan-out. */
+  private userConnIds: Map<number, Set<string>> = new Map();
+
+  /** groupId → set of connIds subscribed to that group. */
+  private groupSubscriptions: Map<string, Set<string>> = new Map();
+
   private initialized: boolean = false;
 
-  // Rate limiting
+  // Rate limiting (keyed by userId — applies across all of a user's connections)
   private readonly RATE_LIMITS = {
     MESSAGE: { count: 10, windowMs: 1000 },      // 10 messages per second
     TYPING: { count: 5, windowMs: 1000 },        // 5 typing updates per second
@@ -166,14 +186,16 @@ export class ChatWSHandler extends EventEmitter {
   }
 
   /**
-   * Register a user's WebSocket connection.
+   * Register a new WebSocket connection for a user.
    *
-   * Mobile networks routinely drop and re-establish WS connections during
-   * background→foreground transitions, captive-portal switches, and signal
-   * blips. When that happens the OLD socket's `close` event fires
-   * asynchronously, AFTER the new connection has already been registered.
-   * To prevent the stale close-handler from wiping the new registration,
-   * `unregisterUser` checks WS identity — see comment there.
+   * IMPORTANT: this does NOT close or kick any existing connections for
+   * the same userId. A user may have unlimited simultaneous connections
+   * (multi-device, multi-tab, PWA + browser). Dead connections are
+   * reaped by the server-side heartbeat sweep in setupWSS.ts.
+   *
+   * Returns the ChatWSUser including a freshly-generated `connId` that
+   * the caller MUST pass back to `unregisterUser` / `handleMessage` for
+   * this connection.
    */
   registerUser(user: {
     userId: number;
@@ -181,69 +203,77 @@ export class ChatWSHandler extends EventEmitter {
     email: string;
     sessionId: string;
   }, ws: WebSocket): ChatWSUser {
-    // Check for existing connection and close it
-    const existing = this.users.get(user.userId);
-    if (existing) {
-      try {
-        existing.ws.close(1000, 'New connection established');
-      } catch (e) {
-        // Ignore close errors
-      }
-    }
+    const connId = uuidv4();
 
     const chatUser: ChatWSUser = {
+      connId,
       ...user,
       ws,
       connectedAt: new Date(),
       activeGroups: new Set(),
     };
 
-    this.users.set(user.userId, chatUser);
+    this.connections.set(connId, chatUser);
 
-    console.log(`👤 Chat user registered: ${user.userId} (${user.username})`);
+    let conns = this.userConnIds.get(user.userId);
+    if (!conns) {
+      conns = new Set();
+      this.userConnIds.set(user.userId, conns);
+    }
+    conns.add(connId);
+
+    console.log(`👤 Chat user registered: ${user.userId} (${user.username}) [conn=${connId.slice(0, 8)}, total=${conns.size}]`);
 
     return chatUser;
   }
 
   /**
-   * Unregister a user's WebSocket connection.
+   * Unregister a specific connection. Other connections owned by the
+   * same userId are left intact.
    *
-   * The optional `ws` parameter is the socket that fired the close/error
-   * event triggering this call. When supplied, we only act if the user's
-   * CURRENT registration is owned by that same socket. Without this guard,
-   * the close event from a stale connection (e.g. after a mobile reconnect
-   * race) would tear down the brand-new registration — leaving the user's
-   * groupSubscriptions emptied and `users.get(userId)` undefined, so every
-   * subsequent broadcast (including all `dina:*` events) silently no-ops
-   * for that user. Manifested in the wild as: "Dina works then doesn't
-   * then works; responses only appear after refresh."
-   *
-   * Callers that genuinely want to force-unregister regardless of which
-   * socket owns the entry can omit `ws`.
+   * Presence is set to 'offline' for the user's group memberships only
+   * when this was the LAST connection of theirs — otherwise they're
+   * still online from another device/tab.
    */
-  unregisterUser(userId: number, ws?: WebSocket): void {
-    const user = this.users.get(userId);
+  unregisterUser(connId: string): void {
+    const user = this.connections.get(connId);
     if (!user) return;
 
-    // Stale-WS guard: a close event from an old socket must not wipe a
-    // newer registration that already replaced it.
-    if (ws && user.ws !== ws) {
-      console.log(`👤 Chat unregisterUser: skipping stale close for user ${userId} (newer connection has taken over)`);
-      return;
-    }
-
-    // Remove from all group subscriptions
+    // Remove this connection from every group subscription it held.
     for (const groupId of user.activeGroups) {
-      this.removeFromGroup(userId, groupId);
+      const subs = this.groupSubscriptions.get(groupId);
+      if (subs) {
+        subs.delete(connId);
+        if (subs.size === 0) {
+          this.groupSubscriptions.delete(groupId);
+        }
+      }
     }
 
-    // Set offline presence
-    for (const groupId of user.activeGroups) {
-      this.handlePresenceChange(userId, groupId, 'offline');
+    // Remove from the userId → connIds reverse index.
+    const conns = this.userConnIds.get(user.userId);
+    let wasLastConnection = false;
+    if (conns) {
+      conns.delete(connId);
+      if (conns.size === 0) {
+        this.userConnIds.delete(user.userId);
+        wasLastConnection = true;
+      }
     }
 
-    this.users.delete(userId);
-    console.log(`👤 Chat user unregistered: ${userId}`);
+    // Drop the connection record.
+    this.connections.delete(connId);
+
+    // Only emit 'offline' presence when there are no more connections
+    // for this user; otherwise the user remains online from elsewhere.
+    if (wasLastConnection) {
+      for (const groupId of user.activeGroups) {
+        this.handlePresenceChange(user.userId, groupId, 'offline');
+      }
+    }
+
+    const remaining = conns?.size ?? 0;
+    console.log(`👤 Chat connection closed: user=${user.userId} conn=${connId.slice(0, 8)} remaining=${remaining}`);
   }
 
   // ============================================================================
@@ -251,15 +281,22 @@ export class ChatWSHandler extends EventEmitter {
   // ============================================================================
 
   /**
-   * Handle incoming WebSocket message
+   * Handle an incoming WebSocket message from a specific connection.
    */
-  async handleMessage(userId: number, data: string): Promise<void> {
+  async handleMessage(connId: string, data: string): Promise<void> {
+    const user = this.connections.get(connId);
+    if (!user) {
+      // Connection closed between message arrival and dispatch. Ignore.
+      return;
+    }
+    const userId = user.userId;
+
     try {
       const message: ChatWSMessage = JSON.parse(data);
 
       // Validate message structure
       if (!message.type || !message.payload) {
-        this.sendError(userId, 'Invalid message format', message.requestId);
+        this.sendErrorToConnection(connId, 'Invalid message format', message.requestId);
         return;
       }
 
@@ -267,13 +304,13 @@ export class ChatWSHandler extends EventEmitter {
       switch (message.type) {
         // Message operations
         case 'chat:send_message':
-          await this.handleSendMessage(userId, message.payload, message.requestId);
+          await this.handleSendMessage(connId, userId, message.payload, message.requestId);
           break;
         case 'chat:edit_message':
-          await this.handleEditMessage(userId, message.payload, message.requestId);
+          await this.handleEditMessage(connId, userId, message.payload, message.requestId);
           break;
         case 'chat:delete_message':
-          await this.handleDeleteMessage(userId, message.payload, message.requestId);
+          await this.handleDeleteMessage(connId, userId, message.payload, message.requestId);
           break;
 
         // Typing
@@ -291,32 +328,32 @@ export class ChatWSHandler extends EventEmitter {
 
         // Read receipts
         case 'chat:mark_read':
-          await this.handleMarkRead(userId, message.payload, message.requestId);
+          await this.handleMarkRead(connId, userId, message.payload, message.requestId);
           break;
 
         // Reactions
         case 'chat:add_reaction':
-          await this.handleAddReaction(userId, message.payload, message.requestId);
+          await this.handleAddReaction(connId, userId, message.payload, message.requestId);
           break;
         case 'chat:remove_reaction':
-          await this.handleRemoveReaction(userId, message.payload, message.requestId);
+          await this.handleRemoveReaction(connId, userId, message.payload, message.requestId);
           break;
 
         // Group subscription
         case 'chat:join_group':
-          await this.handleJoinGroup(userId, message.payload, message.requestId);
+          await this.handleJoinGroup(connId, message.payload, message.requestId);
           break;
         case 'chat:leave_group':
-          await this.handleLeaveGroup(userId, message.payload, message.requestId);
+          await this.handleLeaveGroup(connId, message.payload, message.requestId);
           break;
 
         default:
-          this.sendError(userId, `Unknown message type: ${message.type}`, message.requestId);
+          this.sendErrorToConnection(connId, `Unknown message type: ${message.type}`, message.requestId);
       }
 
     } catch (error) {
       logError('Failed to handle WebSocket message', error);
-      this.sendError(userId, 'Failed to process message');
+      this.sendErrorToConnection(connId, 'Failed to process message');
     }
   }
 
@@ -325,14 +362,15 @@ export class ChatWSHandler extends EventEmitter {
   // ============================================================================
 
   private async handleSendMessage(
+    connId: string,
     userId: number,
     payload: SendMessagePayload,
     requestId?: string
   ): Promise<void> {
     try {
-      // Rate limiting
+      // Rate limiting (per-user, shared across all connections)
       if (!this.checkRateLimit(userId, 'MESSAGE')) {
-        this.sendError(userId, 'Rate limit exceeded. Please slow down.', requestId);
+        this.sendErrorToConnection(connId, 'Rate limit exceeded. Please slow down.', requestId);
         return;
       }
 
@@ -347,8 +385,11 @@ export class ChatWSHandler extends EventEmitter {
         clientMessageId: payload.clientMessageId,
       });
 
-      // Send acknowledgment to sender
-      this.sendToUser(userId, {
+      // Send acknowledgment to the SPECIFIC connection that sent the
+      // request. Other tabs/devices for this user do not need this ack
+      // — they will receive the 'chat:message' broadcast separately if
+      // they're subscribed to the group.
+      this.sendToConnection(connId, {
         type: 'chat:ack',
         payload: {
           success: true,
@@ -359,11 +400,12 @@ export class ChatWSHandler extends EventEmitter {
       });
 
     } catch (error) {
-      this.sendError(userId, getErrorMessage(error), requestId);
+      this.sendErrorToConnection(connId, getErrorMessage(error), requestId);
     }
   }
 
   private async handleEditMessage(
+    connId: string,
     userId: number,
     payload: EditMessagePayload,
     requestId?: string
@@ -375,19 +417,19 @@ export class ChatWSHandler extends EventEmitter {
         payload.content
       );
 
-      // Send acknowledgment
-      this.sendToUser(userId, {
+      this.sendToConnection(connId, {
         type: 'chat:ack',
         payload: { success: true, messageId: message.id },
         requestId,
       });
 
     } catch (error) {
-      this.sendError(userId, getErrorMessage(error), requestId);
+      this.sendErrorToConnection(connId, getErrorMessage(error), requestId);
     }
   }
 
   private async handleDeleteMessage(
+    connId: string,
     userId: number,
     payload: DeleteMessagePayload,
     requestId?: string
@@ -395,15 +437,14 @@ export class ChatWSHandler extends EventEmitter {
     try {
       await chatMessageManager.deleteMessage(payload.messageId, userId);
 
-      // Send acknowledgment
-      this.sendToUser(userId, {
+      this.sendToConnection(connId, {
         type: 'chat:ack',
         payload: { success: true, messageId: payload.messageId, deleted: true },
         requestId,
       });
 
     } catch (error) {
-      this.sendError(userId, getErrorMessage(error), requestId);
+      this.sendErrorToConnection(connId, getErrorMessage(error), requestId);
     }
   }
 
@@ -441,7 +482,9 @@ export class ChatWSHandler extends EventEmitter {
         payload.groupId,
         userId,
         payload.status,
-        payload.deviceType
+        // Use first connection's deviceType as representative; presence
+        // is per-user not per-connection in the underlying manager.
+        payload.deviceType ?? this.getRepresentativeDeviceType(userId)
       );
 
     } catch (error) {
@@ -460,11 +503,22 @@ export class ChatWSHandler extends EventEmitter {
     });
   }
 
+  private getRepresentativeDeviceType(userId: number): string | undefined {
+    const connIds = this.userConnIds.get(userId);
+    if (!connIds) return undefined;
+    for (const connId of connIds) {
+      const u = this.connections.get(connId);
+      if (u?.deviceType) return u.deviceType;
+    }
+    return undefined;
+  }
+
   // ============================================================================
   // READ RECEIPT HANDLERS
   // ============================================================================
 
   private async handleMarkRead(
+    connId: string,
     userId: number,
     payload: MarkReadPayload,
     requestId?: string
@@ -472,15 +526,14 @@ export class ChatWSHandler extends EventEmitter {
     try {
       await chatMessageManager.markAsRead(payload.groupId, userId, payload.messageId);
 
-      // Send acknowledgment
-      this.sendToUser(userId, {
+      this.sendToConnection(connId, {
         type: 'chat:ack',
         payload: { success: true, marked: true },
         requestId,
       });
 
     } catch (error) {
-      this.sendError(userId, getErrorMessage(error), requestId);
+      this.sendErrorToConnection(connId, getErrorMessage(error), requestId);
     }
   }
 
@@ -489,13 +542,14 @@ export class ChatWSHandler extends EventEmitter {
   // ============================================================================
 
   private async handleAddReaction(
+    connId: string,
     userId: number,
     payload: ReactionPayload,
     requestId?: string
   ): Promise<void> {
     try {
       if (!this.checkRateLimit(userId, 'REACTION')) {
-        this.sendError(userId, 'Rate limit exceeded', requestId);
+        this.sendErrorToConnection(connId, 'Rate limit exceeded', requestId);
         return;
       }
 
@@ -505,19 +559,19 @@ export class ChatWSHandler extends EventEmitter {
         payload.emoji
       );
 
-      // Send acknowledgment
-      this.sendToUser(userId, {
+      this.sendToConnection(connId, {
         type: 'chat:ack',
         payload: { success: true, reactions },
         requestId,
       });
 
     } catch (error) {
-      this.sendError(userId, getErrorMessage(error), requestId);
+      this.sendErrorToConnection(connId, getErrorMessage(error), requestId);
     }
   }
 
   private async handleRemoveReaction(
+    connId: string,
     userId: number,
     payload: ReactionPayload,
     requestId?: string
@@ -529,15 +583,14 @@ export class ChatWSHandler extends EventEmitter {
         payload.emoji
       );
 
-      // Send acknowledgment
-      this.sendToUser(userId, {
+      this.sendToConnection(connId, {
         type: 'chat:ack',
         payload: { success: true, reactions },
         requestId,
       });
 
     } catch (error) {
-      this.sendError(userId, getErrorMessage(error), requestId);
+      this.sendErrorToConnection(connId, getErrorMessage(error), requestId);
     }
   }
 
@@ -546,16 +599,17 @@ export class ChatWSHandler extends EventEmitter {
   // ============================================================================
 
   private async handleJoinGroup(
-    userId: number,
+    connId: string,
     payload: GroupPayload,
     requestId?: string
   ): Promise<void> {
     try {
-      const user = this.users.get(userId);
+      const user = this.connections.get(connId);
       if (!user) {
-        this.sendError(userId, 'User not connected', requestId);
+        // Connection just closed — no recipient to ack.
         return;
       }
+      const userId = user.userId;
 
       // Verify membership
       const [rows] = await DB.query(
@@ -565,11 +619,15 @@ export class ChatWSHandler extends EventEmitter {
       );
 
       if ((rows as any[]).length === 0) {
-        this.sendError(userId, 'Not a member of this group', requestId);
+        this.sendErrorToConnection(connId, 'Not a member of this group', requestId);
         return;
       }
 
-      // Add to subscriptions
+      // Per-connection subscription: this device subscribes; others
+      // owned by the same user must call join_group independently if
+      // they want to receive group events. The client's `onopen` rejoin
+      // loop in chatWebSocket.ts does this automatically for each
+      // device's own subscribedGroups set.
       user.activeGroups.add(payload.groupId);
 
       let subscribers = this.groupSubscriptions.get(payload.groupId);
@@ -577,23 +635,19 @@ export class ChatWSHandler extends EventEmitter {
         subscribers = new Set();
         this.groupSubscriptions.set(payload.groupId, subscribers);
       }
-      subscribers.add(userId);
+      subscribers.add(connId);
 
       // Update presence to online
       await chatMessageManager.updatePresence(payload.groupId, userId, 'online', user.deviceType);
 
-      // Get username for the response
+      // Get username for the presence broadcast
       const [userRows] = await DB.query('SELECT username FROM users WHERE id = ?', [userId]);
       const username = (userRows as any[])[0]?.username;
 
-      // Protocol contract: resolve the client's sendWithAck Promise FIRST
-      // with a chat:ack carrying the requestId — every other handler in
-      // this file (send/edit/delete/markRead/add/removeReaction) does the
-      // same, and the client (chatWebSocket.ts) routes pending requests
-      // by requestId. Without this ack, the client's join Promise sits
-      // until its 10s timeout, leaving the chat UI in a "joining" state
-      // and reliably visible on mobile reconnects.
-      this.sendToUser(userId, {
+      // Ack the specific connection that asked. chat:ack with requestId
+      // resolves the client's sendWithAck Promise; the protocol matches
+      // every other request/response handler in this file.
+      this.sendToConnection(connId, {
         type: 'chat:ack',
         payload: {
           success: true,
@@ -603,10 +657,9 @@ export class ChatWSHandler extends EventEmitter {
         requestId,
       });
 
-      // Then emit the semantic event so any chat:group_joined handlers
-      // (e.g. UI subscriber-count badges) still fire. No requestId here —
-      // this is a notification, not a response to a specific request.
-      this.sendToUser(userId, {
+      // Emit the semantic event so chat:group_joined listeners fire.
+      // Sent only to the connection that joined (per-connection scope).
+      this.sendToConnection(connId, {
         type: 'chat:group_joined',
         payload: {
           groupId: payload.groupId,
@@ -614,7 +667,7 @@ export class ChatWSHandler extends EventEmitter {
         },
       });
 
-      // Notify other group members
+      // Notify other group members (skipping the joiner's other tabs too)
       this.broadcastToGroup(payload.groupId, {
         type: 'chat:presence',
         payload: {
@@ -626,64 +679,84 @@ export class ChatWSHandler extends EventEmitter {
         },
       }, userId);
 
-      console.log(`📥 User ${userId} joined chat group ${payload.groupId}`);
+      console.log(`📥 conn=${connId.slice(0, 8)} (user=${userId}) joined chat group ${payload.groupId}`);
 
     } catch (error) {
-      this.sendError(userId, getErrorMessage(error), requestId);
+      this.sendErrorToConnection(connId, getErrorMessage(error), requestId);
     }
   }
 
   private async handleLeaveGroup(
-    userId: number,
+    connId: string,
     payload: GroupPayload,
     requestId?: string
   ): Promise<void> {
     try {
-      this.removeFromGroup(userId, payload.groupId);
+      const user = this.connections.get(connId);
+      if (!user) return;
+      const userId = user.userId;
 
-      // Update presence to offline for this group
-      await chatMessageManager.updatePresence(payload.groupId, userId, 'offline');
+      this.removeFromGroup(connId, payload.groupId);
 
-      // Same protocol pattern as handleJoinGroup: ack first (resolves the
-      // client's pending request), then emit the semantic event.
-      this.sendToUser(userId, {
+      // Was this the user's LAST subscription to this group across all
+      // their connections? Only then is it correct to broadcast offline
+      // presence to other group members.
+      const stillSubscribed = this.userHasGroupSubscription(userId, payload.groupId);
+      if (!stillSubscribed) {
+        await chatMessageManager.updatePresence(payload.groupId, userId, 'offline');
+      }
+
+      this.sendToConnection(connId, {
         type: 'chat:ack',
         payload: { success: true, groupId: payload.groupId, left: true },
         requestId,
       });
 
-      this.sendToUser(userId, {
+      this.sendToConnection(connId, {
         type: 'chat:group_left',
         payload: { groupId: payload.groupId },
       });
 
-      // Notify other group members
-      this.broadcastToGroup(payload.groupId, {
-        type: 'chat:presence',
-        payload: {
-          userId,
-          groupId: payload.groupId,
-          status: 'offline',
-          lastSeenAt: new Date().toISOString(),
-        },
-      }, userId);
+      if (!stillSubscribed) {
+        this.broadcastToGroup(payload.groupId, {
+          type: 'chat:presence',
+          payload: {
+            userId,
+            groupId: payload.groupId,
+            status: 'offline',
+            lastSeenAt: new Date().toISOString(),
+          },
+        }, userId);
+      }
 
-      console.log(`📤 User ${userId} left chat group ${payload.groupId}`);
+      console.log(`📤 conn=${connId.slice(0, 8)} (user=${userId}) left chat group ${payload.groupId}`);
 
     } catch (error) {
-      this.sendError(userId, getErrorMessage(error), requestId);
+      this.sendErrorToConnection(connId, getErrorMessage(error), requestId);
     }
   }
 
-  private removeFromGroup(userId: number, groupId: string): void {
-    const user = this.users.get(userId);
+  /** Does this user still subscribe to the group via ANY of their connections? */
+  private userHasGroupSubscription(userId: number, groupId: string): boolean {
+    const connIds = this.userConnIds.get(userId);
+    if (!connIds) return false;
+    const subs = this.groupSubscriptions.get(groupId);
+    if (!subs) return false;
+    for (const connId of connIds) {
+      if (subs.has(connId)) return true;
+    }
+    return false;
+  }
+
+  private removeFromGroup(connId: string, groupId: string): void {
+    const user = this.connections.get(connId);
     if (user) {
       user.activeGroups.delete(groupId);
     }
 
     const subscribers = this.groupSubscriptions.get(groupId);
     if (subscribers) {
-      subscribers.delete(userId);
+      subscribers.delete(connId);
       if (subscribers.size === 0) {
         this.groupSubscriptions.delete(groupId);
       }
@@ -695,7 +768,10 @@ export class ChatWSHandler extends EventEmitter {
   // ============================================================================
 
   private handleMessageSent(message: ChatMessage): void {
-    // Broadcast to all group subscribers
+    // Broadcast to all group subscribers EXCEPT the sender's connections.
+    // The sender's tab that submitted the message already has it optimistically;
+    // their OTHER tabs/devices, however, DO need it — see the comment in
+    // broadcastToGroup for how cross-tab delivery is handled.
     this.broadcastToGroup(message.groupId, {
       type: 'chat:message',
       payload: this.formatMessageForBroadcast(message),
@@ -728,8 +804,12 @@ export class ChatWSHandler extends EventEmitter {
   // SENDING HELPERS
   // ============================================================================
 
-  private sendToUser(userId: number, message: ChatWSMessage): boolean {
-    const user = this.users.get(userId);
+  /**
+   * Send a message to a specific connection. Used for request/response
+   * acks where only the originating client should receive the reply.
+   */
+  private sendToConnection(connId: string, message: ChatWSMessage): boolean {
+    const user = this.connections.get(connId);
     if (!user || user.ws.readyState !== WebSocket.OPEN) {
       return false;
     }
@@ -738,13 +818,33 @@ export class ChatWSHandler extends EventEmitter {
       user.ws.send(JSON.stringify(message));
       return true;
     } catch (error) {
-      logError(`Failed to send to user ${userId}`, error);
+      logError(`Failed to send to conn ${connId.slice(0, 8)}`, error);
       return false;
     }
   }
 
-  private sendError(userId: number, error: string, requestId?: string): void {
-    this.sendToUser(userId, {
+  /**
+   * Send a message to ALL of a user's connections.
+   *
+   * Returns the count of connections successfully delivered to. A return
+   * of 0 means none of the user's connections were open — caller can fall
+   * back to push notification etc.
+   */
+  sendToUser(userId: number, message: ChatWSMessage): number {
+    const connIds = this.userConnIds.get(userId);
+    if (!connIds) return 0;
+
+    let sent = 0;
+    for (const connId of connIds) {
+      if (this.sendToConnection(connId, message)) {
+        sent++;
+      }
+    }
+    return sent;
+  }
+
+  private sendErrorToConnection(connId: string, error: string, requestId?: string): void {
+    this.sendToConnection(connId, {
       type: 'chat:error',
       payload: { error },
       requestId,
@@ -752,7 +852,19 @@ export class ChatWSHandler extends EventEmitter {
   }
 
   /**
-   * Broadcast message to all users in a group
+   * Broadcast a message to every connection subscribed to a group.
+   *
+   * `excludeUserId` skips ALL connections owned by that user — including
+   * the user's other tabs/devices. This is correct for `chat:message`
+   * broadcasts because the sender's other devices receive the message
+   * via a DIFFERENT path: they're subscribed to the group too and get
+   * the broadcast directly, but the sender's submitting tab already has
+   * an optimistic copy of the message. We skip all their connections to
+   * avoid duplicating that optimistic message; ChatContext's dedup Set
+   * also handles any leftover race, and the message reload on focus/open
+   * brings the canonical persisted row.
+   *
+   * Returns the number of connections delivered to.
    */
   broadcastToGroup(
     groupId: string,
@@ -763,9 +875,11 @@ export class ChatWSHandler extends EventEmitter {
     if (!subscribers) return 0;
 
     let sent = 0;
-    for (const userId of subscribers) {
-      if (excludeUserId && userId === excludeUserId) continue;
-      if (this.sendToUser(userId, message)) {
+    for (const connId of subscribers) {
+      const user = this.connections.get(connId);
+      if (!user) continue;
+      if (excludeUserId && user.userId === excludeUserId) continue;
+      if (this.sendToConnection(connId, message)) {
         sent++;
       }
     }
@@ -778,8 +892,8 @@ export class ChatWSHandler extends EventEmitter {
    */
   broadcastToAll(message: ChatWSMessage): number {
     let sent = 0;
-    for (const [userId] of this.users) {
-      if (this.sendToUser(userId, message)) {
+    for (const connId of this.connections.keys()) {
+      if (this.sendToConnection(connId, message)) {
         sent++;
       }
     }
@@ -827,6 +941,7 @@ export class ChatWSHandler extends EventEmitter {
    * Get connection statistics
    */
   getStats(): {
+    connectedConnections: number;
     connectedUsers: number;
     activeGroups: number;
     totalSubscriptions: number;
@@ -837,26 +952,47 @@ export class ChatWSHandler extends EventEmitter {
     }
 
     return {
-      connectedUsers: this.users.size,
+      connectedConnections: this.connections.size,
+      connectedUsers: this.userConnIds.size,
       activeGroups: this.groupSubscriptions.size,
       totalSubscriptions,
     };
   }
 
   /**
-   * Check if a user is connected
+   * Check if a user has at least one open connection.
    */
   isUserConnected(userId: number): boolean {
-    const user = this.users.get(userId);
-    return user !== undefined && user.ws.readyState === WebSocket.OPEN;
+    const connIds = this.userConnIds.get(userId);
+    if (!connIds || connIds.size === 0) return false;
+    for (const connId of connIds) {
+      const user = this.connections.get(connId);
+      if (user && user.ws.readyState === WebSocket.OPEN) return true;
+    }
+    return false;
   }
 
   /**
-   * Get users subscribed to a group
+   * Get the count of open connections for a user.
+   */
+  getUserConnectionCount(userId: number): number {
+    const connIds = this.userConnIds.get(userId);
+    return connIds ? connIds.size : 0;
+  }
+
+  /**
+   * Get unique userIds subscribed to a group (de-duplicated across
+   * multiple connections for the same user).
    */
   getGroupSubscribers(groupId: string): number[] {
     const subscribers = this.groupSubscriptions.get(groupId);
-    return subscribers ? Array.from(subscribers) : [];
+    if (!subscribers) return [];
+    const userIds = new Set<number>();
+    for (const connId of subscribers) {
+      const user = this.connections.get(connId);
+      if (user) userIds.add(user.userId);
+    }
+    return Array.from(userIds);
   }
 
   // ============================================================================
@@ -866,20 +1002,25 @@ export class ChatWSHandler extends EventEmitter {
   async shutdown(): Promise<void> {
     console.log('🔌 Shutting down Chat WebSocket Handler...');
 
-    // Set all users offline
-    for (const [userId, user] of this.users) {
+    // Set all users offline and close every connection
+    const presenceUpdates: Promise<void>[] = [];
+    for (const [, user] of this.connections) {
       for (const groupId of user.activeGroups) {
-        await chatMessageManager.updatePresence(groupId, userId, 'offline');
+        presenceUpdates.push(
+          chatMessageManager.updatePresence(groupId, user.userId, 'offline').catch(() => {})
+        );
       }
 
       try {
         user.ws.close(1001, 'Server shutting down');
-      } catch (e) {
+      } catch {
         // Ignore close errors
       }
     }
+    await Promise.allSettled(presenceUpdates);
 
-    this.users.clear();
+    this.connections.clear();
+    this.userConnIds.clear();
     this.groupSubscriptions.clear();
     this.rateLimiters.clear();
     this.initialized = false;

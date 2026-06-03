@@ -204,20 +204,28 @@ type ValidatedNotificationQueue = NotificationQueue & { type: GroupNotificationT
 
 export class MirrorGroupNotificationSystem extends EventEmitter {
   private initialized: boolean = false;
-  private activeConnections: Map<string, WebSocket> = new Map();
 
-  // Phase 6a.5: per-user Page Visibility state. Updated when the client
-  // sends a `{type:'visibility', state:'visible'|'hidden'}` WS message.
-  // Keyed by userId (string). Value records last-known state and the
-  // timestamp of that change. isUserActive() considers a user active
-  // when they have an open WS AND the last visibility report was
-  // 'visible' within the configured window (default 60s).
+  // Multi-connection per user (Phase 7 / Goal #3): a single userId may
+  // have any number of concurrent WebSockets (multi-device, multi-tab,
+  // PWA + browser). Sends fan out to all of them; close/error events
+  // only remove the specific ws that fired, never wholesale-wipe the
+  // user's entry. This eliminates the multi-device ping-pong disconnect
+  // cycle that the prior single-ws-per-user map caused.
+  private activeConnections: Map<string, Set<WebSocket>> = new Map();
+
+  // Phase 6a.5: Page Visibility state, now tracked PER-WEBSOCKET so a
+  // user with one foregrounded tab and one backgrounded tab is correctly
+  // classified as "active" (any visible tab counts). Updated when a
+  // client sends `{type:'visibility', state:'visible'|'hidden'}` over
+  // its WS. isUserActive() iterates the user's connections and returns
+  // true if any visibility entry is 'visible' within the configured
+  // window (default 60s).
   //
   // The dispatcher (services/pushNotificationDispatcher.ts) checks
   // isUserActive() before firing a Web Push — active users get the
   // in-app WS notification instead, avoiding the "I'm IN the app and
   // also getting buzzed on my home screen" feedback loop.
-  private userVisibility: Map<string, { state: 'visible' | 'hidden'; timestamp: number }> = new Map();
+  private connectionVisibility: WeakMap<WebSocket, { state: 'visible' | 'hidden'; timestamp: number }> = new WeakMap();
   private readonly VISIBILITY_ACTIVE_WINDOW_MS = 60_000;
 
   // Notification templates
@@ -536,28 +544,67 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
   // WEBSOCKET CONNECTION MANAGEMENT
   // ============================================================================
 
+  /**
+   * Register a new WebSocket connection for a user. Does NOT close any
+   * existing connections — a user may have unlimited simultaneous
+   * connections (multi-device / multi-tab). The internal close/error
+   * handlers attached here only remove the specific ws that fired,
+   * never wipe the user's entire set.
+   */
   registerConnection(userId: string, ws: WebSocket): void {
-    this.activeConnections.set(userId, ws);
+    let conns = this.activeConnections.get(userId);
+    if (!conns) {
+      conns = new Set();
+      this.activeConnections.set(userId, conns);
+    }
+    conns.add(ws);
 
     ws.on('close', () => {
-      this.activeConnections.delete(userId);
-      // Phase 6a.5: drop stale visibility on disconnect.
-      this.userVisibility.delete(userId);
+      this.removeConnectionWs(userId, ws);
     });
 
     ws.on('error', (error) => {
       logError(`WebSocket error for user ${userId}`, error);
-      this.activeConnections.delete(userId);
-      this.userVisibility.delete(userId);
+      this.removeConnectionWs(userId, ws);
     });
 
-    console.log(`✅ Registered WebSocket connection for user ${userId}`);
+    console.log(`✅ Registered WebSocket connection for user ${userId} (total=${conns.size})`);
   }
 
-  unregisterConnection(userId: string): void {
-    this.activeConnections.delete(userId);
-    this.userVisibility.delete(userId);
-    console.log(`🔌 Unregistered WebSocket connection for user ${userId}`);
+  /**
+   * Unregister a specific WebSocket. If `ws` is omitted, force-removes
+   * ALL connections for the user (used by graceful shutdown / session
+   * invalidation paths).
+   */
+  unregisterConnection(userId: string, ws?: WebSocket): void {
+    if (ws) {
+      this.removeConnectionWs(userId, ws);
+      return;
+    }
+
+    // Force-unregister all for this user.
+    const conns = this.activeConnections.get(userId);
+    if (conns) {
+      for (const conn of conns) {
+        this.connectionVisibility.delete(conn);
+      }
+      this.activeConnections.delete(userId);
+    }
+    console.log(`🔌 Unregistered ALL WebSocket connections for user ${userId}`);
+  }
+
+  /**
+   * Remove a single ws from a user's connection set and clean its
+   * per-ws visibility entry. Idempotent.
+   */
+  private removeConnectionWs(userId: string, ws: WebSocket): void {
+    this.connectionVisibility.delete(ws);
+    const conns = this.activeConnections.get(userId);
+    if (!conns) return;
+    conns.delete(ws);
+    if (conns.size === 0) {
+      this.activeConnections.delete(userId);
+    }
   }
 
   // ============================================================================
@@ -566,41 +613,90 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
 
   /**
    * Called by the WebSocket message handler when a client posts
-   * `{type:'visibility', state:'visible'}`. Marks the user as
-   * foregrounded — the dispatcher will skip Web Push for them.
+   * `{type:'visibility', state:'visible'}` on a specific connection.
+   * Marks THAT connection as foregrounded — the dispatcher will skip
+   * Web Push when ANY of the user's connections is currently visible.
    */
-  markUserVisible(userId: string): void {
-    this.userVisibility.set(userId, { state: 'visible', timestamp: Date.now() });
+  markUserVisible(userId: string, ws: WebSocket): void {
+    if (!this.activeConnections.get(userId)?.has(ws)) return;
+    this.connectionVisibility.set(ws, { state: 'visible', timestamp: Date.now() });
   }
 
   /**
    * Called when the client posts `{type:'visibility', state:'hidden'}`
-   * (tab backgrounded, app minimized, etc.). User reverts to "may need
-   * push delivery" state.
+   * (tab backgrounded, app minimized, etc.) on a specific connection.
    */
-  markUserHidden(userId: string): void {
-    this.userVisibility.set(userId, { state: 'hidden', timestamp: Date.now() });
+  markUserHidden(userId: string, ws: WebSocket): void {
+    if (!this.activeConnections.get(userId)?.has(ws)) return;
+    this.connectionVisibility.set(ws, { state: 'hidden', timestamp: Date.now() });
   }
 
   /**
    * True when the user has BOTH:
-   *   • an open WebSocket connection (so in-app delivery will reach them), AND
-   *   • a recent 'visible' visibility report (within the active window).
+   *   • at least one open WebSocket connection, AND
+   *   • at least one of those connections has reported 'visible' within
+   *     the active window.
    *
-   * The dispatcher uses this to decide whether to skip Web Push. Conservative
-   * default: if no visibility has been reported yet (user just connected
-   * but hasn't sent a visibility message), we treat them as INACTIVE so
-   * push still fires — better to over-deliver than to silently drop a
-   * notification.
+   * The dispatcher uses this to decide whether to skip Web Push. With
+   * multi-connection users, a foregrounded tab on ANY device counts as
+   * active — pushing to a hidden tab on another device would still
+   * surface as a notification on a device where the user IS looking,
+   * which is the exact "buzzing while in-app" UX we want to avoid.
+   *
+   * Conservative default: if NO connection has reported visibility yet
+   * (just connected), we treat the user as INACTIVE so push still
+   * fires — better to over-deliver than to silently drop a notification.
    */
   isUserActive(userId: string): boolean {
-    const ws = this.activeConnections.get(userId);
-    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    const conns = this.activeConnections.get(userId);
+    if (!conns || conns.size === 0) return false;
 
-    const v = this.userVisibility.get(userId);
-    if (!v) return false; // No visibility reported → treat as inactive (push).
-    if (v.state !== 'visible') return false;
-    return Date.now() - v.timestamp < this.VISIBILITY_ACTIVE_WINDOW_MS;
+    const now = Date.now();
+    for (const ws of conns) {
+      if (ws.readyState !== WebSocket.OPEN) continue;
+      const v = this.connectionVisibility.get(ws);
+      if (!v) continue;
+      if (v.state !== 'visible') continue;
+      if (now - v.timestamp < this.VISIBILITY_ACTIVE_WINDOW_MS) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Internal helper: get the first open WebSocket for a user (any
+   * connection). Returns undefined if the user has no open connections.
+   * Used by code paths that historically expected a single ws and have
+   * been incrementally migrated to multi-connection. Prefer the explicit
+   * fan-out helpers (sendToUserConnections etc.) for new code.
+   */
+  private getFirstOpenConnection(userId: string): WebSocket | undefined {
+    const conns = this.activeConnections.get(userId);
+    if (!conns) return undefined;
+    for (const ws of conns) {
+      if (ws.readyState === WebSocket.OPEN) return ws;
+    }
+    return undefined;
+  }
+
+  /**
+   * Fan-out send: deliver `message` to every open connection owned by
+   * `userId`. Returns the number of connections successfully delivered
+   * to (0 if user has no open connections).
+   */
+  private sendToUserConnections(userId: string, message: string): number {
+    const conns = this.activeConnections.get(userId);
+    if (!conns) return 0;
+    let sent = 0;
+    for (const ws of conns) {
+      if (ws.readyState !== WebSocket.OPEN) continue;
+      try {
+        ws.send(message);
+        sent++;
+      } catch (error) {
+        logError(`Fan-out send failed for user ${userId} on one connection`, error);
+      }
+    }
+    return sent;
   }
 
   // ============================================================================
@@ -888,28 +984,21 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
     type: string;
     payload: Record<string, any>;
   }): Promise<boolean> {
-    try {
-      const ws = this.activeConnections.get(userId);
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        return false;
-      }
+    const message = JSON.stringify({
+      type: 'group_notification',
+      data: {
+        notificationType: notification.type,
+        ...notification.payload,
+        timestamp: new Date().toISOString(),
+      },
+    });
 
-      const message = JSON.stringify({
-        type: 'group_notification',
-        data: {
-          notificationType: notification.type,
-          ...notification.payload,
-          timestamp: new Date().toISOString(),
-        },
-      });
-
-      ws.send(message);
-      console.log(`✅ Raw WebSocket notification delivered to user ${userId}`);
+    const sent = this.sendToUserConnections(userId, message);
+    if (sent > 0) {
+      console.log(`✅ Raw WebSocket notification delivered to user ${userId} (${sent} connection${sent === 1 ? '' : 's'})`);
       return true;
-    } catch (error) {
-      logError(`Raw WebSocket delivery failed for user ${userId}`, error);
-      return false;
     }
+    return false;
   }
 
   // ============================================================================
@@ -927,12 +1016,7 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
    */
   async sendDirectWebSocketMessage(userId: string, message: string): Promise<boolean> {
     try {
-      const ws = this.activeConnections.get(userId);
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        return false;
-      }
-      ws.send(message);
-      return true;
+      return this.sendToUserConnections(userId, message) > 0;
     } catch (error) {
       logError(`Direct WebSocket send failed for user ${userId}`, error);
       return false;
@@ -1091,11 +1175,6 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
 
   private async deliverViaWebSocket(notification: NotificationDelivery): Promise<boolean> {
     try {
-      const ws = this.activeConnections.get(notification.userId);
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        return false;
-      }
-
       const message = JSON.stringify({
         type: 'group_notification',
         data: {
@@ -1105,9 +1184,12 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
         },
       });
 
-      ws.send(message);
-      console.log(`✅ WebSocket notification delivered to user ${notification.userId}`);
-      return true;
+      const sent = this.sendToUserConnections(notification.userId, message);
+      if (sent > 0) {
+        console.log(`✅ WebSocket notification delivered to user ${notification.userId} (${sent} connection${sent === 1 ? '' : 's'})`);
+        return true;
+      }
+      return false;
     } catch (error) {
       logError(`WebSocket delivery failed for user ${notification.userId}`, error);
       return false;
@@ -1162,9 +1244,15 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
     console.log('📬 Shutting down Mirror Group Notification System...');
 
     try {
-      // Close all WebSocket connections
-      for (const [userId, ws] of this.activeConnections) {
-        ws.close();
+      // Close every connection across every user
+      for (const [, conns] of this.activeConnections) {
+        for (const ws of conns) {
+          try {
+            ws.close(1001, 'Server shutting down');
+          } catch {
+            // Ignore close errors during shutdown
+          }
+        }
       }
       this.activeConnections.clear();
 
