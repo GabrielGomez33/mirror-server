@@ -961,6 +961,35 @@ export class MirrorGroupNotificationSystem extends EventEmitter {
       // Convert colon format to underscore format (e.g., 'vote:proposed' -> 'vote_proposed')
       const internalType = notification.type.replace(':', '_') as GroupNotificationType;
 
+      // Goal #5 — suppress dina_processing_started as a notification.
+      //
+      // `dina:processing_start` is conceptually a TYPING-INDICATOR cue
+      // ("Dina is thinking"), not a notification panel entry. The
+      // DinaChatQueueProcessor already publishes a `dina:processing_start`
+      // frame on DINA_BROADCAST_CHANNEL — bridged in setupWSS.ts
+      // (mirrorRedis.subscribe(DINA_BROADCAST_CHANNEL, …)) and fanned out
+      // by chatWSHandler.broadcastToGroup — which drives the in-chat
+      // typing dots correctly and on its own.
+      //
+      // The separate notify('dina:processing_start') call this short-circuits
+      // additionally built a {type:'notification:new', title:'DINA',
+      // message:'DINA: processing started'} envelope and shipped it down
+      // the /mirror/groups/ws connection, where the client's
+      // NotificationCenter rendered it as a panel entry. With the current
+      // panel double-add bug (one WS frame → two store inserts) that
+      // surfaced as a pair of stacked "DINA: processing started"
+      // notifications per @dina query; even without the double-add it
+      // was UX pollution (typing-indicator notifications aren't actionable
+      // and accumulate forever).
+      //
+      // Returning true here keeps the worker's call-site contract intact
+      // (it still sees "delivered") without emitting the notification:new
+      // frame, persisting a queue entry, or dispatching push. The
+      // in-chat typing dots are unaffected.
+      if (internalType === 'dina_processing_started') {
+        return true;
+      }
+
       // Validate notification type
       if (!isValidGroupNotificationType(internalType)) {
         console.warn(`⚠️ Unknown notification type: ${notification.type}, delivering as raw WebSocket message`);
