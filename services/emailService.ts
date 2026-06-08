@@ -89,6 +89,7 @@ export type EmailTemplateName =
   | 'email_verification'
   | 'email_change_verification'
   | 'password_reset'
+  | 'new_device_login'
   | 'payment_confirmed'
   | 'payment_failed'
   | 'trial_ending'
@@ -197,6 +198,49 @@ const EMAIL_TEMPLATES: Record<EmailTemplateName, {
     `,
     text: (data) =>
       `Hi ${data.username || 'there'},\n\nReset your Mirror password using this link (valid for ${data.expiresInMinutes || 60} minutes):\n${data.resetUrl}\n\nIf you didn't request this, you can ignore this email — your password hasn't changed.\n\nRequest IP: ${data.ipAddress || 'unknown'}`,
+  },
+
+  // ============================================================================
+  // new_device_login — sent best-effort after a successful sign-in from a
+  // previously-unseen IP or User-Agent. Fired by authController.loginUser
+  // when SecurityMonitor.detectSuspiciousActivity flags the request.
+  // Required `data` keys:
+  //   username        — display name (falls back to "there")
+  //   loginTime       — UTC string of the sign-in
+  //   ipAddress       — client IP (already stripped of ::ffff: prefix)
+  //   userAgent       — raw UA string, truncated to ~200 chars upstream
+  //   resetPasswordUrl — absolute URL to the password-reset start page
+  // ============================================================================
+  new_device_login: {
+    subject: 'New sign-in to your Mirror account',
+    html: (data) => `
+      <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; background: #0a0a0f; color: #e0e0e0;">
+        <div style="text-align: center; margin-bottom: 32px;">
+          <h1 style="color: #ffffff; font-size: 28px; margin: 0;">Mirror</h1>
+        </div>
+        <div style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 32px;">
+          <h2 style="color: #fff; margin: 0 0 16px;">New sign-in detected</h2>
+          <p style="color: #ccc; line-height: 1.6;">Hi ${data.username || 'there'},</p>
+          <p style="color: #ccc; line-height: 1.6;">We noticed a sign-in to your Mirror account from a device or location we hadn't seen before.</p>
+          <div style="background: rgba(255,255,255,0.04); border-radius: 8px; padding: 16px; margin: 20px 0; font-family: 'SF Mono', Consolas, monospace; font-size: 13px; color: #ddd;">
+            <div><strong style="color:#aaa;">When:</strong> ${data.loginTime || 'just now'}</div>
+            <div><strong style="color:#aaa;">From IP:</strong> ${data.ipAddress || 'unknown'}</div>
+            <div style="word-break: break-all;"><strong style="color:#aaa;">Device:</strong> ${data.userAgent || 'unknown'}</div>
+          </div>
+          <p style="color: #ccc; line-height: 1.6;"><strong style="color:#fff;">If that was you,</strong> you can ignore this email — we're just letting you know.</p>
+          <p style="color: #ccc; line-height: 1.6;"><strong style="color:#fff;">If it wasn't,</strong> someone else may have your password. Reset it now to lock them out:</p>
+          <div style="text-align: center; margin: 28px 0;">
+            <a href="${data.resetPasswordUrl}" style="display: inline-block; background: linear-gradient(135deg, #f472b6, #fb7185); color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600;">Reset Password</a>
+          </div>
+          <p style="color: #888; font-size: 13px;">If the button doesn't work, copy this link: ${data.resetPasswordUrl}</p>
+          <hr style="border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 24px 0;" />
+          <p style="color: #888; font-size: 12px; line-height: 1.6;">We send this whenever a new IP or device signs in for the first time. You may also see it after switching networks (home → cafe → mobile data). To stop receiving these, sign in only from saved devices.</p>
+        </div>
+        <p style="color: #666; font-size: 12px; text-align: center; margin-top: 32px;">Mirror — &copy; ${new Date().getFullYear()}</p>
+      </div>
+    `,
+    text: (data) =>
+      `Hi ${data.username || 'there'},\n\nNew sign-in to your Mirror account:\nWhen: ${data.loginTime || 'just now'}\nIP: ${data.ipAddress || 'unknown'}\nDevice: ${data.userAgent || 'unknown'}\n\nIf this wasn't you, reset your password immediately: ${data.resetPasswordUrl}\n\nIf it was you, no action needed.`,
   },
 
   payment_confirmed: {
