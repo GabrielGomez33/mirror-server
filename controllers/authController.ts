@@ -1,5 +1,25 @@
 // controllers/authController.ts
 //
+// CHANGES vs previous version (Phase 2b — mobile registration hardening):
+//   - registerUser() now trims username/email, normalises iOS smart quotes
+//     and smart dashes in the password, and uses a unified password policy
+//     that accepts ANY non-alphanumeric character as a "special character"
+//     (previous policy only accepted `[@$!%*?&]`, which rejected iOS
+//     Suggested Strong Password output and any common keyboard symbol
+//     mobile users reach for first like `.`, `,`, `-`). The character set
+//     is now consistent with the client-side validation, eliminating the
+//     "client says Strong → server rejects WEAK_PASSWORD" mismatch that
+//     was blocking mobile registrations.
+//   - The same broader password policy now applies to changePassword and
+//     the email-flow validators below, so credential rotations and resets
+//     stay consistent with sign-up.
+//   - Returned error payloads from /register now include a `field` hint
+//     (`username` | `email` | `password`) so the client can highlight
+//     exactly which input the user must fix.
+//   - All edits below are additive or surgical. Token issuance, session
+//     storage, the Dina-side purge pipeline, security monitoring, refresh,
+//     logout, logout-all-devices and verifyToken are unchanged.
+//
 // CHANGES vs previous version (Phase 2a — account deletion):
 //   - Added deleteAccount() handler. Authenticated via JWT (user identity
 //     comes from req.user, never from the body). Requires the user's
@@ -39,6 +59,88 @@ import { emailService } from '../services/emailService';
 import { Logger } from '../utils/logger';
 
 const authLogger = new Logger('AuthController');
+
+// ============================================================================
+// INPUT NORMALISATION
+// ============================================================================
+//
+// Mobile keyboards (especially iOS) silently substitute "smart" Unicode
+// characters as the user types: ASCII `'` becomes `’`, `"` becomes `“ ”`,
+// `-` becomes `–` or `—`, `...` becomes `…`. bcrypt cares about the exact
+// byte sequence — a password the user types as `Ab1!cd-ef` on iOS gets
+// hashed differently than the same string typed on desktop, and the next
+// login fails. We normalise these out on every write/check path before
+// the value reaches bcrypt or the regex.
+//
+// Username/email are trimmed of all whitespace (a single trailing space
+// that iOS autocorrect adds to an email like "you@gmail.com " is a
+// silent registration killer otherwise).
+
+const SMART_QUOTE_SINGLE_RE = /[‘’‚‛]/g;
+const SMART_QUOTE_DOUBLE_RE = /[“”„‟]/g;
+const SMART_DASH_RE         = /[–—―−]/g;
+const HORIZONTAL_ELLIPSIS_RE = /…/g;
+
+function normalisePassword(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  return raw
+    .replace(SMART_QUOTE_SINGLE_RE, "'")
+    .replace(SMART_QUOTE_DOUBLE_RE, '"')
+    .replace(SMART_DASH_RE, '-')
+    .replace(HORIZONTAL_ELLIPSIS_RE, '...');
+}
+
+function normaliseUsername(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  // Strip ALL internal whitespace — usernames have never been allowed to
+  // contain spaces and iOS's auto-period-after-double-space can sneak one
+  // in just before the field loses focus.
+  return raw.replace(/\s+/g, '').slice(0, 64);
+}
+
+function normaliseEmail(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  // Trim, drop interior whitespace (autocorrect dust), bound the length.
+  // We do NOT lower-case here — the SQL collation handles case-insensitivity
+  // and preserving the case the user picked feels more honest.
+  return raw.trim().replace(/\s+/g, '').slice(0, 254);
+}
+
+// ============================================================================
+// PASSWORD POLICY (single source of truth — used by register + changePassword)
+// ============================================================================
+//
+// Rules:
+//   - 8–128 chars (upper bound stops pathological inputs reaching bcrypt)
+//   - At least one lowercase, uppercase, digit, AND non-alphanumeric.
+//
+// We deliberately accept ANY non-alphanumeric, non-whitespace byte as the
+// "special character". The previous narrow set `[@$!%*?&]` rejected:
+//   - iOS Suggested Strong Password (which uses hyphens),
+//   - mobile users hitting `,` or `.` on the main keyboard,
+//   - everyday users picking `_`, `#`, `^`, `(`, etc.
+// The client validation in client/src/components/intake/RegistrationStep.tsx
+// uses the same rule — keep these two in sync.
+
+const REGISTRATION_PASSWORD_MIN = 8;
+const REGISTRATION_PASSWORD_MAX = 128;
+
+function passwordMeetsPolicy(pw: string): boolean {
+  if (typeof pw !== 'string') return false;
+  if (pw.length < REGISTRATION_PASSWORD_MIN) return false;
+  if (pw.length > REGISTRATION_PASSWORD_MAX) return false;
+  if (!/[a-z]/.test(pw)) return false;
+  if (!/[A-Z]/.test(pw)) return false;
+  if (!/\d/.test(pw)) return false;
+  if (!/[^A-Za-z0-9\s]/.test(pw)) return false;
+  return true;
+}
+
+// RFC-5322-lite email regex. Good enough to reject obvious garbage without
+// false negatives on real addresses; verification clicks are the
+// authoritative check. Hoisted here (instead of next to changeEmail) so
+// registerUser can use it without relying on const-hoisting subtleties.
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // JWT Payload interface
 interface JWTPayload {
@@ -319,21 +421,58 @@ export const registerUser: RequestHandler = async (req, res) => {
   console.log('[REGISTRATION] Starting registration process');
 
   try {
-    const { username, email, password, deviceFingerprint } = req.body ?? {};
+    const body = (req.body ?? {}) as {
+      username?: unknown;
+      email?: unknown;
+      password?: unknown;
+      deviceFingerprint?: unknown;
+    };
+
+    // Normalise BEFORE any validation so the value we check is the same
+    // value we hash. Without this, a trailing autocorrect space or a
+    // smart-quote in the password passes regex on one keyboard and fails
+    // on another.
+    const username = normaliseUsername(body.username);
+    const email = normaliseEmail(body.email);
+    const password = normalisePassword(body.password);
+    const deviceFingerprint = typeof body.deviceFingerprint === 'string'
+      ? body.deviceFingerprint
+      : undefined;
 
     if (!username || !email || !password) {
+      // Report which specific field is missing so the client can highlight it.
+      const missing = !username ? 'username' : !email ? 'email' : 'password';
       res.status(400).json({
         error: 'All fields are required.',
-        code: 'MISSING_FIELDS'
+        code: 'MISSING_FIELDS',
+        field: missing,
       });
       return;
     }
 
-    if (typeof password !== 'string' || password.length < 8 ||
-        !/(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])/.test(password)) {
+    if (username.length < 3 || username.length > 20 || !/^[a-zA-Z0-9_]+$/.test(username)) {
       res.status(400).json({
-        error: 'Password must be at least 8 characters with uppercase, lowercase, number, and special character.',
-        code: 'WEAK_PASSWORD'
+        error: 'Username must be 3–20 characters, letters, numbers and underscores only.',
+        code: 'INVALID_USERNAME',
+        field: 'username',
+      });
+      return;
+    }
+
+    if (!EMAIL_RE.test(email) || email.length > 254) {
+      res.status(400).json({
+        error: 'Please enter a valid email address.',
+        code: 'INVALID_EMAIL',
+        field: 'email',
+      });
+      return;
+    }
+
+    if (!passwordMeetsPolicy(password)) {
+      res.status(400).json({
+        error: 'Password must be 8–128 characters and include uppercase, lowercase, a number, and one symbol.',
+        code: 'WEAK_PASSWORD',
+        field: 'password',
       });
       return;
     }
@@ -425,8 +564,31 @@ export const registerUser: RequestHandler = async (req, res) => {
       authLogger.warn('activity_logs insert failed', { err: (logErr as Error).message });
     }
 
+    // Map createUserInDB() domain errors back to specific HTTP responses
+    // with field hints so the client can highlight exactly which input
+    // to fix.
     if (error.message === 'EMAIL_ALREADY_REGISTERED') {
-      res.status(409).json({ error: 'Email already registered.', code: 'EMAIL_EXISTS' });
+      res.status(409).json({
+        error: 'That email is already registered. Try signing in instead.',
+        code: 'EMAIL_EXISTS',
+        field: 'email',
+      });
+      return;
+    }
+    if (error.message === 'USERNAME_TAKEN') {
+      res.status(409).json({
+        error: 'That username is taken. Please pick another.',
+        code: 'USERNAME_TAKEN',
+        field: 'username',
+      });
+      return;
+    }
+    if (error.message === 'DISPOSABLE_EMAIL') {
+      res.status(400).json({
+        error: 'Disposable email addresses are not supported. Please use your regular inbox.',
+        code: 'DISPOSABLE_EMAIL',
+        field: 'email',
+      });
       return;
     }
 
@@ -444,12 +606,41 @@ export const loginUser: RequestHandler = async (req, res) => {
   const startTime = Date.now();
 
   try {
-    const { email, password, deviceFingerprint } = req.body ?? {};
+    const body = (req.body ?? {}) as {
+      email?: unknown;
+      password?: unknown;
+      deviceFingerprint?: unknown;
+    };
+
+    // Normalise on the login path too — a user who registered on desktop
+    // (ASCII password) and now signs in on iOS would otherwise have their
+    // password silently smart-quoted by iOS's keyboard before submission.
+    // The stored hash is of the normalised form (registerUser sees to that),
+    // so we normalise here on the way in.
+    const email = normaliseEmail(body.email);
+    const password = normalisePassword(body.password);
+    const deviceFingerprint = typeof body.deviceFingerprint === 'string'
+      ? body.deviceFingerprint
+      : undefined;
 
     if (!email || !password) {
       res.status(400).json({
         error: 'Email and password are required.',
         code: 'MISSING_CREDENTIALS'
+      });
+      return;
+    }
+
+    // Hard cap BEFORE bcrypt.compare. Without this, a single request with
+    // a 100KB password can pin a CPU core grinding through bcrypt for
+    // seconds — multiply by the rate limit and you have a cheap DoS vector.
+    // 256 matches the bound used by changePassword / deleteAccount /
+    // changeEmail (MAX_PASSWORD_INPUT). Failed length check looks identical
+    // to a wrong password so it doesn't leak which side is too long.
+    if (password.length > 256 || email.length > 254) {
+      res.status(401).json({
+        error: 'Invalid credentials.',
+        code: 'INVALID_CREDENTIALS'
       });
       return;
     }
@@ -489,8 +680,28 @@ export const loginUser: RequestHandler = async (req, res) => {
       }, 'high');
     }
 
-    // Verify credentials
-    await userLogin(email, password);
+    // Verify credentials.
+    //
+    // Backward-compat fallback for password normalisation: any account that
+    // existed BEFORE the registration path started normalising iOS smart
+    // quotes / dashes may have a stored hash of the raw (un-normalised) PW.
+    // If the normalised compare fails, we retry once with the raw body
+    // password before declaring the credential invalid. This keeps existing
+    // users from being locked out by the policy change.
+    const rawPassword = typeof body.password === 'string' ? body.password : '';
+    try {
+      await userLogin(email, password);
+    } catch (firstErr) {
+      if (rawPassword && rawPassword !== password) {
+        try {
+          await userLogin(email, rawPassword);
+        } catch {
+          throw firstErr;
+        }
+      } else {
+        throw firstErr;
+      }
+    }
 
     const sessionId = TokenManager.generateSessionId();
     await TokenManager.createSession(userInfo.id, sessionId, {
@@ -829,7 +1040,9 @@ export const deleteAccount: RequestHandler = async (req, res) => {
   }
 
   const body = (req.body || {}) as { password?: unknown; confirmation?: unknown };
-  const password = typeof body.password === 'string' ? body.password : '';
+  // Normalise iOS smart quotes/dashes so an account password set on desktop
+  // can still be re-auth'd when typing the deletion confirmation on iOS.
+  const password = normalisePassword(body.password);
   const confirmation = typeof body.confirmation === 'string' ? body.confirmation : '';
 
   if (!password) {
@@ -879,6 +1092,14 @@ export const deleteAccount: RequestHandler = async (req, res) => {
   } catch (err) {
     console.error('[DELETE ACCOUNT] bcrypt.compare threw', err);
     passwordOk = false;
+  }
+  if (!passwordOk) {
+    // Backward-compat fallback: pre-normalisation hashes may carry smart-
+    // quote/dash bytes from iOS. Retry once with the raw input.
+    const rawPassword = typeof body.password === 'string' ? body.password : '';
+    if (rawPassword && rawPassword !== password) {
+      try { passwordOk = await bcrypt.compare(rawPassword, storedHash || ''); } catch { passwordOk = false; }
+    }
   }
 
   if (!passwordOk) {
@@ -962,21 +1183,25 @@ export const deleteAccount: RequestHandler = async (req, res) => {
 // then the change lives in pending_email_changes (see migration 013).
 // ----------------------------------------------------------------------------
 
-// Same rule enforced by registerUser(): >=8 chars, with lower/upper/digit/special.
-const PASSWORD_POLICY = /(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])/;
+// Credential-rotation paths delegate to the unified passwordMeetsPolicy()
+// helper defined at the top of this file so register / change-password
+// always accept the same character set.
+// MAX_PASSWORD_INPUT (256) here is the hard bound for re-auth strings
+// passed to bcrypt.compare (which would otherwise grind on huge inputs);
+// the policy-bound 128 still applies for NEW passwords being set.
 const PASSWORD_SALT_ROUNDS = 10; // matches SALT_ROUNDS in userController
 const MAX_PASSWORD_INPUT = 256;  // hard bound before bcrypt.compare/hash
 
 function isStrongPassword(pw: unknown): pw is string {
-  return typeof pw === 'string'
-    && pw.length >= 8
-    && pw.length <= MAX_PASSWORD_INPUT
-    && PASSWORD_POLICY.test(pw);
+  if (typeof pw !== 'string') return false;
+  // Normalise iOS smart-quote/dash characters here too — change-password
+  // is the most common path through which they leak in after registration.
+  return passwordMeetsPolicy(normalisePassword(pw));
 }
 
-// RFC-5322-lite: good enough to reject obvious garbage without false negatives
-// on real addresses. The authoritative check is the verification click.
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// EMAIL_RE is now defined at the top of this file alongside the password
+// helpers so registerUser() can use the same regex. Re-declaring here would
+// shadow it; we leave the canonical definition above.
 const EMAIL_CHANGE_TOKEN_BYTES = 32;          // -> 64 hex chars (CHAR(64))
 const EMAIL_CHANGE_EXPIRY_HOURS = 24;
 const EMAIL_CHANGE_RESEND_COOLDOWN_MS = 60_000; // 1 min between requests
@@ -1005,10 +1230,14 @@ export const changePassword: RequestHandler = async (req, res) => {
 
   const body = (req.body || {}) as { currentPassword?: unknown; oldPassword?: unknown; newPassword?: unknown };
   // Accept either `currentPassword` (canonical) or `oldPassword` (legacy client).
-  const currentPassword = typeof body.currentPassword === 'string'
-    ? body.currentPassword
-    : typeof body.oldPassword === 'string' ? body.oldPassword : '';
-  const newPassword = typeof body.newPassword === 'string' ? body.newPassword : '';
+  // Normalise both inputs so iOS smart quotes / dashes don't desync from the
+  // hash stored during registration (which is of the normalised form).
+  const currentPassword = normalisePassword(
+    typeof body.currentPassword === 'string'
+      ? body.currentPassword
+      : typeof body.oldPassword === 'string' ? body.oldPassword : ''
+  );
+  const newPassword = normalisePassword(body.newPassword);
 
   if (!currentPassword || !newPassword) {
     res.status(400).json({ error: 'Current and new password are required.', code: 'MISSING_FIELDS' });
@@ -1047,6 +1276,16 @@ export const changePassword: RequestHandler = async (req, res) => {
 
   let ok = false;
   try { ok = await bcrypt.compare(currentPassword, storedHash); } catch { ok = false; }
+  if (!ok) {
+    // Backward-compat fallback: pre-normalisation registrations stored the
+    // raw (smart-quoted) PW hash. Try the raw body once before failing.
+    const rawCurrent = typeof body.currentPassword === 'string'
+      ? body.currentPassword
+      : typeof body.oldPassword === 'string' ? body.oldPassword : '';
+    if (rawCurrent && rawCurrent !== currentPassword) {
+      try { ok = await bcrypt.compare(rawCurrent, storedHash); } catch { ok = false; }
+    }
+  }
   if (!ok) {
     await SecurityMonitor.logSecurityEvent(userId, 'password_change_failed', {
       reason: 'bad_current_password', ipAddress: clientIp(req), userAgent: req.headers['user-agent'] || 'Unknown',
@@ -1103,10 +1342,13 @@ export const changeEmail: RequestHandler = async (req, res) => {
 
   const body = (req.body || {}) as { newEmail?: unknown; currentPassword?: unknown; password?: unknown };
   const newEmailRaw = typeof body.newEmail === 'string' ? body.newEmail : '';
-  const currentPassword = typeof body.currentPassword === 'string'
-    ? body.currentPassword
-    : typeof body.password === 'string' ? body.password : '';
-  const newEmail = newEmailRaw.trim().toLowerCase();
+  // Normalise so iOS smart quotes don't break the re-auth bcrypt.compare.
+  const currentPassword = normalisePassword(
+    typeof body.currentPassword === 'string'
+      ? body.currentPassword
+      : typeof body.password === 'string' ? body.password : ''
+  );
+  const newEmail = normaliseEmail(newEmailRaw).toLowerCase();
 
   if (!newEmail || !currentPassword) {
     res.status(400).json({ error: 'New email and current password are required.', code: 'MISSING_FIELDS' });
@@ -1143,6 +1385,15 @@ export const changeEmail: RequestHandler = async (req, res) => {
 
   let ok = false;
   try { ok = await bcrypt.compare(currentPassword, storedHash); } catch { ok = false; }
+  if (!ok) {
+    // Backward-compat fallback for pre-normalisation password hashes.
+    const rawCurrent = typeof body.currentPassword === 'string'
+      ? body.currentPassword
+      : typeof body.password === 'string' ? body.password : '';
+    if (rawCurrent && rawCurrent !== currentPassword) {
+      try { ok = await bcrypt.compare(rawCurrent, storedHash); } catch { ok = false; }
+    }
+  }
   if (!ok) {
     await SecurityMonitor.logSecurityEvent(userId, 'email_change_failed', {
       reason: 'bad_current_password', ipAddress: clientIp(req), userAgent: req.headers['user-agent'] || 'Unknown',
