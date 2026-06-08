@@ -1,5 +1,17 @@
 // routes/auth.ts
 //
+// CHANGES vs previous version (Phase 2b — mobile registration hardening):
+//   - POST /register is now IP-rate-limited (5 registrations per 15 min
+//     per IP). The endpoint is unauthenticated so AuthMiddleware.rateLimit
+//     falls through to `req.ip` as the identifier — which is why this
+//     server REQUIRES `app.set('trust proxy', ...)` to be configured for
+//     the deployment topology (Apache → Node), otherwise every request
+//     looks like it came from 127.0.0.1 and the limit becomes a global
+//     5-per-15-min cap. See index.ts: app.set('trust proxy', 1).
+//   - POST /login is also IP-rate-limited at a more generous 10/15 min
+//     (legitimate users mistype their password a few times; a real attack
+//     gets caught long before exhausting that budget).
+//
 // CHANGES vs Phase 2a (consent pipeline):
 //   - Added POST /accept-terms (authenticated) — records the user's
 //     acceptance of a legal document version into user_consent.
@@ -55,8 +67,23 @@ const router = express.Router();
 // ----------------------------------------------------------------------------
 // Core auth
 // ----------------------------------------------------------------------------
-router.post('/register', registerUser);
-router.post('/login', loginUser);
+//
+// Rate limits on the unauthenticated entry points. AuthMiddleware.rateLimit
+// uses req.user.id when present and falls back to req.securityContext?.ipAddress
+// then req.ip — for these routes there's no req.user, so the identifier is the
+// IP. A burst of 5 registrations per 15-minute window from one IP covers a
+// family on the same NAT (rare for registration) but stops scripted spam dead.
+// Login gets 10 per 15-min to absorb honest mistypes.
+//
+// CRITICAL: requires Express `trust proxy` to be set correctly upstream of
+// this router (Apache → Node behind reverse proxy). Without it, req.ip
+// collapses to 127.0.0.1 for every request and the limit becomes a global
+// cap instead of a per-IP one. See mirror-server/index.ts.
+const REGISTER_RATE = AuthMiddleware.rateLimit(5, 15 * 60 * 1000) as express.RequestHandler;
+const LOGIN_RATE    = AuthMiddleware.rateLimit(10, 15 * 60 * 1000) as express.RequestHandler;
+
+router.post('/register', REGISTER_RATE, registerUser);
+router.post('/login', LOGIN_RATE, loginUser);
 router.post('/refresh', refreshToken);
 router.get('/verify', verifyToken);
 router.post('/logout', logoutUser);

@@ -206,6 +206,25 @@ console.log(`[STARTUP] Paywall system initialized (provider: ${paywallConfig.pro
 const APP = express();
 
 // ============================================================================
+// TRUST PROXY (must be set BEFORE any middleware that looks at req.ip)
+// ============================================================================
+//
+// This server runs behind Apache (mod_proxy → Node). Without this setting,
+// Express's `req.ip` resolves to 127.0.0.1 for every request and the
+// IP-based rate limiter on /register and /login degrades into a global
+// cap shared by every visitor — making a few legitimate users on the
+// same minute block everyone else.
+//
+// `trust proxy` value of 1 trusts the FIRST proxy hop (Apache). If the
+// topology grows (e.g. a CDN in front of Apache), bump this to the
+// number of trusted hops so X-Forwarded-For is parsed correctly without
+// trusting headers from untrusted intermediaries.
+//
+// We also respect an env override so a multi-CDN environment can bump
+// the hop count without a code change.
+APP.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS || 1));
+
+// ============================================================================
 // SECURITY MIDDLEWARE (Applied BEFORE routes)
 // ============================================================================
 

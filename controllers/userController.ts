@@ -1,5 +1,22 @@
 // controllers/userController.ts
 //
+// CHANGES vs previous version (Phase 2b — mobile registration hardening):
+//   - createUserInDB() now enforces case-insensitive uniqueness on BOTH
+//     username and email. The previous version only checked email, so
+//     "gabriel" and "Gabriel" could coexist as separate accounts (which
+//     breaks @mention routing in groups + chat) and a user who registers
+//     "Gabriel" can later log in with "gabriel" only because the SQL
+//     collation happens to be ci. We normalise email to lower-case at
+//     write time so any future collation swap doesn't introduce ghost
+//     duplicates either.
+//   - A disposable-email guard rejects the most common throw-away mailbox
+//     providers up front. Account recovery to a 10-minute mailbox is a
+//     security nightmare; better to fail at sign-up than at password-
+//     reset time.
+//   - Distinct error codes (EMAIL_ALREADY_REGISTERED, USERNAME_TAKEN,
+//     DISPOSABLE_EMAIL) so authController can return the right `field`
+//     hint and the client can highlight the right input.
+//
 // CHANGES vs previous version (Phase 2a — account deletion hardening):
 //   - deleteUserFromDB is now transactional and explicitly purges every
 //     dependent table BEFORE deleting the users row. The previous version
@@ -51,25 +68,120 @@ const basePath = path.join(process.env.MIRRORSTORAGE!);
 const storagePath = path.join(basePath, 'users');
 const SALT_ROUNDS = 10;
 
+// ============================================================================
+// DISPOSABLE-EMAIL BLOCKLIST
+// ============================================================================
+//
+// The point isn't to be exhaustive — disposable-mail providers churn faster
+// than any list can keep up with — but to reject the top half-dozen that
+// account for the vast majority of real-world throwaway sign-ups. Recovery
+// to one of these is a permanent lock-out the moment the inbox expires.
+//
+// Add new domains here as we see them in support tickets. Keep the list
+// short and high-confidence; false positives on a legitimate domain hurt
+// far more than a few extra disposable accounts slipping through.
+const DISPOSABLE_EMAIL_DOMAINS = new Set<string>([
+  'mailinator.com',
+  'guerrillamail.com',
+  'guerrillamail.net',
+  'guerrillamail.org',
+  'guerrillamail.biz',
+  'sharklasers.com',
+  '10minutemail.com',
+  '10minutemail.net',
+  'tempmail.com',
+  'temp-mail.org',
+  'temp-mail.io',
+  'throwawaymail.com',
+  'getairmail.com',
+  'yopmail.com',
+  'maildrop.cc',
+  'dispostable.com',
+  'fakeinbox.com',
+  'trashmail.com',
+  'mintemail.com',
+  'mytemp.email',
+  'mvrht.net',
+  'spam4.me',
+  'mohmal.com',
+  'inboxbear.com',
+  'tempinbox.com',
+]);
+
+function emailDomain(email: string): string {
+  const at = email.lastIndexOf('@');
+  if (at < 0 || at === email.length - 1) return '';
+  return email.slice(at + 1).toLowerCase();
+}
+
+function isDisposableEmail(email: string): boolean {
+  return DISPOSABLE_EMAIL_DOMAINS.has(emailDomain(email));
+}
+
 // === CORE LOGIC FUNCTIONS ===
 
 export async function createUserInDB(username: string, email: string, password: string): Promise<number> {
   console.log(`[CreateUserInDb()]: Attempting to create account for ${username}`);
 
-  const [existing] = await DB.query('SELECT id FROM users WHERE email=?', [email]);
-  if ((existing as any[]).length > 0) {
+  // Canonical form: lower-case email at the storage boundary so a future
+  // collation swap (or a row inserted via a tool that bypasses authController
+  // normalisation) can't introduce a ghost duplicate. Username keeps its
+  // case for display but is uniqueness-checked with LOWER().
+  const canonicalEmail = email.trim().toLowerCase();
+  const trimmedUsername = username.trim();
+
+  // Disposable-email guard. Cheap to evaluate, expensive to discover at
+  // password-recovery time.
+  if (isDisposableEmail(canonicalEmail)) {
+    throw new Error('DISPOSABLE_EMAIL');
+  }
+
+  // Email uniqueness — explicit LOWER() so it's collation-independent.
+  const [emailExisting] = await DB.query(
+    'SELECT id FROM users WHERE LOWER(email) = ?',
+    [canonicalEmail]
+  );
+  if ((emailExisting as any[]).length > 0) {
     throw new Error('EMAIL_ALREADY_REGISTERED');
+  }
+
+  // Username uniqueness — case-insensitive. The previous implementation
+  // skipped this check entirely, so "gabriel" and "Gabriel" could become
+  // separate accounts that confuse every downstream system that displays
+  // a username (groups, chat mentions, TruthStream attribution).
+  const [usernameExisting] = await DB.query(
+    'SELECT id FROM users WHERE LOWER(username) = ?',
+    [trimmedUsername.toLowerCase()]
+  );
+  if ((usernameExisting as any[]).length > 0) {
+    throw new Error('USERNAME_TAKEN');
   }
 
   const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
 
-  const [result] = await DB.query<ResultSetHeader>(
-    'INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)',
-    [username, email, hashedPassword]
-  )
-	
-  // Get the inserted user ID
-  const userId = result.insertId;
+  let userId: number;
+  try {
+    const [result] = await DB.query<ResultSetHeader>(
+      'INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)',
+      [trimmedUsername, canonicalEmail, hashedPassword]
+    );
+    userId = result.insertId;
+  } catch (err: any) {
+    // Race between the SELECT uniqueness check and the INSERT — another
+    // request could have grabbed the email/username in the gap. MySQL's
+    // unique-constraint error surfaces as ER_DUP_ENTRY; translate it back
+    // into the same domain errors so authController can re-route the
+    // user to the right "already taken" message.
+    if (err?.code === 'ER_DUP_ENTRY' || err?.errno === 1062) {
+      const msg = String(err?.sqlMessage || err?.message || '').toLowerCase();
+      if (msg.includes('email')) throw new Error('EMAIL_ALREADY_REGISTERED');
+      if (msg.includes('username')) throw new Error('USERNAME_TAKEN');
+      // Unknown unique constraint — surface as a generic duplicate so the
+      // user can try a different value rather than seeing a 500.
+      throw new Error('EMAIL_ALREADY_REGISTERED');
+    }
+    throw err;
+  }
   console.log(`[New user created with] -> ID:${userId}`);
 
   // Create user directories and keys
