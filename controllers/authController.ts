@@ -61,6 +61,32 @@ import { Logger } from '../utils/logger';
 const authLogger = new Logger('AuthController');
 
 // ============================================================================
+// TIMING-EQUALISATION DUMMY HASH
+// ============================================================================
+//
+// loginUser previously short-circuited with a single ~5ms DB-miss when the
+// supplied email didn't exist, but spent ~100ms on bcrypt.compare when it
+// did. An attacker measuring the round-trip can use that delta to enumerate
+// which addresses have accounts (a known oracle in OWASP's authentication
+// cheat sheet).
+//
+// We precompute one bcrypt hash at the same cost factor the column uses and
+// always run a bcrypt.compare against it in the user-not-found failure
+// path, so both branches take the same wall-clock time. The hash itself is
+// derived from a random module-load secret — never used as a real password,
+// never persisted.
+const DUMMY_HASH_PROMISE: Promise<string> = bcrypt.hash(
+  crypto.randomBytes(32).toString('hex'),
+  10
+);
+DUMMY_HASH_PROMISE.catch((err) => {
+  // Surface but don't crash — bcrypt.hash failing at module load would
+  // mean the deploy is broken in deeper ways. The timing defence simply
+  // wouldn't engage in that case.
+  authLogger.warn('Dummy bcrypt hash init failed (timing defence disabled)', { err: (err as Error).message });
+});
+
+// ============================================================================
 // INPUT NORMALISATION
 // ============================================================================
 //
@@ -715,6 +741,29 @@ export const loginUser: RequestHandler = async (req, res) => {
       id: userInfo.id, sessionId
     });
 
+    // Fire-and-forget new-device notification when this login looks like
+    // it came from a previously-unseen IP or User-Agent. Best effort: a
+    // queue / template / SMTP failure must never block the user's response.
+    // We deliberately do NOT await — the response goes out immediately and
+    // the email is dispatched in the background.
+    if (isSuspicious) {
+      const appUrl = (process.env.APP_URL || 'https://www.theundergroundrailroad.world/Mirror').replace(/\/$/, '');
+      void emailService
+        .queueEmail(userInfo.email, 'new_device_login', {
+          username: userInfo.username || 'there',
+          loginTime: new Date().toUTCString(),
+          ipAddress,
+          userAgent: typeof userAgent === 'string' ? userAgent.slice(0, 200) : 'unknown',
+          resetPasswordUrl: `${appUrl}/forgot-password`,
+        })
+        .catch((err) =>
+          authLogger.warn('new_device_login email dispatch failed (non-fatal)', {
+            userId: userInfo.id,
+            err: (err as Error).message,
+          })
+        );
+    }
+
     await SecurityMonitor.logSecurityEvent(userInfo.id, 'successful_login', {
       ipAddress, userAgent, deviceFingerprint,
       loginTime: Date.now() - startTime,
@@ -754,6 +803,24 @@ export const loginUser: RequestHandler = async (req, res) => {
         ipAddress, userAgent, error: error.message
       }, 'medium');
     } catch (e) {
+      // ----- Timing-attack equalisation ---------------------------------
+      // The user-doesn't-exist path otherwise resolves in ~5ms while
+      // user-exists-wrong-password takes ~100ms (the bcrypt round on the
+      // real hash). That delta is a known account-enumeration oracle.
+      // Run one bcrypt.compare against the precomputed dummy hash so
+      // both paths take the same wall-clock time.
+      try {
+        const probe = typeof req.body?.password === 'string'
+          ? req.body.password
+          : 'x';
+        const dummy = await DUMMY_HASH_PROMISE;
+        await bcrypt.compare(probe, dummy);
+      } catch {
+        // If even the dummy compare can't run we still want to fall
+        // through to the response — better to leak a tiny timing diff
+        // than to 500 on a failed login.
+      }
+
       try {
         await DB.query(
           `INSERT INTO activity_logs (user_id, action, metadata, risk_level, created_at)
