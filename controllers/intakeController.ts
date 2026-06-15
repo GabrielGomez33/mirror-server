@@ -13,6 +13,7 @@ import {
   TierType,
 } from './directoryController';
 import { v4 as uuidv4 } from 'uuid';
+import { recordIqNormSample } from './iqNormsController';
 
 // ============================================================================
 // TYPES FOR INTAKE DATA WITH FILE REFERENCES
@@ -86,6 +87,7 @@ interface IntakeDataStructure {
     category: string;
     strengths: string[];
     description: string;
+    itemSetVersion?: string;
   };
   iqAnswers?: Record<string, string>;
 
@@ -715,6 +717,14 @@ export const storeIntakeDataHandler: RequestHandler = async (req, res) => {
 
     // Mark user's intake as completed so auth endpoints return intakeCompleted: true
     await DB.query('UPDATE users SET intake_completed = TRUE WHERE id = ?', [uidNum]);
+
+    // Record a de-identified IQ self-norm sample (first attempt only, scored
+    // server-side). Best-effort: never allowed to fail the intake submission.
+    // age_years is left null in v1 (pooled norm); birth date is not part of the
+    // stored intake payload yet, so age-banded norms come later.
+    if (intakeData.iqResults || intakeData.iqAnswers) {
+      await recordIqNormSample(uidNum, intakeData.iqResults, intakeData.iqAnswers, null);
+    }
 
     res.json({
       success: true,
