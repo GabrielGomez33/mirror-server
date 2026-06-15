@@ -8,6 +8,7 @@ import {
   listUserIntakesHandler,
   getLatestIntakeHandler
 } from '../controllers/intakeController';
+import { getIqNormsHandler } from '../controllers/iqNormsController';
 
 const router = express.Router();
 
@@ -39,5 +40,11 @@ router.get('/list/:userId', listUserIntakesHandler);
  * GET /api/intake/latest/:userId
  */
 router.get('/latest/:userId', getLatestIntakeHandler);
+
+/**
+ * Get IQ self-norm percentile for a raw score, relative to other Mirror users
+ * GET /api/intake/iq/norms?rawScore=&itemSetVersion=&age=
+ */
+router.get('/iq/norms', getIqNormsHandler);
 
 export default router;
