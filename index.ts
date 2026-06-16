@@ -1,6 +1,8 @@
 // index.ts - Mirror Server with MirrorGroups Phase 3.5 Integration + @Dina Chat + TruthStream + Paywall
 // Includes: Existing routes, Redis, Notifications, Encryption, Group APIs, WebSocket signaling, Group Analysis, DINA LLM, @Dina Chat, TruthStream, Subscription/Paywall
 // UPDATED: Added Paywall system with PayPal subscriptions, email service, subscription routes
+// UPDATED (Goal #1): Added User Feedback & Support endpoints under /mirror/api/feedback
+//   — All additions are marked with `// === GOAL #1 ===` so the diff is auditable.
 
 import https from 'https';
 import fs from 'fs';
@@ -61,6 +63,11 @@ import truthstreamRoutes from './routes/truthstream';
 // PERSONAL ANALYSIS (MyMirror Comprehensive Reports)
 // ============================================================================
 import personalAnalysisRouter from './routes/personalAnalysis';
+
+// === GOAL #1 === ============================================================
+// USER FEEDBACK & SUPPORT (rating / issue / recommendation / contact)
+// ============================================================================
+import feedbackRoutes from './routes/feedback';
 
 // ============================================================================
 // MIRRORGROUPS PHASE 3 (Group Analysis System)
@@ -393,6 +400,19 @@ console.log('[ROUTES] TruthStream routes mounted at /mirror/api/truthstream');
 APP.use('/mirror/api/personal-analysis', AuthMiddleware.subscriptionGate as express.RequestHandler, personalAnalysisRouter);
 console.log('[ROUTES] Personal Analysis routes mounted at /mirror/api/personal-analysis');
 
+// === GOAL #1 === ============================================================
+// MOUNT FEEDBACK & SUPPORT ROUTES
+// ----------------------------------------------------------------------------
+// Intentionally NOT subscription-gated — every user must always be able to
+// reach customer service, regardless of plan. verifyToken is sufficient.
+// ============================================================================
+
+APP.use('/mirror/api/feedback',
+  AuthMiddleware.verifyToken as express.RequestHandler,
+  feedbackRoutes
+);
+console.log('[ROUTES] Feedback routes mounted at /mirror/api/feedback');
+
 // ============================================================================
 // MOUNT SUBSCRIPTION ROUTES (Paywall)
 // ============================================================================
@@ -423,7 +443,7 @@ APP.get('/mirror/api/health', async (req, res) => {
     status: 'healthy',
     service: 'mirror-server',
     timestamp: new Date().toISOString(),
-    version: '4.0.0', // Bumped for paywall system
+    version: '4.1.0', // Bumped for feedback module
     features: {
       authentication: 'enabled',
       paywall: paywallConfig.provider ? 'enabled' : 'disabled',
@@ -437,6 +457,7 @@ APP.get('/mirror/api/health', async (req, res) => {
       dinaIntegration: 'enabled',
       llmSynthesis: 'enabled',
       truthstream: 'enabled',
+      feedback: 'enabled', // === GOAL #1 ===
       dinaChatProcessor: 'separate_process', // Runs via PM2/systemd
       websocket: wsHealth.status,
       security: {
@@ -534,6 +555,7 @@ APP.get('/mirror/api/health', async (req, res) => {
       sessions: '/mirror/api/groups/:groupId/sessions/:sessionId',
       chat: '/mirror/api/groups/:groupId/chat',
       truthstream: '/mirror/api/truthstream/*',
+      feedback: '/mirror/api/feedback/*', // === GOAL #1 ===
       subscription: '/mirror/api/subscription',
       paywallWebhooks: paywallConfig.webhookPath,
       websocket: 'wss://theundergroundrailroad.world:8444/mirror/groups/ws',
@@ -912,6 +934,7 @@ async function startServer(): Promise<void> {
       console.log(`  Paywall: ${paywallConfig.provider} (${paywallConfig.mode})`);
       console.log(`  PayPal: ${paypalProvider ? 'configured' : 'not configured'}`);
       console.log(`  Email: ${emailService.isEnabled() ? 'enabled' : 'disabled'}`);
+      console.log(`  Feedback: enabled`); // === GOAL #1 ===
       console.log(`  DINA WS: ${dinaWebSocket.connected ? 'CONNECTED' : 'DISCONNECTED (will retry)'}`);
       console.log(`  Model: ${process.env.DEFAULT_MODEL || 'mistral:7b'}`);
       console.log('='.repeat(70));
