@@ -4,6 +4,12 @@
 # This file configures the paywall module for any Express-based application.
 # Copy this file to .payenv and fill in your values.
 # NEVER commit .payenv to version control — add it to .gitignore.
+#
+# NOTE (Goal #1 alignment): the Premium tier's `features` array below uses the
+# singular key `create_group`, matching PAYWALL_GATES and the entire front end.
+# (Previously this single token read `create_groups`.) This is a non-breaking
+# alignment — gating is decided by tier, not by this list — but it removes a
+# latent inconsistency. See ../README.md §4.
 # ============================================================================
 
 # === PROVIDER CONFIGURATION ===
@@ -35,7 +41,7 @@ PAYWALL_PRODUCT_NAME=Mirror Premium
 #   paypal_plan_id: PayPal billing plan ID (created via setup script or API)
 #   trial_days: number of trial days (0 for no trial)
 #   features: array of feature keys this tier grants access to
-PAYWALL_TIERS=[{"id":"free","name":"Free","price":0,"features":["basic_intake","limited_journal","join_one_group","give_reviews","basic_dashboard","group_chat","basic_insights"]},{"id":"premium","name":"Premium","price":9.99,"paypal_plan_id":"","trial_days":7,"features":["full_intake","unlimited_journal","journal_analysis","personal_analysis","create_groups","unlimited_groups","group_insights","receive_reviews","truth_mirror_report","dina_unlimited","data_export","basic_intake","limited_journal","join_one_group","give_reviews","basic_dashboard","group_chat","basic_insights"]},{"id":"enterprise","name":"Enterprise","price":0,"paypal_plan_id":"","trial_days":0,"features":[]}]
+PAYWALL_TIERS=[{"id":"free","name":"Free","price":0,"features":["basic_intake","limited_journal","join_one_group","give_reviews","basic_dashboard","group_chat","basic_insights"]},{"id":"premium","name":"Premium","price":9.99,"paypal_plan_id":"","trial_days":7,"features":["full_intake","unlimited_journal","journal_analysis","personal_analysis","create_group","unlimited_groups","group_insights","receive_reviews","truth_mirror_report","dina_unlimited","data_export","basic_intake","limited_journal","join_one_group","give_reviews","basic_dashboard","group_chat","basic_insights"]},{"id":"enterprise","name":"Enterprise","price":0,"paypal_plan_id":"","trial_days":0,"features":[]}]
 
 # === FEATURE GATING ===
 # Map feature keys to the minimum tier required.
