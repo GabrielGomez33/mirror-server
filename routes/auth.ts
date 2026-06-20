@@ -1,5 +1,12 @@
 // routes/auth.ts
 //
+// CHANGES vs previous version (live username availability):
+//   - Added POST /check-username (public, IP-rate-limited 30/min). Powers the
+//     registration form's real-time "username available / taken" indicator.
+//     Usernames are public, so this is not an enumeration concern; the limiter
+//     just protects the DB from as-you-type abuse. See
+//     controllers/availabilityController.ts.
+//
 // CHANGES vs previous version (Phase 2b — mobile registration hardening):
 //   - POST /register is now IP-rate-limited (5 registrations per 15 min
 //     per IP). The endpoint is unauthenticated so AuthMiddleware.rateLimit
@@ -46,6 +53,7 @@ import {
   changeEmail,
   confirmEmailChange,
 } from '../controllers/authController';
+import { checkUsernameAvailability } from '../controllers/availabilityController';
 import {
   sendVerificationEmail,
   verifyEmailToken,
@@ -82,12 +90,21 @@ const router = express.Router();
 const REGISTER_RATE = AuthMiddleware.rateLimit(5, 15 * 60 * 1000) as express.RequestHandler;
 const LOGIN_RATE    = AuthMiddleware.rateLimit(10, 15 * 60 * 1000) as express.RequestHandler;
 
+// Live username-availability check. Called as the user types (the client
+// debounces + aborts), so the budget is per-minute and more generous than the
+// auth entry points. Usernames are public, so the only thing being protected
+// here is the DB from abusive request volume.
+const USERNAME_CHECK_RATE = AuthMiddleware.rateLimit(30, 60 * 1000) as express.RequestHandler;
+
 router.post('/register', REGISTER_RATE, registerUser);
 router.post('/login', LOGIN_RATE, loginUser);
 router.post('/refresh', refreshToken);
 router.get('/verify', verifyToken);
 router.post('/logout', logoutUser);
 router.post('/logout-all', logoutAllDevices);
+
+// Public, rate-limited username availability check (registration UX).
+router.post('/check-username', USERNAME_CHECK_RATE, checkUsernameAvailability);
 
 // ----------------------------------------------------------------------------
 // Account deletion
