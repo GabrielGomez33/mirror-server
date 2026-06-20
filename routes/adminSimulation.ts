@@ -17,6 +17,10 @@
 //   GET  /intake/runs/:runId    — a single run report
 //   POST /intake/cleanup        — sweep orphaned simulation users.
 //                                 Body: { maxAgeMinutes? }
+//   GET    /intake/users               — list kept sim users + file footprint
+//   GET    /intake/users/:id/verify    — prove a user's DB+disk footprint (R/O)
+//   POST   /intake/users/:id/reset-password — set a new password { password? }
+//   DELETE /intake/users/:id           — delete one sim user, then verify purge
 // ============================================================================
 
 import express, { Request, Response } from 'express';
@@ -28,6 +32,10 @@ import {
   simulationHealth,
   listRuns,
   getRun,
+  listSimUsers,
+  verifyUserPurged,
+  resetSimUserPassword,
+  deleteSimUser,
   SimulationBusyError,
 } from '../controllers/intakeSimulationController';
 
@@ -141,6 +149,91 @@ router.post('/intake/cleanup', async (req: Request, res: Response) => {
   } catch (err) {
     logger.error('Orphan sweep failed', err as Error);
     res.status(500).json({ success: false, error: 'Orphan sweep failed' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// TEST-USER MANAGER
+//   GET    /intake/users              — list kept sim users (+ file footprint)
+//   GET    /intake/users/:id/verify   — prove a user's DB+disk footprint (R/O)
+//   POST   /intake/users/:id/reset-password  — set a new password { password? }
+//   DELETE /intake/users/:id          — delete one sim user, then verify purge
+// Each helper re-checks the reserved-namespace guard server-side, so none of
+// these can act on a real account.
+// ---------------------------------------------------------------------------
+
+// Parse a positive integer :id, or send a 400 and return null.
+function parseUserId(req: Request, res: Response): number | null {
+  const id = parseInt(String(req.params.id), 10);
+  if (!Number.isInteger(id) || id <= 0) {
+    res.status(400).json({ success: false, error: 'Invalid user id' });
+    return null;
+  }
+  return id;
+}
+
+router.get('/intake/users', async (req: Request, res: Response) => {
+  try {
+    const users = await listSimUsers();
+    audit('users_listed', req, { count: users.length });
+    res.json({ success: true, data: users });
+  } catch (err) {
+    logger.error('Failed to list sim users', err as Error);
+    res.status(500).json({ success: false, error: 'Failed to list test users' });
+  }
+});
+
+router.get('/intake/users/:id/verify', async (req: Request, res: Response) => {
+  const id = parseUserId(req, res);
+  if (id === null) return;
+  try {
+    const verification = await verifyUserPurged(id);
+    audit('user_verified', req, { userId: id, clean: verification.clean, residue: verification.dbResidue.length, scanned: verification.dbTablesScanned });
+    res.json({ success: true, data: verification });
+  } catch (err) {
+    logger.error('Failed to verify sim user', err as Error);
+    res.status(500).json({ success: false, error: 'Failed to verify test user' });
+  }
+});
+
+router.post('/intake/users/:id/reset-password', async (req: Request, res: Response) => {
+  const id = parseUserId(req, res);
+  if (id === null) return;
+  const password =
+    typeof req.body?.password === 'string' && req.body.password.length > 0 ? req.body.password : undefined;
+  audit('user_password_reset', req, { userId: id, customPassword: !!password });
+  try {
+    const credentials = await resetSimUserPassword(id, password);
+    res.json({ success: true, data: credentials });
+  } catch (err) {
+    const msg = (err as Error).message || 'Failed to reset password';
+    const safety = /safety stop|not a simulation user|not found/i.test(msg);
+    logger.error('Failed to reset sim user password', err as Error);
+    res.status(safety ? 400 : 500).json({ success: false, error: msg });
+  }
+});
+
+router.delete('/intake/users/:id', async (req: Request, res: Response) => {
+  const id = parseUserId(req, res);
+  if (id === null) return;
+  audit('user_delete_started', req, { userId: id });
+  try {
+    const result = await deleteSimUser(id);
+    audit('user_delete_finished', req, {
+      userId: id,
+      deleted: result.deleted,
+      clean: result.verification.clean,
+      dbResidue: result.verification.dbResidue.length,
+      tablesScanned: result.verification.dbTablesScanned,
+      storageClean: result.verification.storageClean,
+      dinaNotified: result.dinaNotified,
+    });
+    res.json({ success: true, data: result });
+  } catch (err) {
+    const msg = (err as Error).message || 'Failed to delete test user';
+    const safety = /safety stop|not a simulation user/i.test(msg);
+    logger.error('Failed to delete sim user', err as Error);
+    res.status(safety ? 400 : 500).json({ success: false, error: msg });
   }
 });
 
