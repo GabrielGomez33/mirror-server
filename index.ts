@@ -111,6 +111,7 @@ import { emailService } from './services/emailService';
 // ADMIN EMAIL BROADCASTS (internal-secret gated) + public unsubscribe/webhooks
 // ============================================================================
 import adminEmailRoutes from './routes/adminEmail';
+import adminSimulationRoutes from './routes/adminSimulation';
 import emailPublicRoutes from './routes/emailPublic';
 
 // ============================================================================
@@ -364,6 +365,12 @@ console.log('[ROUTES] Public email routes mounted at /mirror/api/email (unsubscr
 // gated by the internal shared secret inside the router (requireInternalSecret).
 APP.use('/mirror/api/admin/email', adminEmailRoutes);
 console.log('[ROUTES] Admin email routes mounted at /mirror/api/admin/email');
+
+// Admin intake-simulation — reached only by the admin-server over localhost,
+// gated by the internal shared secret inside the router (requireInternalSecret).
+// Runs a real end-to-end intake against a throwaway sim user, then deletes it.
+APP.use('/mirror/api/admin/simulation', adminSimulationRoutes);
+console.log('[ROUTES] Admin intake-simulation routes mounted at /mirror/api/admin/simulation');
 
 // ============================================================================
 // MOUNT MIRRORGROUPS ROUTES (PHASE 1 + PHASE 3 + PHASE 4)
