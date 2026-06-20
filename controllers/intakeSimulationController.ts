@@ -3,37 +3,51 @@
 // ============================================================================
 // File: controllers/intakeSimulationController.ts
 // ----------------------------------------------------------------------------
-// A *real* end-to-end intake simulation that exercises the production intake
-// pipeline against a throwaway, clearly-marked simulation user and then deletes
-// every trace of it. The purpose is to give operators a one-click, legitimate
-// way to confirm "is intake actually working end to end?" without manually
-// clicking through the whole front-end flow and without leaving residue.
+// A *real*, step-by-step intake simulation that mirrors the front-end intake
+// journey against a throwaway, clearly-marked simulation user and then deletes
+// every trace of it. It gives operators a one-click, legitimate way to confirm
+// "is intake actually working end to end?" without manually clicking through the
+// whole flow and without leaving residue.
 //
-// WHAT IT DOES (each is a reported step):
-//   1. register       — provisions a sim user via the SAME functions the real
-//                        /auth/register handler uses (createUserInDB -> creates
-//                        the user row + tier1/2/3 directories + encryption keys;
-//                        TokenManager session + access token). We bypass only
-//                        the HTTP /auth/register wrapper so the per-IP register
-//                        rate limit (5/15m) can't make this tool flaky, and so
-//                        no verification email is dispatched to a fake address.
-//   2. upload_photo   — REAL HTTP POST to /mirror/api/storage/store (tier1) over
-//                        loopback with the sim user's JWT (exercises routing,
-//                        multer, verifyToken, writeToTier, plaintext tier1).
-//   3. upload_voice   — REAL HTTP POST to /mirror/api/storage/store (tier2)
-//                        (exercises the encrypted-tier write path).
-//   4. submit_intake  — REAL HTTP POST to /mirror/api/intake/store (exercises
-//                        IntakeDataManager: 6 encrypted tier3 JSON files +
-//                        intake_metadata row + iq_norm_samples + intake_completed).
-//   5. verify_db      — asserts the DB side effects landed.
-//   6. verify_files   — asserts the tier1/2/3 files exist on disk.
-//   7. verify_readback— decrypts the latest intake back out and checks it round
-//                        trips (proves the tier3 encryption + metadata wiring).
-//   8. cleanup        — deletes the sim user through the EXISTING production
-//                        teardown (deleteUserFromDB: filesystem + transactional
-//                        DB cascade) and notifies Dina's mirror module purge
-//                        (so the rule "all Dina interaction flows through
-//                        src/modules/mirror" holds). Then verifies removal.
+// STEPS — these mirror the real front-end journey
+// (Registration → Visual → Vocal → IQ → Astrology → Personality → Submit →
+//  Results), with server-side verification folded in:
+//
+//   1. register     — provision a sim user via the SAME functions the real
+//                      /auth/register handler uses (createUserInDB -> user row +
+//                      tier1/2/3 directories + encryption keys; TokenManager
+//                      session + access token). We bypass only the HTTP
+//                      /auth/register wrapper so the per-IP register rate limit
+//                      can't make this tool flaky and no verification email is
+//                      sent to a fake address.
+//   2. visual       — REAL POST /mirror/api/storage/store (tier1, photo) over
+//                      loopback with the sim user's JWT, and assemble the
+//                      faceAnalysis slice. (Front-end VisualStep.)
+//   3. vocal        — REAL POST /mirror/api/storage/store (tier2, encrypted
+//                      voice) + voiceMetadata slice. (Front-end VocalStep.)
+//   4. iq           — assemble the IQ answers/results slice and exercise the
+//                      REAL GET /mirror/api/intake/iq/norms endpoint the IQStep
+//                      calls. (Front-end IQStep.)
+//   5. astrology    — assemble + validate the astrology slice. (AstroLogicalStep;
+//                      computed client-side in the real app, so this is the
+//                      data-assembly equivalent.)
+//   6. personality  — assemble + validate the personality slice. (PersonalityStep.)
+//   7. submit       — REAL POST /mirror/api/intake/store with the assembled
+//                      payload (6 encrypted tier3 JSON files + intake_metadata +
+//                      iq_norm_samples + intake_completed). (Front-end SubmitStep.)
+//   8. verify_db    — assert the DB side effects landed.
+//   9. verify_files — assert the tier1/2/3 files exist on disk.
+//  10. results      — REAL GET /mirror/api/intake/latest/:userId (decrypts the
+//                      stored intake back out and checks it round-trips). This is
+//                      the data the front-end ResultsStep renders.
+//  11. cleanup      — delete the sim user through the EXISTING production teardown
+//                      (deleteUserFromDB: filesystem + transactional DB cascade)
+//                      and notify Dina's mirror module purge, so the rule "all
+//                      Dina interaction flows through src/modules/mirror" holds.
+//                      Then verify removal.
+//
+// If any step throws, the run still tears the sim user down (best-effort) so a
+// failed run never leaves residue.
 //
 // SAFETY (this tool creates and deletes real users — it must never touch a real
 // account):
@@ -42,13 +56,11 @@
 //     TLD per RFC 2606 so no real inbox can ever collide).
 //   - Every destructive teardown re-validates that the target user matches BOTH
 //     the sim username prefix AND the sim email domain before deleting. A user
-//     that fails either check is refused — defence in depth against a bug ever
-//     pointing teardown at a real account.
+//     that fails either check is refused — defence in depth.
 //   - Every run is recorded in an additive `intake_simulation_runs` audit table
-//     (created lazily, never alters existing tables). The orphan sweeper only
-//     ever purges users it can prove are simulations.
-//   - A process-level lock serialises runs so concurrent invocations can't race
-//     on shared resources.
+//     (never alters existing tables). The orphan sweeper only ever purges users
+//     it can prove are simulations.
+//   - A process-level lock serialises runs so concurrent invocations can't race.
 //
 // This controller REUSES production code paths; it does not re-implement them.
 // ============================================================================
@@ -60,12 +72,7 @@ import { DB } from '../db';
 import { Logger } from '../utils/logger';
 import { TokenManager } from './authController';
 import { createUserInDB, deleteUserFromDB } from './userController';
-import {
-  listTierFiles,
-  DataAccessContext,
-  TierType,
-} from './directoryController';
-import { IntakeDataManager } from './intakeController';
+import { listTierFiles, TierType } from './directoryController';
 
 const logger = new Logger('IntakeSimulation');
 
@@ -252,7 +259,6 @@ function strongRandomPassword(): string {
   const core = [pick(upper), pick(lower), pick(digit), pick(special)];
   const all = upper + lower + digit + special;
   for (let i = 0; i < 20; i++) core.push(pick(all));
-  // Shuffle (Fisher–Yates with crypto randomness).
   for (let i = core.length - 1; i > 0; i--) {
     const j = crypto.randomInt(i + 1);
     [core[i], core[j]] = [core[j], core[i]];
@@ -279,7 +285,7 @@ interface SelfResponse {
 function selfRequest(
   method: string,
   path: string,
-  opts: { json?: unknown; body?: Buffer; contentType?: string; token?: string },
+  opts: { json?: unknown; body?: Buffer; contentType?: string; token?: string } = {},
 ): Promise<SelfResponse> {
   return new Promise((resolve, reject) => {
     let url: URL;
@@ -372,6 +378,29 @@ function buildMultipart(
   return { body: Buffer.concat(parts), contentType: `multipart/form-data; boundary=${boundary}` };
 }
 
+/** Upload one file to the real /storage/store endpoint and return its file ref. */
+async function uploadToStorage(
+  userId: number,
+  tier: 'tier1' | 'tier2',
+  file: { buffer: Buffer; filename: string; contentType: string },
+  token: string | undefined,
+): Promise<{ filename: string; tier: string; size: number; mimetype: string; uploadedAt: string; originalname?: string }> {
+  const mp = buildMultipart(
+    { userId: String(userId), tier, filename: file.filename },
+    { field: 'file', filename: file.filename, contentType: file.contentType, buffer: file.buffer },
+  );
+  const res = await selfRequest('POST', '/mirror/api/storage/store', { body: mp.body, contentType: mp.contentType, token });
+  if (res.status !== 200 || !res.body?.success) {
+    throw new Error(`storage/store ${tier} failed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
+  }
+  const f = res.body.files?.[0];
+  if (!f?.filename) throw new Error(`storage/store ${tier} returned no filename`);
+  return {
+    filename: f.filename, tier, size: f.size, mimetype: f.mimetype,
+    uploadedAt: res.body.timestamp || new Date().toISOString(), originalname: f.originalname,
+  };
+}
+
 // ----------------------------------------------------------------------------
 // SYNTHETIC FIXTURES — valid, compact, deterministic; no real PII
 // ----------------------------------------------------------------------------
@@ -406,7 +435,6 @@ function sampleVoice(): { buffer: Buffer; filename: string; contentType: string;
   buf.writeUInt16LE(16, 34);          // bitsPerSample
   buf.write('data', 36);
   buf.writeUInt32LE(dataLen, 40);
-  // samples left as zeroed silence
   return { buffer: buf, filename: 'sim_voice.wav', contentType: 'audio/wav', durationMs };
 }
 
@@ -429,66 +457,47 @@ const SIM_IQ_ANSWERS: Record<string, string> = {
   'iq-spat-3': 'A', 'iq-spat-5': 'Some musicians are not poets.',
 };
 
-function buildIntakeData(name: string, photoRef: any, voiceRef: any, voiceDurationMs: number): Record<string, unknown> {
-  return {
-    userLoggedIn: true,
-    name,
-    photoFileRef: photoRef,
-    voiceFileRef: voiceRef,
-    faceAnalysis: {
-      detection: { score: 0.99, box: { x: 8, y: 8, width: 96, height: 96 } },
-      landmarks: { positions: [[20, 30], [44, 30], [32, 48], [24, 62], [40, 62]] },
-      unshiftedLandmarks: {},
-      alignedRect: { x: 8, y: 8, width: 96, height: 96 },
-      angle: { roll: 1.4, pitch: -2.1, yaw: 0.7 },
-      expressions: {
-        neutral: 0.74, happy: 0.18, sad: 0.02, angry: 0.01,
-        fearful: 0.01, disgusted: 0.01, surprised: 0.03,
-      },
-    },
-    progress: {
-      lastStep: 'SubmitStep',
-      completed: true,
-      steps: {
-        VisualStep: { completed: true, data: { source: 'simulation' } },
-        VocalStep: { completed: true, data: { source: 'simulation' } },
-        IQStep: { completed: true, data: { source: 'simulation' } },
-        AstroLogicalStep: { completed: true, data: { source: 'simulation' } },
-        PersonalityStep: { completed: true, data: { source: 'simulation' } },
-      },
-    },
-    voiceMetadata: {
-      mimeType: 'audio/wav',
-      duration: voiceDurationMs,
-      size: voiceRef?.size ?? 0,
-      deviceInfo: { isMobile: false, platform: 'Desktop', browser: 'Simulation' },
-    },
-    iqResults: {
-      rawScore: 30,
-      totalQuestions: 30,
-      iqScore: 130,
-      category: 'Simulation',
-      strengths: ['logical', 'verbal'],
-      description: 'Synthetic cognitive profile generated by the intake simulation.',
-      itemSetVersion: SIM_IQ_ITEM_SET_VERSION,
-    },
-    iqAnswers: SIM_IQ_ANSWERS,
-    astrologicalResult: {
-      western: { sunSign: 'Aquarius', moonSign: 'Libra', risingSign: 'Gemini', dominantElement: 'Air' },
-      chinese: { animalSign: 'Tiger', element: 'Wood', yinYang: 'Yang' },
-      african: { orishaGuardian: 'Obatala', elementalForce: 'Air', sacredAnimal: 'Owl' },
-      numerology: { lifePathNumber: 7, destinyNumber: 3, soulUrgeNumber: 9 },
-      synthesis: { coreThemes: ['curiosity', 'balance'], lifeDirection: 'Synthesis (simulated).' },
-    },
-    personalityResult: {
-      big5Profile: { openness: 82, conscientiousness: 67, extraversion: 55, agreeableness: 71, neuroticism: 38 },
-      mbtiType: 'ENFP',
-      dominantTraits: ['Openness', 'Agreeableness'],
-      description: 'Synthetic personality profile generated by the intake simulation.',
-    },
-    personalityAnswers: { 'big5-o-1': { value: '5', score: 5 }, 'big5-c-1': { value: '4', score: 4 } },
-  };
-}
+// Per-modality slice builders (mirror the front-end step outputs).
+const buildFaceAnalysis = () => ({
+  detection: { score: 0.99, box: { x: 8, y: 8, width: 96, height: 96 } },
+  landmarks: { positions: [[20, 30], [44, 30], [32, 48], [24, 62], [40, 62]] },
+  unshiftedLandmarks: {},
+  alignedRect: { x: 8, y: 8, width: 96, height: 96 },
+  angle: { roll: 1.4, pitch: -2.1, yaw: 0.7 },
+  expressions: { neutral: 0.74, happy: 0.18, sad: 0.02, angry: 0.01, fearful: 0.01, disgusted: 0.01, surprised: 0.03 },
+});
+
+const buildVoiceMetadata = (size: number, durationMs: number) => ({
+  mimeType: 'audio/wav',
+  duration: durationMs,
+  size,
+  deviceInfo: { isMobile: false, platform: 'Desktop', browser: 'Simulation' },
+});
+
+const buildIqResults = () => ({
+  rawScore: 30,
+  totalQuestions: 30,
+  iqScore: 130,
+  category: 'Simulation',
+  strengths: ['logical', 'verbal'],
+  description: 'Synthetic cognitive profile generated by the intake simulation.',
+  itemSetVersion: SIM_IQ_ITEM_SET_VERSION,
+});
+
+const buildAstrology = () => ({
+  western: { sunSign: 'Aquarius', moonSign: 'Libra', risingSign: 'Gemini', dominantElement: 'Air' },
+  chinese: { animalSign: 'Tiger', element: 'Wood', yinYang: 'Yang' },
+  african: { orishaGuardian: 'Obatala', elementalForce: 'Air', sacredAnimal: 'Owl' },
+  numerology: { lifePathNumber: 7, destinyNumber: 3, soulUrgeNumber: 9 },
+  synthesis: { coreThemes: ['curiosity', 'balance'], lifeDirection: 'Synthesis (simulated).' },
+});
+
+const buildPersonality = () => ({
+  big5Profile: { openness: 82, conscientiousness: 67, extraversion: 55, agreeableness: 71, neuroticism: 38 },
+  mbtiType: 'ENFP',
+  dominantTraits: ['Openness', 'Agreeableness'],
+  description: 'Synthetic personality profile generated by the intake simulation.',
+});
 
 // ----------------------------------------------------------------------------
 // STEP RUNNER
@@ -568,7 +577,7 @@ async function notifyDinaPurge(userId: number, sessionId: string | undefined): P
 
 /** Fully delete a simulation user (filesystem + DB cascade + Dina purge).
  *  Refuses to act on any user that does not pass the sim-identity guard. */
-async function teardownSimUser(userId: number, sessionId: string | undefined, operator: string): Promise<{ dinaNotified: boolean; dinaDetail?: string }> {
+async function teardownSimUser(userId: number, sessionId: string | undefined): Promise<{ dinaNotified: boolean; dinaDetail?: string }> {
   // Re-load identity straight from the DB and gate on it. Never trust a caller
   // to have handed us a sim user — prove it here, immediately before deleting.
   const [rows] = await DB.query('SELECT username, email FROM users WHERE id = ?', [userId]);
@@ -585,17 +594,11 @@ async function teardownSimUser(userId: number, sessionId: string | undefined, op
   }
 
   // Local teardown is the source of truth (filesystem + transactional cascade).
-  await deleteUserFromDB(String(userId), operatorNumericId(operator, userId));
+  // deleteUserFromDB's adminUserId is used only for audit context during the
+  // pre-delete filesystem cleanup; the sim user's own id is valid there.
+  await deleteUserFromDB(String(userId), userId);
   // Downstream Dina purge through src/modules/mirror (best-effort).
-  const dina = await notifyDinaPurge(userId, sessionId);
-  return { dinaNotified: dina.notified, dinaDetail: dina.detail };
-}
-
-/** deleteUserFromDB wants a numeric adminUserId purely for audit context. The
- *  operator here is an admin-portal username (string), so we fall back to the
- *  sim user's own id, which still exists during phase-1 filesystem cleanup. */
-function operatorNumericId(_operator: string, fallbackUserId: number): number {
-  return fallbackUserId;
+  return await notifyDinaPurge(userId, sessionId).then((d) => ({ dinaNotified: d.notified, dinaDetail: d.detail }));
 }
 
 // ----------------------------------------------------------------------------
@@ -636,6 +639,13 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
   let sessionId: string | undefined;
   let accessToken: string | undefined;
 
+  // Payload assembled slice-by-slice across the journey steps.
+  const intakeData: Record<string, any> = {
+    userLoggedIn: true,
+    name: simUsername,
+    progress: { lastStep: 'SubmitStep', completed: true, steps: {} },
+  };
+
   try {
     await ensureAuditTable();
     await insertAuditRow(report, options.label);
@@ -666,72 +676,84 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
         ipAddress: '127.0.0.1',
         fingerprint: `sim-${shortId}`,
       });
-      accessToken = TokenManager.createAccessToken({
-        id: userId,
-        email: simEmail,
-        username: simUsername,
-        sessionId,
-      });
+      accessToken = TokenManager.createAccessToken({ id: userId, email: simEmail, username: simUsername, sessionId });
       return { detail: `Created sim user #${userId} (${simUsername}) + directories + keys + session`, data: { userId } };
     });
 
-    // ---- 2. UPLOAD PHOTO (real HTTP -> /storage/store, tier1) --------------
-    let photoRef: any = null;
-    await step(steps, 'upload_photo', async () => {
-      const photo = samplePhoto();
-      const mp = buildMultipart(
-        { userId: String(userId), tier: 'tier1', filename: photo.filename },
-        { field: 'file', filename: photo.filename, contentType: photo.contentType, buffer: photo.buffer },
-      );
-      const res = await selfRequest('POST', '/mirror/api/storage/store', { body: mp.body, contentType: mp.contentType, token: accessToken });
-      if (res.status !== 200 || !res.body?.success) {
-        throw new Error(`storage/store tier1 failed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
-      }
-      const f = res.body.files?.[0];
-      if (!f?.filename) throw new Error('storage/store tier1 returned no filename');
-      photoRef = {
-        filename: f.filename, tier: 'tier1', size: f.size, mimetype: f.mimetype,
-        uploadedAt: res.body.timestamp || new Date().toISOString(), originalname: f.originalname,
-      };
-      return { detail: `Uploaded tier1 photo "${f.filename}" (${f.size} bytes)`, data: { filename: f.filename } };
+    // ---- 2. VISUAL (real upload -> /storage/store tier1) -------------------
+    await step(steps, 'visual', async () => {
+      const ref = await uploadToStorage(userId!, 'tier1', samplePhoto(), accessToken);
+      intakeData.photoFileRef = ref;
+      intakeData.faceAnalysis = buildFaceAnalysis();
+      intakeData.progress.steps.VisualStep = { completed: true, data: { source: 'simulation' } };
+      return { detail: `Uploaded tier1 photo "${ref.filename}" (${ref.size} bytes) + face analysis`, data: { filename: ref.filename } };
     });
 
-    // ---- 3. UPLOAD VOICE (real HTTP -> /storage/store, tier2 encrypted) ----
-    let voiceRef: any = null;
+    // ---- 3. VOCAL (real upload -> /storage/store tier2, encrypted) ---------
     const voice = sampleVoice();
-    await step(steps, 'upload_voice', async () => {
-      const mp = buildMultipart(
-        { userId: String(userId), tier: 'tier2', filename: voice.filename },
-        { field: 'file', filename: voice.filename, contentType: voice.contentType, buffer: voice.buffer },
-      );
-      const res = await selfRequest('POST', '/mirror/api/storage/store', { body: mp.body, contentType: mp.contentType, token: accessToken });
-      if (res.status !== 200 || !res.body?.success) {
-        throw new Error(`storage/store tier2 failed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
-      }
-      const f = res.body.files?.[0];
-      if (!f?.filename) throw new Error('storage/store tier2 returned no filename');
-      voiceRef = {
-        filename: f.filename, tier: 'tier2', size: f.size, mimetype: f.mimetype,
-        uploadedAt: res.body.timestamp || new Date().toISOString(),
-        duration: voice.durationMs,
-        deviceInfo: { isMobile: false, platform: 'Desktop', browser: 'Simulation' },
-      };
-      return { detail: `Uploaded tier2 voice "${f.filename}" (${f.size} bytes, encrypted)`, data: { filename: f.filename } };
+    await step(steps, 'vocal', async () => {
+      const ref: any = await uploadToStorage(userId!, 'tier2', voice, accessToken);
+      ref.duration = voice.durationMs;
+      ref.deviceInfo = { isMobile: false, platform: 'Desktop', browser: 'Simulation' };
+      intakeData.voiceFileRef = ref;
+      intakeData.voiceMetadata = buildVoiceMetadata(ref.size, voice.durationMs);
+      intakeData.progress.steps.VocalStep = { completed: true, data: { source: 'simulation' } };
+      return { detail: `Uploaded tier2 voice "${ref.filename}" (${ref.size} bytes, encrypted) + metadata`, data: { filename: ref.filename } };
     });
 
-    // ---- 4. SUBMIT INTAKE (real HTTP -> /intake/store) ---------------------
-    let intakeId: string | null = null;
-    await step(steps, 'submit_intake', async () => {
-      const intakeData = buildIntakeData(simUsername, photoRef, voiceRef, voice.durationMs);
+    // ---- 4. IQ (assemble slice + exercise the real norms endpoint) ---------
+    await step(steps, 'iq', async () => {
+      intakeData.iqResults = buildIqResults();
+      intakeData.iqAnswers = SIM_IQ_ANSWERS;
+      intakeData.progress.steps.IQStep = { completed: true, data: { source: 'simulation' } };
+
+      // The IQStep calls the self-norm endpoint to show a percentile. Exercise
+      // it for real; a non-OK norms response is a warning (it doesn't block the
+      // intake itself), not a failure.
+      const q = `?itemSetVersion=${encodeURIComponent(SIM_IQ_ITEM_SET_VERSION)}&rawScore=30`;
+      const res = await selfRequest('GET', `/mirror/api/intake/iq/norms${q}`, { token: accessToken });
+      if (res.status !== 200 || !res.body?.success) {
+        warnings.push(`iq/norms returned HTTP ${res.status}`);
+        return { detail: `IQ slice assembled; norms endpoint HTTP ${res.status}`, severity: 'warn' as StepSeverity };
+      }
+      const ready = res.body.ready;
+      const n = res.body.n;
+      const pct = res.body.percentile;
+      return {
+        detail: `IQ slice assembled; norms endpoint OK (ready=${ready}, n=${n}${pct != null ? `, percentile≈${pct}` : ''})`,
+        data: { ready, n, percentile: pct },
+      };
+    });
+
+    // ---- 5. ASTROLOGY (assemble + validate slice) --------------------------
+    await step(steps, 'astrology', async () => {
+      const a = buildAstrology();
+      if (!a.western?.sunSign || !a.numerology?.lifePathNumber) throw new Error('astrology slice failed validation');
+      intakeData.astrologicalResult = a;
+      intakeData.progress.steps.AstroLogicalStep = { completed: true, data: { source: 'simulation' } };
+      return { detail: `Astrology slice assembled (sun=${a.western.sunSign}, chinese=${a.chinese.animalSign})` };
+    });
+
+    // ---- 6. PERSONALITY (assemble + validate slice) ------------------------
+    await step(steps, 'personality', async () => {
+      const p = buildPersonality();
+      if (!p.mbtiType || !p.big5Profile) throw new Error('personality slice failed validation');
+      intakeData.personalityResult = p;
+      intakeData.personalityAnswers = { 'big5-o-1': { value: '5', score: 5 }, 'big5-c-1': { value: '4', score: 4 } };
+      intakeData.progress.steps.PersonalityStep = { completed: true, data: { source: 'simulation' } };
+      return { detail: `Personality slice assembled (MBTI=${p.mbtiType})` };
+    });
+
+    // ---- 7. SUBMIT (real POST -> /intake/store) ----------------------------
+    await step(steps, 'submit', async () => {
       const res = await selfRequest('POST', '/mirror/api/intake/store', { json: { userId: String(userId), intakeData }, token: accessToken });
       if (res.status !== 200 || !res.body?.success) {
         throw new Error(`intake/store failed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
       }
-      intakeId = res.body.intakeId || null;
-      return { detail: `Stored intake ${intakeId} (storedFiles=${res.body.storedFiles ?? '?'})`, data: { intakeId } };
+      return { detail: `Stored intake ${res.body.intakeId} (storedFiles=${res.body.storedFiles ?? '?'})`, data: { intakeId: res.body.intakeId } };
     });
 
-    // ---- 5. VERIFY DB ------------------------------------------------------
+    // ---- 8. VERIFY DB ------------------------------------------------------
     await step(steps, 'verify_db', async () => {
       const issues: string[] = [];
 
@@ -751,8 +773,6 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
       if (!u) issues.push('user row missing');
       else if (!u.intake_completed) issues.push('users.intake_completed not set');
 
-      // IQ norm sample: present and verified (warning-level if unverified, since
-      // the core intake still succeeded — most likely the IQ fixture drifted).
       let iqWarn = '';
       const [iqRows] = await DB.query(
         'SELECT verified FROM iq_norm_samples WHERE user_id = ? AND item_set_version = ?',
@@ -767,8 +787,7 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
       return { detail: 'intake_metadata, users.intake_completed and verified iq_norm_samples all present' };
     });
 
-    // ---- 6. VERIFY FILES ON DISK ------------------------------------------
-    const ctx: DataAccessContext = { userId: userId!, accessedBy: userId!, reason: 'intake_simulation_verify' };
+    // ---- 9. VERIFY FILES ON DISK ------------------------------------------
     await step(steps, 'verify_files', async () => {
       const counts: Record<string, number> = {};
       for (const tier of ['tier1', 'tier2', 'tier3'] as TierType[]) {
@@ -783,27 +802,27 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
       return { detail: `Files present — tier1:${counts.tier1} tier2:${counts.tier2} tier3:${counts.tier3}`, data: counts };
     });
 
-    // ---- 7. VERIFY READBACK (decrypt latest intake) ------------------------
-    await step(steps, 'verify_readback', async () => {
-      const latest = await IntakeDataManager.getLatestIntakeData(String(userId), ctx, false);
-      if (!latest) throw new Error('getLatestIntakeData returned null');
-      const name = (latest.intakeData as any)?.name;
-      if (name !== simUsername) throw new Error(`readback name mismatch: "${name}" !== "${simUsername}"`);
-      const hasPersonality = !!(latest.intakeData as any)?.personalityResult;
-      if (!hasPersonality) throw new Error('readback missing personalityResult');
-      return { detail: 'Latest intake decrypted and round-tripped (name + personality intact)' };
+    // ---- 10. RESULTS (real GET -> /intake/latest, decrypt round-trip) ------
+    await step(steps, 'results', async () => {
+      const res = await selfRequest('GET', `/mirror/api/intake/latest/${userId}`, { token: accessToken });
+      if (res.status !== 200 || !res.body?.success) {
+        throw new Error(`intake/latest failed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
+      }
+      const name = res.body.intakeData?.name;
+      if (name !== simUsername) throw new Error(`results name mismatch: "${name}" !== "${simUsername}"`);
+      if (!res.body.intakeData?.personalityResult) throw new Error('results missing personalityResult');
+      return { detail: 'Latest intake retrieved and decrypted (name + personality round-trip intact)' };
     });
 
-    // ---- 8. CLEANUP --------------------------------------------------------
+    // ---- 11. CLEANUP -------------------------------------------------------
     if (options.skipCleanup) {
       warnings.push('skipCleanup=true — sim user left in place; sweep it later via the cleanup endpoint');
       steps.push({ name: 'cleanup', ok: true, severity: 'warn', ms: 0, detail: 'skipped (skipCleanup=true)' });
     } else {
       await step(steps, 'cleanup', async () => {
-        const t = await teardownSimUser(userId!, sessionId, report.operator);
+        const t = await teardownSimUser(userId!, sessionId);
         report.cleanedUp = true;
 
-        // Verify removal.
         const issues: string[] = [];
         const [u] = await DB.query('SELECT id FROM users WHERE id = ?', [userId]);
         if ((u as any[]).length !== 0) issues.push('users row still present');
@@ -830,7 +849,7 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
     // (unless the operator explicitly asked to keep it).
     if (userId && !options.skipCleanup && !report.cleanedUp) {
       try {
-        await teardownSimUser(userId, sessionId, report.operator);
+        await teardownSimUser(userId, sessionId);
         report.cleanedUp = true;
         steps.push({ name: 'cleanup_after_failure', ok: true, severity: 'warn', ms: 0, detail: `Rolled back sim user #${userId} after failure` });
       } catch (cleanupErr) {
@@ -876,7 +895,7 @@ export async function cleanupOrphans(maxAgeMinutes = 0): Promise<CleanupResult> 
   const result: CleanupResult = { scanned: candidates.length, purged: 0, failures: [], details: [] };
   for (const c of candidates) {
     try {
-      await teardownSimUser(c.id, undefined, 'orphan-sweeper');
+      await teardownSimUser(c.id, undefined);
       result.purged++;
       result.details.push({ userId: c.id, username: c.username, ok: true });
     } catch (err) {
