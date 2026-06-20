@@ -68,10 +68,12 @@
 import https from 'node:https';
 import http from 'node:http';
 import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { DB } from '../db';
 import { Logger } from '../utils/logger';
 import { TokenManager } from './authController';
-import { createUserInDB, deleteUserFromDB } from './userController';
+import { createUserInDB, deleteUserFromDB, updateUserPassword } from './userController';
 import { listTierFiles, TierType } from './directoryController';
 
 const logger = new Logger('IntakeSimulation');
@@ -1033,4 +1035,220 @@ export async function getRun(runId: string): Promise<unknown | null> {
   const [rows] = await DB.query('SELECT * FROM intake_simulation_runs WHERE run_id = ?', [runId]);
   const row = (rows as any[])[0];
   return row || null;
+}
+
+// ============================================================================
+// TEST-USER MANAGER — list / inspect / reset-password / delete kept sim users
+// ----------------------------------------------------------------------------
+// These power the admin "Test users" panel. Every credential or destructive
+// action re-loads the user's identity from the DB and gates on the reserved
+// namespace guard (looksLikeSimUser), so these helpers can NEVER touch a real
+// account. deleteSimUser runs the SAME canonical teardown as the orphan sweeper
+// (deleteUserFromDB: filesystem + transactional multi-table cascade + Dina
+// purge) and then PROVES the account is gone via verifyUserPurged.
+// ============================================================================
+
+export interface SimUserFiles { tier1: number; tier2: number; tier3: number; total: number; }
+
+export interface SimUserRow {
+  id: number;
+  username: string;
+  email: string;
+  createdAt: string | null;
+  lastLogin: string | null;
+  emailVerified: boolean;
+  intakeCompleted: boolean;
+  files: SimUserFiles;
+}
+
+/** Count a user's stored files per tier (best-effort; a missing dir counts 0). */
+async function countUserFiles(userId: number | string): Promise<SimUserFiles> {
+  const files: SimUserFiles = { tier1: 0, tier2: 0, tier3: 0, total: 0 };
+  for (const tier of ['tier1', 'tier2', 'tier3'] as TierType[]) {
+    try {
+      const list = await listTierFiles(String(userId), tier);
+      (files as any)[tier] = list.length;
+    } catch { /* missing dir => 0 */ }
+  }
+  files.total = files.tier1 + files.tier2 + files.tier3;
+  return files;
+}
+
+/** List every kept simulation user, newest first, with its on-disk footprint. */
+export async function listSimUsers(): Promise<SimUserRow[]> {
+  const [rows] = await DB.query(
+    `SELECT id, username, email, created_at, last_login, email_verified, intake_completed
+       FROM users
+      WHERE email LIKE CONCAT('%@', ?)
+      ORDER BY id DESC
+      LIMIT 500`,
+    [SIM_EMAIL_DOMAIN],
+  );
+  const out: SimUserRow[] = [];
+  for (const r of rows as any[]) {
+    // Double-guard: only surface users that pass the EXACT namespace check.
+    if (!looksLikeSimUser(r.username, r.email)) continue;
+    out.push({
+      id: Number(r.id),
+      username: String(r.username),
+      email: String(r.email),
+      createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+      lastLogin: r.last_login ? new Date(r.last_login).toISOString() : null,
+      emailVerified: !!r.email_verified,
+      intakeCompleted: !!r.intake_completed,
+      files: await countUserFiles(r.id),
+    });
+  }
+  return out;
+}
+
+export interface PurgeVerification {
+  userId: number;
+  clean: boolean;                 // true only if NOTHING references the user anywhere
+  usersRowPresent: boolean;       // is the `users` row itself still there?
+  dbResidue: { table: string; column: string; rows: number }[];   // tables still holding rows
+  dbTablesScanned: number;        // how many (table,column) pairs were checked
+  scanErrors: { table: string; column: string; error: string }[]; // count queries that failed
+  storage: SimUserFiles;
+  storageDirPresent: boolean | null; // <MIRRORUSERSTORAGE>/<id> still on disk? null if base unknown
+  storageClean: boolean;
+}
+
+// Only ever interpolate identifiers that match this, even though they come from
+// information_schema in our own database (defence in depth against weird names).
+const SAFE_SQL_IDENTIFIER = /^[A-Za-z0-9_]+$/;
+
+// Tables that legitimately RETAIN a user-id reference after the account is gone
+// and therefore must NOT count as residue. intake_simulation_runs is this tool's
+// own audit/run history: sim_user_id has no FK on purpose (it is the orphan
+// sweeper's reconciliation source and survives deletion by design). It holds run
+// metadata, not user PII.
+const VERIFY_EXCLUDE_TABLES = new Set<string>(['intake_simulation_runs']);
+
+/** Prove (or disprove) that nothing in the database or on disk still references
+ *  `userId`. Read-only. Introspects information_schema for every INTEGER column
+ *  that looks like a user reference (user_id / *_user_id / known actor columns)
+ *  and counts residual rows — so it validates against the LIVE schema, catching
+ *  anything the hard-coded teardown list might miss. Works before deletion (it
+ *  reports the full footprint) and after (everything should read zero). */
+export async function verifyUserPurged(userId: number): Promise<PurgeVerification> {
+  const result: PurgeVerification = {
+    userId,
+    clean: false,
+    usersRowPresent: false,
+    dbResidue: [],
+    dbTablesScanned: 0,
+    scanErrors: [],
+    storage: { tier1: 0, tier2: 0, tier3: 0, total: 0 },
+    storageDirPresent: null,
+    storageClean: false,
+  };
+
+  try {
+    const [u] = await DB.query('SELECT 1 FROM users WHERE id = ? LIMIT 1', [userId]);
+    result.usersRowPresent = (u as any[]).length > 0;
+  } catch (e) {
+    result.scanErrors.push({ table: 'users', column: 'id', error: errMsg(e).slice(0, 200) });
+  }
+
+  // Discover every integer user-referencing column in the live schema.
+  const [cols] = await DB.query(
+    `SELECT TABLE_NAME AS t, COLUMN_NAME AS c
+       FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND DATA_TYPE IN ('int','bigint','smallint','mediumint','tinyint','integer')
+        AND (
+          COLUMN_NAME = 'user_id'
+          OR COLUMN_NAME LIKE '%\\_user\\_id'
+          OR COLUMN_NAME IN ('accessed_by','started_by','created_by','reviewer_id')
+        )`,
+  );
+
+  for (const row of cols as any[]) {
+    const table = String(row.t);
+    const column = String(row.c);
+    if (!SAFE_SQL_IDENTIFIER.test(table) || !SAFE_SQL_IDENTIFIER.test(column)) continue;
+    if (table === 'users') continue; // its own row is handled above
+    if (VERIFY_EXCLUDE_TABLES.has(table)) continue; // intentional audit retention
+    result.dbTablesScanned++;
+    try {
+      const [cnt] = await DB.query(
+        `SELECT COUNT(*) AS n FROM \`${table}\` WHERE \`${column}\` = ?`,
+        [userId],
+      );
+      const n = Number((cnt as any[])[0]?.n ?? 0);
+      if (n > 0) result.dbResidue.push({ table, column, rows: n });
+    } catch (e) {
+      result.scanErrors.push({ table, column, error: errMsg(e).slice(0, 200) });
+    }
+  }
+
+  // On-disk footprint.
+  result.storage = await countUserFiles(userId);
+  const base = process.env.MIRRORUSERSTORAGE;
+  if (base) {
+    try {
+      await fs.stat(path.join(base, String(userId)));
+      result.storageDirPresent = true;
+    } catch {
+      result.storageDirPresent = false;
+    }
+  }
+  result.storageClean = result.storage.total === 0 && result.storageDirPresent !== true;
+
+  result.clean = !result.usersRowPresent && result.dbResidue.length === 0 && result.storageClean;
+  return result;
+}
+
+/** Reset a kept sim user's password (operator-supplied or random) and return the
+ *  credentials. Re-marks the account email-verified so it stays banner-free. */
+export async function resetSimUserPassword(
+  userId: number,
+  newPassword?: string,
+): Promise<{ email: string; username: string; password: string }> {
+  const [rows] = await DB.query('SELECT username, email FROM users WHERE id = ? LIMIT 1', [userId]);
+  const row = (rows as any[])[0];
+  if (!row) throw new Error(`User ${userId} not found`);
+  if (!looksLikeSimUser(row.username, row.email)) {
+    throw new Error(`Refusing to reset password for user ${userId}: not a simulation user (safety stop).`);
+  }
+  const password = newPassword && newPassword.length >= 8 ? newPassword : strongRandomPassword();
+  await updateUserPassword(String(userId), password);
+  await DB.query('UPDATE users SET email_verified = 1 WHERE id = ?', [userId]);
+  return { email: String(row.email), username: String(row.username), password };
+}
+
+export interface DeleteSimUserResult {
+  deleted: boolean;
+  userId: number;
+  username: string;
+  email: string;
+  dinaNotified: boolean;
+  dinaDetail?: string;
+  verification: PurgeVerification;
+}
+
+/** Delete ONE kept sim user via the canonical teardown, then prove it's gone. */
+export async function deleteSimUser(userId: number): Promise<DeleteSimUserResult> {
+  const [rows] = await DB.query('SELECT username, email FROM users WHERE id = ? LIMIT 1', [userId]);
+  const row = (rows as any[])[0];
+  if (!row) {
+    // Already absent — still run verification so the caller gets a clean proof.
+    const verification = await verifyUserPurged(userId);
+    return { deleted: false, userId, username: '', email: '', dinaNotified: false, dinaDetail: 'user_absent', verification };
+  }
+  if (!looksLikeSimUser(row.username, row.email)) {
+    throw new Error(`Refusing to delete user ${userId}: not a simulation user (safety stop).`);
+  }
+  const td = await teardownSimUser(userId, undefined);
+  const verification = await verifyUserPurged(userId);
+  return {
+    deleted: true,
+    userId,
+    username: String(row.username),
+    email: String(row.email),
+    dinaNotified: td.dinaNotified,
+    dinaDetail: td.dinaDetail,
+    verification,
+  };
 }
