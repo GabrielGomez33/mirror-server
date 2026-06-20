@@ -134,13 +134,29 @@ export interface SimRunReport {
   steps: SimStep[];
   warnings: string[];
   error: string | null;
+  // Login credentials for a KEPT test user (skipCleanup). Returned in the live
+  // run response only — NEVER persisted to the audit table or logged — so the
+  // operator can sign in as this account. null for ephemeral (cleaned-up) runs.
+  credentials: { email: string; username: string; password: string } | null;
 }
 
 export interface RunOptions {
   dryRun?: boolean;
   // Leave the sim user in place after a run (debugging only). The run report
-  // still reports which user was created so it can be swept later.
+  // still reports which user was created so it can be swept later. When set, the
+  // run returns login credentials (see SimRunReport.credentials) and marks the
+  // user email-verified so it can be used as a real test account.
   skipCleanup?: boolean;
+  // Optional password for the kept test user. If omitted (or shorter than 8
+  // chars) a strong random one is generated and returned. Only meaningful with
+  // skipCleanup. Username/email are always in the reserved sim namespace.
+  password?: string;
+  // Optional email LOCAL PART for the test user (e.g. "qa-alice" ->
+  // qa-alice@<reserved sim domain>). The domain is ALWAYS forced to the reserved
+  // sim domain and the username ALWAYS keeps the __sim_ prefix, so the teardown
+  // safety guard and orphan sweeper keep working and a custom test user can
+  // never collide with or impersonate a real account. Sanitized server-side.
+  emailLocalPart?: string;
   // Free-text label stored with the audit row (e.g. "post-deploy smoke").
   label?: string;
 }
@@ -273,6 +289,15 @@ function looksLikeSimUser(username: string | null | undefined, email: string | n
   return u.startsWith(SIM_USERNAME_PREFIX) && e.endsWith('@' + SIM_EMAIL_DOMAIN);
 }
 
+/** Sanitize an operator-supplied email local part into a safe token usable in
+ *  BOTH the email local part and the username (so the reserved domain/prefix can
+ *  be appended). Lowercased; restricted to [a-z0-9._-]; length-capped. Returns
+ *  '' when nothing usable remains, in which case a run-id-based default is used. */
+function sanitizeLocalPart(input?: string): string {
+  if (!input) return '';
+  return String(input).toLowerCase().trim().replace(/[^a-z0-9._-]/g, '').slice(0, 40);
+}
+
 // ----------------------------------------------------------------------------
 // LOOPBACK HTTP — JSON + multipart, dependency-free (mirrors mirrorEmailClient)
 // ----------------------------------------------------------------------------
@@ -393,7 +418,14 @@ async function uploadToStorage(
   if (res.status !== 200 || !res.body?.success) {
     throw new Error(`storage/store ${tier} failed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
   }
-  const f = res.body.files?.[0];
+  // Mirror the front end's selection EXACTLY: SubmitStep's toPhotoFileRef /
+  // toVoiceFileRef reference files[files.length - 1] (the last entry), not
+  // files[0]. This matters because the storage handler currently returns two
+  // entries per upload (see the README "Known finding"); the front end uses the
+  // last one, so the simulation must too to stay faithful. Robust to a future
+  // single-entry response as well (length-1 === 0).
+  const arr: any[] = Array.isArray(res.body.files) ? res.body.files : [];
+  const f = arr[arr.length - 1] || arr[0];
   if (!f?.filename) throw new Error(`storage/store ${tier} returned no filename`);
   return {
     filename: f.filename, tier, size: f.size, mimetype: f.mimetype,
@@ -612,8 +644,13 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
   const startedAt = new Date();
   const runId = crypto.randomUUID();
   const shortId = runId.slice(0, 8);
-  const simUsername = `${SIM_USERNAME_PREFIX}${shortId}`;
-  const simEmail = `sim+${shortId}@${SIM_EMAIL_DOMAIN}`;
+  // Identity always stays in the reserved namespace so teardown + the orphan
+  // sweeper keep working: username is `__sim_<x>` and email is `<x>@<sim domain>`.
+  // The operator may choose `<x>` (sanitized) to make a memorable test account;
+  // otherwise it defaults to the run's short id.
+  const customLocal = sanitizeLocalPart(options.emailLocalPart);
+  const simUsername = `${SIM_USERNAME_PREFIX}${customLocal || shortId}`;
+  const simEmail = `${customLocal || `sim+${shortId}`}@${SIM_EMAIL_DOMAIN}`;
   const dryRun = !!options.dryRun;
 
   const steps: SimStep[] = [];
@@ -633,6 +670,7 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
     steps,
     warnings,
     error: null,
+    credentials: null,
   };
 
   let userId: number | null = null;
@@ -667,8 +705,24 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
 
     // ---- 1. REGISTER (provision via the same fns /auth/register uses) ------
     await step(steps, 'register', async () => {
-      const password = strongRandomPassword();
-      userId = await createUserInDB(simUsername, simEmail, password); // + dirs + keys
+      // Use the operator-supplied password when provided (>= 8 chars), else a
+      // strong random one. The password is held only in memory for the duration
+      // of the run and surfaced in report.credentials for KEPT users; it is
+      // never written to the step detail, the audit table, or the logs.
+      const password =
+        options.password && options.password.length >= 8 ? options.password : strongRandomPassword();
+      try {
+        userId = await createUserInDB(simUsername, simEmail, password); // + dirs + keys
+      } catch (e) {
+        const m = errMsg(e);
+        if (m === 'EMAIL_ALREADY_REGISTERED' || m === 'USERNAME_TAKEN') {
+          throw new Error(
+            `A test user with email "${simEmail}" already exists. Sweep it first ` +
+            `(Sweep orphans) or choose a different email.`,
+          );
+        }
+        throw e;
+      }
       report.simUserId = userId;
       sessionId = TokenManager.generateSessionId();
       await TokenManager.createSession(userId, sessionId, {
@@ -677,7 +731,23 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
         fingerprint: `sim-${shortId}`,
       });
       accessToken = TokenManager.createAccessToken({ id: userId, email: simEmail, username: simUsername, sessionId });
-      return { detail: `Created sim user #${userId} (${simUsername}) + directories + keys + session`, data: { userId } };
+
+      // For a KEPT user, make it a clean, fully-onboarded test account: mark the
+      // email verified and return the credentials. Login itself does not require
+      // a verified email (unverified users just see a "verify your email"
+      // banner), but marking it verified removes that banner — and the .invalid
+      // address can never receive a real verification link — and also keeps the
+      // account loginable if LOGIN_REQUIRE_EMAIL_VERIFIED is ever enabled. Done
+      // here, right after creation, so even a later-failing kept run still
+      // yields a usable account. intake_completed is set by the submit step.
+      // Ephemeral runs skip all of this (the user is deleted).
+      if (options.skipCleanup) {
+        await DB.query('UPDATE users SET email_verified = 1 WHERE id = ?', [userId]);
+        report.credentials = { email: simEmail, username: simUsername, password };
+      }
+
+      const keptNote = options.skipCleanup ? ' (kept: login-enabled, credentials in report)' : '';
+      return { detail: `Created sim user #${userId} (${simUsername}) + directories + keys + session${keptNote}`, data: { userId } };
     });
 
     // ---- 2. VISUAL (real upload -> /storage/store tier1) -------------------
@@ -816,8 +886,8 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
 
     // ---- 11. CLEANUP -------------------------------------------------------
     if (options.skipCleanup) {
-      warnings.push('skipCleanup=true — sim user left in place; sweep it later via the cleanup endpoint');
-      steps.push({ name: 'cleanup', ok: true, severity: 'warn', ms: 0, detail: 'skipped (skipCleanup=true)' });
+      warnings.push('skipCleanup=true — sim user kept as a login-enabled test account (credentials in this report); sweep it later via the cleanup endpoint');
+      steps.push({ name: 'cleanup', ok: true, severity: 'warn', ms: 0, detail: 'skipped (skipCleanup=true) — user kept; log in with the credentials shown below' });
     } else {
       await step(steps, 'cleanup', async () => {
         const t = await teardownSimUser(userId!, sessionId);
