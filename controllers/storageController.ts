@@ -72,13 +72,19 @@ function normalizeTier(tierLike?: string, typeLike?: string): TierType {
   return 'tier3';
 }
 
-/** Gather files regardless of whether route used single/array/fields and file|data name */
+/** Gather files regardless of whether route used single/array/fields and file|data name.
+ *  De-duplicated by object identity: the storage route's normalization shim copies
+ *  the uploaded file into `req.file` (it points at the same object already present in
+ *  `req.files.file`/`req.files.data`), so without this guard a single upload would be
+ *  counted — and therefore written to disk — twice. */
 function collectFiles(req: any) {
   const files: any[] = [];
-  if (req.file) files.push(req.file);
-  if (req.files?.file?.length) files.push(...(req.files.file as any[]));
-  if (req.files?.data?.length) files.push(...(req.files.data as any[]));
-  if (Array.isArray(req.files)) files.push(...req.files); // upload.array('file')
+  const seen = new Set<any>();
+  const add = (f: any) => { if (f && !seen.has(f)) { seen.add(f); files.push(f); } };
+  if (req.file) add(req.file);
+  if (req.files?.file?.length) (req.files.file as any[]).forEach(add);
+  if (req.files?.data?.length) (req.files.data as any[]).forEach(add);
+  if (Array.isArray(req.files)) (req.files as any[]).forEach(add); // upload.array('file')
   return files;
 }
 
@@ -173,16 +179,22 @@ export const storeDataHandler: RequestHandler = async (req, res) => {
         try {
           const buf = await getFileBuffer(f);
 
-          // Decide filename for this file
+          // Decide a COLLISION-SAFE filename for this file. Every stored file
+          // gets a unique name (a uuid component), so a repeat upload can never
+          // silently overwrite an earlier file and concurrent uploads can't
+          // collide. A readable prefix is derived from the client-supplied
+          // filename when present (purely cosmetic); the extension is taken from
+          // the client filename, falling back to the MIME-inferred extension.
+          // Clients reference the returned `filename` from the response, so the
+          // exact string is internal — only its uniqueness is load-bearing.
           const suggestedExt = inferExtFromMime(f.mimetype);
-          const base =
+          const clientExt = i === 0 && filenameRaw ? path.extname(String(filenameRaw)) : '';
+          const clientBase =
             i === 0 && filenameRaw
               ? path.basename(String(filenameRaw), path.extname(String(filenameRaw)))
-              : crypto.randomUUID();
-
-          const finalName = `${safeBase(base)}${
-            (i === 0 && filenameRaw ? path.extname(String(filenameRaw)) : '') || suggestedExt || ''
-          }`;
+              : '';
+          const prefix = safeBase(clientBase) || 'upload';
+          const finalName = `${prefix}-${crypto.randomUUID()}${clientExt || suggestedExt || ''}`;
 
 		  const userIdNum = resolveAccessedBy(userIdRaw);
 

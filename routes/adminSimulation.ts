@@ -66,11 +66,18 @@ router.post('/intake/run', async (req: Request, res: Response) => {
   const dryRun = req.body?.dryRun === true;
   const skipCleanup = req.body?.skipCleanup === true;
   const label = typeof req.body?.label === 'string' ? req.body.label : undefined;
+  // Optional password for a kept test user. Never logged.
+  const password =
+    typeof req.body?.password === 'string' && req.body.password.length > 0 ? req.body.password : undefined;
+  // Optional email local part for a memorable test account (domain is forced to
+  // the reserved sim domain server-side).
+  const emailLocalPart =
+    typeof req.body?.emailLocalPart === 'string' && req.body.emailLocalPart.length > 0 ? req.body.emailLocalPart : undefined;
 
-  audit('run_started', req, { dryRun, skipCleanup, label });
+  audit('run_started', req, { dryRun, skipCleanup, label, customPassword: !!password, customEmail: !!emailLocalPart });
 
   try {
-    const report = await runIntakeSimulation({ dryRun, skipCleanup, label }, op);
+    const report = await runIntakeSimulation({ dryRun, skipCleanup, password, emailLocalPart, label }, op);
     audit('run_finished', req, {
       runId: report.runId,
       status: report.status,
