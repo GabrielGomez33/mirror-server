@@ -416,16 +416,29 @@ async function loadUserContextFields(
     // subscriptionStatus is computed from the paywall table when available,
     // otherwise defaults to 'free'. We avoid failing the whole call if the
     // paywall tables are missing in older environments.
+    //
+    // Read `user_subscriptions` FIRST — that is the table the premium gate
+    // (subscriptionService) actually enforces, so the login/refresh response
+    // stays consistent with what the gate allows (previously this read a legacy
+    // `subscriptions` table that could disagree with the gate, so premium users
+    // were shown the upgrade wall even though the backend allowed them through).
+    // Fall back to `subscriptions` for environments that only have that table.
+    // Table names below are hard-coded literals, never user input.
     let subscriptionStatus: 'free' | 'premium' | 'enterprise' = 'free';
-    try {
-      const [subRows] = await DB.query(
-        `SELECT tier FROM subscriptions WHERE user_id = ? AND status IN ('active','trialing','past_due') ORDER BY id DESC LIMIT 1`,
-        [userId]
-      );
-      const tier = (subRows as any[])[0]?.tier;
-      if (tier === 'premium' || tier === 'enterprise') subscriptionStatus = tier;
-    } catch {
-      // paywall not installed — leave as 'free'
+    for (const table of ['user_subscriptions', 'subscriptions']) {
+      try {
+        const [subRows] = await DB.query(
+          `SELECT tier FROM ${table} WHERE user_id = ? AND status IN ('active','trialing','past_due') ORDER BY id DESC LIMIT 1`,
+          [userId]
+        );
+        const tier = (subRows as any[])[0]?.tier;
+        if (tier === 'premium' || tier === 'enterprise') {
+          subscriptionStatus = tier;
+          break;
+        }
+      } catch {
+        // table missing in this environment — try the next one
+      }
     }
 
     return {

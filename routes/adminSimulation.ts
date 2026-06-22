@@ -23,8 +23,10 @@
 //   POST   /intake/users/:id/reset-password — set a new password { password? }
 //   DELETE /intake/users/:id           — delete one sim user, then verify purge
 //   GET    /intake/reviewable-users    — sim users (+ TruthStream profile flag)
+//   GET    /intake/users-with-profile  — any user (sim/real) with a TS profile
 //   GET    /intake/user-search?q=      — search any user for a reviewee
 //   POST   /intake/reviews/run         — run one targeted TruthStream review
+//   POST   /intake/reviews/run-batch   — many reviewers (+ helpers) -> 1 reviewee
 // ============================================================================
 
 import express, { Request, Response } from 'express';
@@ -44,6 +46,8 @@ import {
   searchUsers,
   runTargetedReview,
   getUserTruthStreamReport,
+  listUsersWithTruthStreamProfile,
+  runReviewBatch,
   SimulationBusyError,
 } from '../controllers/intakeSimulationController';
 
@@ -295,6 +299,42 @@ router.get('/intake/user-search', async (req: Request, res: Response) => {
   } catch (err) {
     logger.error('User search failed', err as Error);
     res.status(500).json({ success: false, error: 'User search failed' });
+  }
+});
+
+router.get('/intake/users-with-profile', async (req: Request, res: Response) => {
+  try {
+    const users = await listUsersWithTruthStreamProfile();
+    audit('users_with_profile_listed', req, { count: users.length });
+    res.json({ success: true, data: users });
+  } catch (err) {
+    logger.error('Failed to list users with TruthStream profile', err as Error);
+    res.status(500).json({ success: false, error: 'Failed to list users with a TruthStream profile' });
+  }
+});
+
+router.post('/intake/reviews/run-batch', async (req: Request, res: Response) => {
+  const revieweeId = Number(req.body?.revieweeId);
+  const reviewerIds = Array.isArray(req.body?.reviewerIds) ? req.body.reviewerIds : [];
+  const addHelpers = Number(req.body?.addHelpers) || 0;
+  const tone = typeof req.body?.tone === 'string' ? req.body.tone : undefined;
+  if (!Number.isInteger(revieweeId) || revieweeId <= 0) {
+    res.status(400).json({ success: false, error: 'revieweeId must be a positive integer' });
+    return;
+  }
+  audit('review_batch_started', req, { revieweeId, reviewerCount: reviewerIds.length, addHelpers, tone });
+  try {
+    const result = await runReviewBatch({ reviewerIds, revieweeId, tone, addHelpers });
+    audit('review_batch_finished', req, {
+      revieweeId, succeeded: result.succeeded, attempted: result.results.length,
+      totalReceivedAfter: result.totalReceivedAfter, reportReady: result.reportReady,
+    });
+    res.json({ success: true, data: result });
+  } catch (err) {
+    const msg = (err as Error).message || 'Failed to run review batch';
+    const client = /Invalid|at least one|not found|no TruthStream profile|refusing/i.test(msg);
+    logger.error('Review batch failed', err as Error);
+    res.status(client ? 400 : 500).json({ success: false, error: msg });
   }
 });
 

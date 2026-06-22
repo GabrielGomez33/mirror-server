@@ -1834,3 +1834,117 @@ export async function getUserTruthStreamReport(userId: number): Promise<TruthStr
 
   return out;
 }
+
+// ============================================================================
+// REVIEWEE PICKER + MULTI-REVIEWER BATCH
+// ============================================================================
+
+export interface ProfiledUser {
+  id: number;
+  username: string;
+  email: string;
+  isSim: boolean;
+  goalCategory: string | null;
+  reviewsReceived: number;
+  hasReport: boolean;
+}
+
+/** Every user (sim OR real) that has a TruthStream profile — the pool of valid
+ *  reviewees. Annotated with whether they already have a generated report and
+ *  how many reviews they've received, so the operator can see who needs more. */
+export async function listUsersWithTruthStreamProfile(limit = 200): Promise<ProfiledUser[]> {
+  const cap = Math.min(Math.max(1, limit), 500);
+  const [rows] = await DB.query(
+    `SELECT u.id, u.username, u.email, p.goal_category, p.total_reviews_received,
+            EXISTS(SELECT 1 FROM truth_stream_analyses a WHERE a.user_id = u.id) AS has_report
+       FROM truth_stream_profiles p
+       JOIN users u ON u.id = p.user_id
+      ORDER BY u.id DESC
+      LIMIT ?`,
+    [cap],
+  );
+  return (rows as any[]).map((r) => ({
+    id: Number(r.id),
+    username: String(r.username),
+    email: String(r.email),
+    isSim: looksLikeSimUser(r.username, r.email),
+    goalCategory: r.goal_category || null,
+    reviewsReceived: Number(r.total_reviews_received || 0),
+    hasReport: !!r.has_report,
+  }));
+}
+
+export interface ReviewBatchResult {
+  revieweeId: number;
+  revieweeIsSim: boolean;
+  tone: ReviewTone;
+  results: { reviewerId: number; ok: boolean; reviewId: string | null; qualityScore: number | null; error?: string }[];
+  succeeded: number;
+  totalReceivedAfter: number;
+  minReviewsForAnalysis: number;
+  reportReady: boolean;
+}
+
+/** Run reviews for ONE reviewee from MANY reviewers (each an existing sim user)
+ *  and/or N freshly-created helper sim reviewers. Per-reviewer errors are
+ *  captured so one failure doesn't abort the batch. */
+export async function runReviewBatch(opts: {
+  reviewerIds?: number[];
+  revieweeId: number;
+  tone?: string;
+  addHelpers?: number;
+}): Promise<ReviewBatchResult> {
+  const revieweeId = Number(opts.revieweeId);
+  if (!Number.isInteger(revieweeId) || revieweeId <= 0) throw new Error('Invalid revieweeId');
+  const tone = normalizeTone(opts.tone);
+  const reviewerIds = Array.isArray(opts.reviewerIds)
+    ? Array.from(new Set(opts.reviewerIds.map(Number).filter((n) => Number.isInteger(n) && n > 0)))
+    : [];
+  const addHelpers = Math.min(Math.max(0, Math.floor(Number(opts.addHelpers) || 0)), 10);
+  if (reviewerIds.length === 0 && addHelpers === 0) {
+    throw new Error('Select at least one reviewer, or add one or more helper reviewers');
+  }
+
+  const [eRows] = await DB.query('SELECT username, email FROM users WHERE id = ? LIMIT 1', [revieweeId]);
+  const reviewee = (eRows as any[])[0];
+  if (!reviewee) throw new Error(`Reviewee #${revieweeId} not found`);
+  const revieweeIsSim = looksLikeSimUser(reviewee.username, reviewee.email);
+
+  const results: ReviewBatchResult['results'] = [];
+
+  for (const reviewerId of reviewerIds) {
+    if (reviewerId === revieweeId) {
+      results.push({ reviewerId, ok: false, reviewId: null, qualityScore: null, error: 'a user cannot review themselves' });
+      continue;
+    }
+    try {
+      const r = await runTargetedReview({ reviewerId, revieweeId, tone });
+      results.push({ reviewerId, ok: !!r.reviewId, reviewId: r.reviewId, qualityScore: r.qualityScore });
+    } catch (e) {
+      results.push({ reviewerId, ok: false, reviewId: null, qualityScore: null, error: errMsg(e) });
+    }
+  }
+
+  for (let i = 0; i < addHelpers; i++) {
+    try {
+      const helper = await createHelperReviewer();
+      const r = await runTargetedReview({ reviewerId: helper.userId, revieweeId, tone });
+      results.push({ reviewerId: helper.userId, ok: !!r.reviewId, reviewId: r.reviewId, qualityScore: r.qualityScore });
+    } catch (e) {
+      results.push({ reviewerId: -1, ok: false, reviewId: null, qualityScore: null, error: errMsg(e) });
+    }
+  }
+
+  const [cnt] = await DB.query('SELECT COUNT(*) AS n FROM truth_stream_reviews WHERE reviewee_id = ?', [revieweeId]);
+  const totalReceivedAfter = Number((cnt as any[])[0]?.n ?? 0);
+  return {
+    revieweeId,
+    revieweeIsSim,
+    tone,
+    results,
+    succeeded: results.filter((r) => r.ok).length,
+    totalReceivedAfter,
+    minReviewsForAnalysis: MIN_REVIEWS_FOR_ANALYSIS,
+    reportReady: totalReceivedAfter >= MIN_REVIEWS_FOR_ANALYSIS,
+  };
+}
