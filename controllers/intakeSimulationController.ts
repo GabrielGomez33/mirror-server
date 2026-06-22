@@ -331,6 +331,19 @@ async function ensureSimUserPremium(userId: number): Promise<void> {
   try { await mirrorRedis.del(`subscription:${userId}`); } catch { /* cache optional */ }
 }
 
+/** Admin action: (re-)assert ACTIVE premium for ANY user and bust the
+ *  subscription cache, then read back the effective state. Fixes a user stuck on
+ *  a free/cancelled subscription — the gate caches subscription state for 5
+ *  minutes, so a stale 'cancelled'/'free' entry (or a genuinely cancelled row)
+ *  will not clear on its own; this forces it active and clears the cache so the
+ *  premium gate allows them on the very next request. */
+export async function grantUserPremium(userId: number): Promise<{ userId: number; tier: string; status: string }> {
+  await ensureSimUserPremium(userId);
+  const [rows] = await DB.query('SELECT tier, status FROM user_subscriptions WHERE user_id = ? LIMIT 1', [userId]);
+  const row = (rows as any[])[0];
+  return { userId, tier: String(row?.tier || 'free'), status: String(row?.status || 'free') };
+}
+
 /** Sanitize an operator-supplied email local part into a safe token usable in
  *  BOTH the email local part and the username (so the reserved domain/prefix can
  *  be appended). Lowercased; restricted to [a-z0-9._-]; length-capped. Returns

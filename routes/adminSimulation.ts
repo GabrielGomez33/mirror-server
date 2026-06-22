@@ -20,6 +20,7 @@
 //   GET    /intake/users               — list kept sim users + file footprint
 //   GET    /intake/users/:id/verify    — prove a user's DB+disk footprint (R/O)
 //   GET    /intake/users/:id/truthstream — a user's card + reviews + report (R/O)
+//   POST   /intake/users/:id/premium   — (re-)assert active premium + bust cache
 //   POST   /intake/users/:id/reset-password — set a new password { password? }
 //   DELETE /intake/users/:id           — delete one sim user, then verify purge
 //   GET    /intake/reviewable-users    — sim users (+ TruthStream profile flag)
@@ -48,6 +49,7 @@ import {
   getUserTruthStreamReport,
   listUsersWithTruthStreamProfile,
   runReviewBatch,
+  grantUserPremium,
   SimulationBusyError,
 } from '../controllers/intakeSimulationController';
 
@@ -208,6 +210,19 @@ router.get('/intake/users/:id/verify', async (req: Request, res: Response) => {
   } catch (err) {
     logger.error('Failed to verify sim user', err as Error);
     res.status(500).json({ success: false, error: 'Failed to verify test user' });
+  }
+});
+
+router.post('/intake/users/:id/premium', async (req: Request, res: Response) => {
+  const id = parseUserId(req, res);
+  if (id === null) return;
+  audit('user_grant_premium', req, { userId: id });
+  try {
+    const result = await grantUserPremium(id);
+    res.json({ success: true, data: result });
+  } catch (err) {
+    logger.error('Failed to grant premium', err as Error);
+    res.status(500).json({ success: false, error: (err as Error).message || 'Failed to grant premium' });
   }
 });
 
