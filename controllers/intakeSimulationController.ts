@@ -72,6 +72,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { DB } from '../db';
 import { Logger } from '../utils/logger';
+import { mirrorRedis } from '../config/redis';
 import { TokenManager } from './authController';
 import { createUserInDB, deleteUserFromDB, updateUserPassword } from './userController';
 import { listTierFiles, TierType } from './directoryController';
@@ -305,6 +306,29 @@ function looksLikeSimUser(username: string | null | undefined, email: string | n
   const u = String(username || '');
   const e = String(email || '').toLowerCase();
   return u.startsWith(SIM_USERNAME_PREFIX) && e.endsWith('@' + SIM_EMAIL_DOMAIN);
+}
+
+/** Grant a sim user PERMANENT premium. Premium-gated features (TruthStream,
+ *  groups, journal analysis, …) read tier from `user_subscriptions` via the
+ *  subscription service, so we upsert tier=premium/status=active there (status
+ *  'active' alone confers the tier — no period_end needed, which also sidesteps
+ *  the MySQL TIMESTAMP 2038 ceiling) and clear the 5-minute subscription cache
+ *  so it takes effect immediately. The row CASCADE-deletes with the user. */
+async function ensureSimUserPremium(userId: number): Promise<void> {
+  try {
+    await DB.query(
+      `INSERT INTO user_subscriptions (user_id, tier, status, provider)
+       VALUES (?, 'premium', 'active', 'manual')
+       ON DUPLICATE KEY UPDATE tier = 'premium', status = 'active', provider = 'manual',
+         cancelled_at = NULL, grace_period_end = NULL, cancel_reason = NULL, updated_at = CURRENT_TIMESTAMP`,
+      [userId],
+    );
+  } catch (e) {
+    // Surface clearly — without premium, downstream TruthStream steps will 403.
+    throw new Error(`failed to grant premium to user ${userId}: ${errMsg(e)}`);
+  }
+  // Best-effort cache bust so the gate sees premium on the very next request.
+  try { await mirrorRedis.del(`subscription:${userId}`); } catch { /* cache optional */ }
 }
 
 /** Sanitize an operator-supplied email local part into a safe token usable in
@@ -743,6 +767,10 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
         throw e;
       }
       report.simUserId = userId;
+      // Grant permanent premium on creation so premium-gated features
+      // (TruthStream, groups, journal analysis, …) work for the sim user and
+      // every operation downstream of registration.
+      await ensureSimUserPremium(userId);
       sessionId = TokenManager.generateSessionId();
       await TokenManager.createSession(userId, sessionId, {
         userAgent: 'IntakeSimulation',
@@ -766,7 +794,7 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
       }
 
       const keptNote = options.skipCleanup ? ' (kept: login-enabled, credentials in report)' : '';
-      return { detail: `Created sim user #${userId} (${simUsername}) + directories + keys + session${keptNote}`, data: { userId } };
+      return { detail: `Created sim user #${userId} (${simUsername}) + directories + keys + session + premium${keptNote}`, data: { userId } };
     });
 
     // ---- 2. VISUAL (real upload -> /storage/store tier1) -------------------
@@ -1474,6 +1502,7 @@ async function createHelperReviewer(): Promise<{ userId: number; token: string; 
   const email = `rev+${short}@${SIM_EMAIL_DOMAIN}`;
   const userId = await createUserInDB(username, email, strongRandomPassword());
   await DB.query('UPDATE users SET intake_completed = 1, email_verified = 1 WHERE id = ?', [userId]);
+  await ensureSimUserPremium(userId); // TruthStream profile creation is premium-gated
   const token = await mintAccessToken(userId, username, email);
   await ensureTruthStreamProfile(userId, token, { alias: `sim-rev-${short}` });
   return { userId, token, username, email };
@@ -1618,8 +1647,10 @@ export async function runTargetedReview(opts: { reviewerId: number; revieweeId: 
 
   const tone = normalizeTone(opts.tone);
 
-  // Ensure the reviewer is a usable account with a TruthStream profile.
+  // Ensure the reviewer is a usable, premium account with a TruthStream profile
+  // (giving a review hits the premium-gated /queue endpoints).
   await DB.query('UPDATE users SET intake_completed = 1, email_verified = 1 WHERE id = ?', [reviewerId]);
+  await ensureSimUserPremium(reviewerId);
   const reviewerToken = await mintAccessToken(reviewerId, String(reviewer.username), String(reviewer.email));
   await ensureTruthStreamProfile(reviewerId, reviewerToken);
 
@@ -1631,6 +1662,7 @@ export async function runTargetedReview(opts: { reviewerId: number; revieweeId: 
       throw new Error(`Reviewee #${revieweeId} (a real user) has no TruthStream profile — refusing to create one on their behalf.`);
     }
     await DB.query('UPDATE users SET intake_completed = 1 WHERE id = ?', [revieweeId]);
+    await ensureSimUserPremium(revieweeId); // profile creation is premium-gated
     const revieweeToken = await mintAccessToken(revieweeId, String(reviewee.username), String(reviewee.email));
     await ensureTruthStreamProfile(revieweeId, revieweeToken);
   }
