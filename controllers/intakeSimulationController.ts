@@ -140,6 +140,15 @@ export interface SimRunReport {
   // run response only — NEVER persisted to the audit table or logged — so the
   // operator can sign in as this account. null for ephemeral (cleaned-up) runs.
   credentials: { email: string; username: string; password: string } | null;
+  // Summary of the TruthStream "report card" built for a kept user (truthCard
+  // option). null when not requested.
+  truthCard: {
+    profile: boolean;
+    goalCategory: string | null;
+    reviewsSeeded: number;
+    helperUserIds: number[];
+    analysisRequested: boolean;
+  } | null;
 }
 
 export interface RunOptions {
@@ -161,6 +170,13 @@ export interface RunOptions {
   emailLocalPart?: string;
   // Free-text label stored with the audit row (e.g. "post-deploy smoke").
   label?: string;
+  // When true (and skipCleanup), also build a TruthStream "report card" for the
+  // kept user: create their TruthStream profile, seed a few reviews from helper
+  // sim reviewers, and request the analysis report. Only honored for kept runs.
+  truthCard?: boolean;
+  // Tone for the seeded reviews (one of the 5 allowed TruthStream tones). Shapes
+  // the generated review wording; defaults to "Honest but kind".
+  reviewTone?: string;
 }
 
 // ----------------------------------------------------------------------------
@@ -673,6 +689,7 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
     warnings,
     error: null,
     credentials: null,
+    truthCard: null,
   };
 
   let userId: number | null = null;
@@ -885,6 +902,49 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
       if (!res.body.intakeData?.personalityResult) throw new Error('results missing personalityResult');
       return { detail: 'Latest intake retrieved and decrypted (name + personality round-trip intact)' };
     });
+
+    // ---- 10b. TRUTHSTREAM REPORT CARD (kept users only) --------------------
+    // Build a real TruthStream "report card": create the user's profile, seed a
+    // few reviews from helper sim reviewers (so the card has content), and
+    // request the analysis report. Only for kept runs (so helper reviewers and
+    // the card aren't immediately torn down).
+    if (options.truthCard && options.skipCleanup && !dryRun) {
+      let goalCategory: string | null = null;
+      await step(steps, 'truthstream_profile', async () => {
+        const p = await ensureTruthStreamProfile(userId!, accessToken!);
+        goalCategory = p.goalCategory;
+        return {
+          detail: `TruthStream profile ${p.created ? 'created' : 'already present'} (goal: ${p.goalCategory})`,
+          data: { goalCategory: p.goalCategory },
+        };
+      });
+      await step(steps, 'truthstream_reviews', async () => {
+        const tone = normalizeTone(options.reviewTone);
+        // The mirror report needs MIN_REVIEWS_FOR_ANALYSIS (default 5) received
+        // reviews before it can be generated — seed that many.
+        const target = MIN_REVIEWS_FOR_ANALYSIS;
+        const helperUserIds: number[] = [];
+        let seeded = 0;
+        for (let i = 0; i < target; i++) {
+          const helper = await createHelperReviewer();
+          helperUserIds.push(helper.userId);
+          const r = await submitReview(helper.userId, helper.token, userId!, tone);
+          if (r.reviewId) seeded++;
+        }
+        const gen = await selfRequest('POST', `${TS_BASE}/analysis/generate`, {
+          json: { analysisType: 'truth_mirror_report' }, token: accessToken,
+        });
+        const analysisRequested = gen.status === 200 || gen.status === 202 || !!gen.body?.success;
+        report.truthCard = { profile: true, goalCategory, reviewsSeeded: seeded, helperUserIds, analysisRequested };
+        return {
+          detail: `Seeded ${seeded}/${target} ${tone} reviews from helper sim users; analysis report ${analysisRequested ? 'requested (async)' : `request returned HTTP ${gen.status}`}`,
+          severity: seeded === target ? ('pass' as StepSeverity) : ('warn' as StepSeverity),
+          data: { reviewsSeeded: seeded, helperUserIds },
+        };
+      });
+    } else if (options.truthCard && !options.skipCleanup) {
+      warnings.push('truthCard requested but ignored — it requires Keep sim user (skipCleanup) so the card and its helper reviewers are not immediately torn down');
+    }
 
     // ---- 11. CLEANUP -------------------------------------------------------
     if (options.skipCleanup) {
@@ -1160,7 +1220,7 @@ export async function verifyUserPurged(userId: number): Promise<PurgeVerificatio
         AND (
           COLUMN_NAME = 'user_id'
           OR COLUMN_NAME LIKE '%\\_user\\_id'
-          OR COLUMN_NAME IN ('accessed_by','started_by','created_by','reviewer_id')
+          OR COLUMN_NAME IN ('accessed_by','started_by','created_by','reviewer_id','reviewee_id')
         )`,
   );
 
@@ -1251,4 +1311,494 @@ export async function deleteSimUser(userId: number): Promise<DeleteSimUserResult
     dinaDetail: td.dinaDetail,
     verification,
   };
+}
+
+// ============================================================================
+// TRUTHSTREAM SIMULATION — report card + review-giving pipeline
+// ----------------------------------------------------------------------------
+// Faithful to the real journey: profiles are created via POST /truthstream/
+// profile, and reviews are submitted through the REAL /queue/:id/start +
+// /queue/:id/complete endpoints. To target a SPECIFIC reviewee (the real flow
+// matches reviewers to reviewees algorithmically), we seed a single
+// truth_stream_queue pairing and then drive the real endpoints over it.
+//
+// SAFETY: we only ever mint an access token for a SIM user, so the REVIEWER is
+// always a sim account. The REVIEWEE may be sim or real (we just read their
+// existing profile and write the review they receive) — we never authenticate
+// as, or author profile data for, a real account.
+// ============================================================================
+
+const TS_BASE = '/mirror/api/truthstream';
+
+// Mirror report requires this many received reviews before it can be generated
+// (mirrors TRUTHSTREAM_MIN_REVIEWS_FOR_ANALYSIS on the TruthStream side).
+const MIN_REVIEWS_FOR_ANALYSIS = parseInt(process.env.TRUTHSTREAM_MIN_REVIEWS_FOR_ANALYSIS || '5', 10);
+
+// The five self-tagged tones the questionnaire's free_form section allows. The
+// complete endpoint REQUIRES responses.free_form.self_tagged_tone to be set.
+const REVIEW_TONES = [
+  'Encouraging and supportive',
+  'Honest but kind',
+  'Direct and unfiltered',
+  'Critical with constructive intent',
+  'Tough love',
+] as const;
+type ReviewTone = typeof REVIEW_TONES[number];
+
+function normalizeTone(input?: string): ReviewTone {
+  const match = REVIEW_TONES.find((t) => t.toLowerCase() === String(input || '').toLowerCase());
+  return match || 'Honest but kind';
+}
+
+// A paragraph that deliberately trips the scorer's criticism + tips + advice
+// keyword detectors (so quality scores land high), prefixed by a tone-specific
+// opener. Keywords present: improve/grow (criticism), suggest/consider/practice/
+// try/work on/focus on/build/develop (tips), advice/recommend/should (advice).
+function constructiveText(tone: ReviewTone, lead: string): string {
+  const openers: Record<ReviewTone, string> = {
+    'Encouraging and supportive': 'You are clearly making real progress and it shows.',
+    'Honest but kind': 'I will be honest with you, and I mean this kindly.',
+    'Direct and unfiltered': 'Straight up, with no sugar-coating.',
+    'Critical with constructive intent': 'Here is some pointed but genuinely useful criticism.',
+    'Tough love': 'Tough love here, because I think you can take it.',
+  };
+  return (
+    `${openers[tone]} ${lead} There is real room to improve and grow in this area. ` +
+    `My honest advice is that you should consider and practice this deliberately: I recommend you ` +
+    `try a small experiment this week, focus on the fundamentals, work on it consistently, and you will build and develop quickly.`
+  );
+}
+
+function answerForQuestion(q: any, tone: ReviewTone): any {
+  const c = q?.config || {};
+  switch (q?.type) {
+    case 'scale': {
+      const min = Number(c.min ?? 1);
+      const max = Number(c.max ?? 10);
+      return Math.min(max, Math.max(min, Math.round((min + max) / 2) + 1));
+    }
+    case 'select_words': {
+      const list: string[] = Array.isArray(c.words) && c.words.length
+        ? c.words
+        : ['Genuine', 'Warm', 'Thoughtful', 'Confident', 'Direct', 'Honest'];
+      const min = Number(c.min ?? 1);
+      const max = Number(c.max ?? 5);
+      const target = Math.min(Math.max(min, 3), Math.max(min, max));
+      return list.slice(0, Math.min(target, list.length));
+    }
+    case 'free_text': {
+      const maxLen = Number(c.maxLength ?? 2000);
+      return constructiveText(tone, String(q.text || '')).slice(0, maxLen);
+    }
+    case 'category_explain': {
+      const cats: string[] = Array.isArray(c.categories) && c.categories.length ? c.categories : ['Communication'];
+      const selectCount = Math.max(1, Number(c.selectCount ?? 1));
+      const maxLen = Number(c.maxLength ?? 1500);
+      return {
+        categories: cats.slice(0, Math.min(selectCount, cats.length)),
+        explanation: constructiveText(tone, String(q.text || '')).slice(0, maxLen),
+      };
+    }
+    case 'multi_choice': {
+      const opts: string[] = Array.isArray(c.options) ? c.options : [];
+      return opts.length ? opts[0] : 'yes';
+    }
+    default:
+      return constructiveText(tone, String(q?.text || ''));
+  }
+}
+
+// Build a complete, valid `responses` object for a questionnaire's sections,
+// shaped by `tone`. Always sets the scorer-required free_form keys.
+function generateReviewResponses(sections: any[], tone: ReviewTone): Record<string, any> {
+  const responses: Record<string, any> = {};
+  for (const section of sections || []) {
+    const sec: Record<string, any> = {};
+    for (const q of section?.questions || []) {
+      sec[q.id] = answerForQuestion(q, tone);
+    }
+    responses[section.id] = sec;
+  }
+  // The scorer reads these exact keys regardless of the questionnaire shape.
+  responses.free_form = {
+    ...(responses.free_form || {}),
+    self_tagged_tone: tone,
+    open_reflection:
+      constructiveText(tone, 'Overall:') +
+      ' My broader recommendation is to keep practicing, seek feedback often, and work on the specific areas noted above.',
+  };
+  return responses;
+}
+
+/** Mint a short-lived access token for a SIM user (creates a session). */
+async function mintAccessToken(userId: number, username: string, email: string): Promise<string> {
+  const sessionId = TokenManager.generateSessionId();
+  await TokenManager.createSession(userId, sessionId, {
+    userAgent: 'IntakeSimulation', ipAddress: '127.0.0.1', fingerprint: `simtok-${userId}`,
+  });
+  return TokenManager.createAccessToken({ id: userId, email, username, sessionId });
+}
+
+/** Create the user's TruthStream profile via the REAL endpoint if absent. */
+async function ensureTruthStreamProfile(
+  userId: number,
+  token: string,
+  opts?: { alias?: string; goalCategory?: string },
+): Promise<{ created: boolean; goalCategory: string }> {
+  const [rows] = await DB.query('SELECT goal_category FROM truth_stream_profiles WHERE user_id = ? LIMIT 1', [userId]);
+  if ((rows as any[]).length > 0) return { created: false, goalCategory: String((rows as any[])[0].goal_category) };
+
+  const alias = (opts?.alias || `sim-card-${crypto.randomUUID().slice(0, 8)}`).slice(0, 50);
+  const payload = {
+    displayAlias: alias,
+    ageRange: '25-34',
+    selfStatement: 'Simulation profile created by the intake/TruthStream test harness for end-to-end verification.',
+    feedbackAreas: ['First Impressions', 'Communication'],
+    sharedDataTypes: ['personality', 'cognitive', 'astrological'],
+    goalCategory: opts?.goalCategory || 'personal_growth',
+  };
+  const res = await selfRequest('POST', `${TS_BASE}/profile`, { json: payload, token });
+  if (res.status !== 201 && res.status !== 200) {
+    // Possible race / already exists — re-read before failing.
+    const [again] = await DB.query('SELECT goal_category FROM truth_stream_profiles WHERE user_id = ? LIMIT 1', [userId]);
+    if ((again as any[]).length > 0) return { created: false, goalCategory: String((again as any[])[0].goal_category) };
+    throw new Error(`TruthStream profile create failed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
+  }
+  return { created: true, goalCategory: String(res.body?.data?.goalCategory || payload.goalCategory) };
+}
+
+/** Create a lightweight helper sim reviewer (reserved namespace) with a profile. */
+async function createHelperReviewer(): Promise<{ userId: number; token: string; username: string; email: string }> {
+  const short = crypto.randomUUID().slice(0, 8);
+  const username = `${SIM_USERNAME_PREFIX}rev_${short}`;
+  const email = `rev+${short}@${SIM_EMAIL_DOMAIN}`;
+  const userId = await createUserInDB(username, email, strongRandomPassword());
+  await DB.query('UPDATE users SET intake_completed = 1, email_verified = 1 WHERE id = ?', [userId]);
+  const token = await mintAccessToken(userId, username, email);
+  await ensureTruthStreamProfile(userId, token, { alias: `sim-rev-${short}` });
+  return { userId, token, username, email };
+}
+
+/** Seed a targeted queue pairing, then drive the REAL start + complete endpoints. */
+async function submitReview(
+  reviewerId: number,
+  reviewerToken: string,
+  revieweeId: number,
+  tone: ReviewTone,
+): Promise<{ reviewId?: string; quality?: number; completeness?: number; depth?: number }> {
+  const [pRows] = await DB.query('SELECT goal_category FROM truth_stream_profiles WHERE user_id = ? LIMIT 1', [revieweeId]);
+  if ((pRows as any[]).length === 0) throw new Error(`reviewee #${revieweeId} has no TruthStream profile`);
+  const goalCategory = String((pRows as any[])[0].goal_category);
+
+  const [qRows] = await DB.query(
+    `SELECT id, sections FROM truth_stream_questionnaires WHERE goal_category = ? AND is_active = 1 ORDER BY version DESC LIMIT 1`,
+    [goalCategory],
+  );
+  if ((qRows as any[]).length === 0) throw new Error(`no active questionnaire for goal_category ${goalCategory}`);
+  const rawSections = (qRows as any[])[0].sections;
+  const sections = typeof rawSections === 'string' ? JSON.parse(rawSections) : rawSections;
+
+  // Targeted pairing (bypasses algorithmic matching). Unique batch number.
+  const [mb] = await DB.query('SELECT COALESCE(MAX(batch_number), 0) + 1 AS b FROM truth_stream_queue WHERE reviewer_id = ?', [reviewerId]);
+  const batch = Number((mb as any[])[0]?.b ?? 1);
+  const queueId = crypto.randomUUID();
+  await DB.query(
+    `INSERT INTO truth_stream_queue (id, reviewer_id, reviewee_id, batch_number, status, assigned_at, expires_at)
+     VALUES (?, ?, ?, ?, 'pending', NOW(), DATE_ADD(NOW(), INTERVAL 48 HOUR))`,
+    [queueId, reviewerId, revieweeId, batch],
+  );
+
+  const startRes = await selfRequest('POST', `${TS_BASE}/queue/${queueId}/start`, { json: {}, token: reviewerToken });
+  if (startRes.status !== 200 && startRes.status !== 201) {
+    throw new Error(`queue start failed: HTTP ${startRes.status} ${JSON.stringify(startRes.body).slice(0, 200)}`);
+  }
+
+  const responses = generateReviewResponses(sections, tone);
+  const completeRes = await selfRequest('POST', `${TS_BASE}/queue/${queueId}/complete`, {
+    json: { responses, timeSpentSeconds: 60, idempotencyKey: queueId },
+    token: reviewerToken,
+  });
+  if (completeRes.status !== 201 && completeRes.status !== 200) {
+    throw new Error(`queue complete failed: HTTP ${completeRes.status} ${JSON.stringify(completeRes.body).slice(0, 300)}`);
+  }
+  const d = completeRes.body?.data || {};
+  return { reviewId: d.reviewId, quality: d.qualityScore, completeness: d.completenessScore, depth: d.depthScore };
+}
+
+export interface ReviewableUser {
+  id: number;
+  username: string;
+  email: string;
+  isSim: boolean;
+  hasProfile: boolean;
+  goalCategory: string | null;
+}
+
+/** Sim users (newest first) annotated with whether they have a TruthStream
+ *  profile — the candidate pool for the reviewer/reviewee pickers. */
+export async function listReviewableUsers(): Promise<ReviewableUser[]> {
+  const [rows] = await DB.query(
+    `SELECT u.id, u.username, u.email, p.goal_category
+       FROM users u
+       LEFT JOIN truth_stream_profiles p ON p.user_id = u.id
+      WHERE u.email LIKE CONCAT('%@', ?)
+      ORDER BY u.id DESC
+      LIMIT 500`,
+    [SIM_EMAIL_DOMAIN],
+  );
+  const out: ReviewableUser[] = [];
+  for (const r of rows as any[]) {
+    if (!looksLikeSimUser(r.username, r.email)) continue;
+    out.push({
+      id: Number(r.id), username: String(r.username), email: String(r.email),
+      isSim: true, hasProfile: !!r.goal_category, goalCategory: r.goal_category || null,
+    });
+  }
+  return out;
+}
+
+/** Search ANY user (sim or real) for picking a reviewee. Matches id / username /
+ *  email; flags whether each is a sim user and has a TruthStream profile. */
+export async function searchUsers(q: string, limit = 25): Promise<ReviewableUser[]> {
+  const term = String(q || '').trim();
+  if (!term) return [];
+  const like = `%${term}%`;
+  const asId = Number(term);
+  const useId = Number.isInteger(asId) && asId > 0;
+  const cap = Math.min(Math.max(1, limit), 50);
+  const [rows] = await DB.query(
+    `SELECT u.id, u.username, u.email, p.goal_category
+       FROM users u
+       LEFT JOIN truth_stream_profiles p ON p.user_id = u.id
+      WHERE u.username LIKE ? OR u.email LIKE ?${useId ? ' OR u.id = ?' : ''}
+      ORDER BY u.id DESC
+      LIMIT ?`,
+    useId ? [like, like, asId, cap] : [like, like, cap],
+  );
+  return (rows as any[]).map((r) => ({
+    id: Number(r.id), username: String(r.username), email: String(r.email),
+    isSim: looksLikeSimUser(r.username, r.email), hasProfile: !!r.goal_category, goalCategory: r.goal_category || null,
+  }));
+}
+
+export interface TargetedReviewResult {
+  reviewId: string | null;
+  reviewerId: number;
+  revieweeId: number;
+  revieweeIsSim: boolean;
+  tone: ReviewTone;
+  goalCategory: string;
+  qualityScore: number | null;
+  completenessScore: number | null;
+  depthScore: number | null;
+  classificationPending: boolean;
+}
+
+/** Run one targeted review: a SIM reviewer reviews a chosen reviewee (sim or
+ *  real) with the given tone, via the real start/complete pipeline. */
+export async function runTargetedReview(opts: { reviewerId: number; revieweeId: number; tone?: string }): Promise<TargetedReviewResult> {
+  const reviewerId = Number(opts.reviewerId);
+  const revieweeId = Number(opts.revieweeId);
+  if (!Number.isInteger(reviewerId) || reviewerId <= 0) throw new Error('Invalid reviewerId');
+  if (!Number.isInteger(revieweeId) || revieweeId <= 0) throw new Error('Invalid revieweeId');
+  if (reviewerId === revieweeId) throw new Error('A user cannot review themselves');
+
+  // The reviewer MUST be a sim user — we only ever mint tokens for sim accounts.
+  const [rRows] = await DB.query('SELECT username, email FROM users WHERE id = ? LIMIT 1', [reviewerId]);
+  const reviewer = (rRows as any[])[0];
+  if (!reviewer) throw new Error(`Reviewer #${reviewerId} not found`);
+  if (!looksLikeSimUser(reviewer.username, reviewer.email)) {
+    throw new Error(`Reviewer #${reviewerId} is not a simulation user. The reviewer must be a sim user (the tool never authenticates as a real account).`);
+  }
+
+  const [eRows] = await DB.query('SELECT username, email FROM users WHERE id = ? LIMIT 1', [revieweeId]);
+  const reviewee = (eRows as any[])[0];
+  if (!reviewee) throw new Error(`Reviewee #${revieweeId} not found`);
+  const revieweeIsSim = looksLikeSimUser(reviewee.username, reviewee.email);
+
+  const tone = normalizeTone(opts.tone);
+
+  // Ensure the reviewer is a usable account with a TruthStream profile.
+  await DB.query('UPDATE users SET intake_completed = 1, email_verified = 1 WHERE id = ?', [reviewerId]);
+  const reviewerToken = await mintAccessToken(reviewerId, String(reviewer.username), String(reviewer.email));
+  await ensureTruthStreamProfile(reviewerId, reviewerToken);
+
+  // The reviewee needs a TruthStream profile (its goal_category selects the
+  // questionnaire). Create one only if the reviewee is a sim user.
+  const [pRows] = await DB.query('SELECT goal_category FROM truth_stream_profiles WHERE user_id = ? LIMIT 1', [revieweeId]);
+  if ((pRows as any[]).length === 0) {
+    if (!revieweeIsSim) {
+      throw new Error(`Reviewee #${revieweeId} (a real user) has no TruthStream profile — refusing to create one on their behalf.`);
+    }
+    await DB.query('UPDATE users SET intake_completed = 1 WHERE id = ?', [revieweeId]);
+    const revieweeToken = await mintAccessToken(revieweeId, String(reviewee.username), String(reviewee.email));
+    await ensureTruthStreamProfile(revieweeId, revieweeToken);
+  }
+
+  const r = await submitReview(reviewerId, reviewerToken, revieweeId, tone);
+  const [gRows] = await DB.query('SELECT goal_category FROM truth_stream_profiles WHERE user_id = ? LIMIT 1', [revieweeId]);
+  return {
+    reviewId: r.reviewId || null,
+    reviewerId, revieweeId, revieweeIsSim, tone,
+    goalCategory: String((gRows as any[])[0]?.goal_category || 'unknown'),
+    qualityScore: r.quality ?? null,
+    completenessScore: r.completeness ?? null,
+    depthScore: r.depth ?? null,
+    classificationPending: true,
+  };
+}
+
+// ============================================================================
+// TRUTHSTREAM INSPECTION — read a user's report card, reviews, and analysis
+// ----------------------------------------------------------------------------
+// Read-only admin view (queries the DB directly; no token needed) powering the
+// Test Users "Inspect" panel: the profile, the received reviews (with Dina's
+// classification once the worker runs), the given reviews, the generated mirror
+// report, and any still-pending Dina jobs. Works for sim or real users.
+// ============================================================================
+
+export interface TruthStreamReviewSummary {
+  id: string;
+  classification: string | null;
+  classificationConfidence: number | null;
+  qualityScore: number | null;
+  completenessScore: number | null;
+  depthScore: number | null;
+  tone: string | null;
+  snippet: string | null;
+  createdAt: string | null;
+}
+
+export interface TruthStreamUserReport {
+  hasProfile: boolean;
+  minReviewsForAnalysis: number;
+  profile: {
+    displayAlias: string;
+    goalCategory: string;
+    isActive: boolean;
+    totalReviewsReceived: number;
+    totalReviewsGiven: number;
+    reviewQualityScore: number | null;
+    perceptionGapScore: number | null;
+    profileCompleteness: number | null;
+  } | null;
+  receivedReviews: TruthStreamReviewSummary[];
+  givenReviews: { id: string; revieweeId: number; classification: string | null; qualityScore: number | null; createdAt: string | null }[];
+  analysis: {
+    analysisType: string;
+    reviewCountAtGeneration: number;
+    perceptionGapScore: number | null;
+    confidenceLevel: number | null;
+    createdAt: string | null;
+    summary: string | null;
+  } | null;
+  pendingJobs: { jobType: string; status: string; createdAt: string | null }[];
+}
+
+export async function getUserTruthStreamReport(userId: number): Promise<TruthStreamUserReport> {
+  const out: TruthStreamUserReport = {
+    hasProfile: false,
+    minReviewsForAnalysis: MIN_REVIEWS_FOR_ANALYSIS,
+    profile: null,
+    receivedReviews: [],
+    givenReviews: [],
+    analysis: null,
+    pendingJobs: [],
+  };
+
+  const [pRows] = await DB.query(
+    `SELECT display_alias, goal_category, is_active, total_reviews_received, total_reviews_given,
+            review_quality_score, perception_gap_score, profile_completeness
+       FROM truth_stream_profiles WHERE user_id = ? LIMIT 1`,
+    [userId],
+  );
+  const p = (pRows as any[])[0];
+  if (!p) return out; // no TruthStream profile — nothing else to show
+  out.hasProfile = true;
+  out.profile = {
+    displayAlias: String(p.display_alias),
+    goalCategory: String(p.goal_category),
+    isActive: !!p.is_active,
+    totalReviewsReceived: Number(p.total_reviews_received || 0),
+    totalReviewsGiven: Number(p.total_reviews_given || 0),
+    reviewQualityScore: p.review_quality_score ?? null,
+    perceptionGapScore: p.perception_gap_score ?? null,
+    profileCompleteness: p.profile_completeness ?? null,
+  };
+
+  const [recv] = await DB.query(
+    `SELECT id, classification, classification_confidence, quality_score, completeness_score, depth_score, responses, created_at
+       FROM truth_stream_reviews WHERE reviewee_id = ? ORDER BY created_at DESC LIMIT 20`,
+    [userId],
+  );
+  out.receivedReviews = (recv as any[]).map((r) => {
+    let tone: string | null = null;
+    let snippet: string | null = null;
+    try {
+      const resp = typeof r.responses === 'string' ? JSON.parse(r.responses) : r.responses;
+      tone = resp?.free_form?.self_tagged_tone ?? null;
+      const open = resp?.free_form?.open_reflection;
+      snippet = typeof open === 'string' ? open.slice(0, 160) : null;
+    } catch { /* leave null */ }
+    return {
+      id: String(r.id),
+      classification: r.classification ?? null,
+      classificationConfidence: r.classification_confidence ?? null,
+      qualityScore: r.quality_score ?? null,
+      completenessScore: r.completeness_score ?? null,
+      depthScore: r.depth_score ?? null,
+      tone,
+      snippet,
+      createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+    };
+  });
+
+  const [given] = await DB.query(
+    `SELECT id, reviewee_id, classification, quality_score, created_at
+       FROM truth_stream_reviews WHERE reviewer_id = ? ORDER BY created_at DESC LIMIT 20`,
+    [userId],
+  );
+  out.givenReviews = (given as any[]).map((r) => ({
+    id: String(r.id),
+    revieweeId: Number(r.reviewee_id),
+    classification: r.classification ?? null,
+    qualityScore: r.quality_score ?? null,
+    createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+  }));
+
+  const [an] = await DB.query(
+    `SELECT analysis_type, review_count_at_generation, perception_gap_score, confidence_level, analysis_data, created_at
+       FROM truth_stream_analyses WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`,
+    [userId],
+  );
+  const a = (an as any[])[0];
+  if (a) {
+    let summary: string | null = null;
+    try {
+      const data = typeof a.analysis_data === 'string' ? JSON.parse(a.analysis_data) : a.analysis_data;
+      const text = data?.summary || data?.report || data?.text || data?.overview;
+      summary = typeof text === 'string' ? text.slice(0, 1200) : JSON.stringify(data).slice(0, 1200);
+    } catch { summary = null; }
+    out.analysis = {
+      analysisType: String(a.analysis_type),
+      reviewCountAtGeneration: Number(a.review_count_at_generation || 0),
+      perceptionGapScore: a.perception_gap_score ?? null,
+      confidenceLevel: a.confidence_level ?? null,
+      createdAt: a.created_at ? new Date(a.created_at).toISOString() : null,
+      summary,
+    };
+  }
+
+  const [jobs] = await DB.query(
+    `SELECT job_type, status, created_at FROM truth_stream_processing_queue
+      WHERE user_id = ? AND status IN ('pending', 'processing') ORDER BY created_at DESC LIMIT 10`,
+    [userId],
+  );
+  out.pendingJobs = (jobs as any[]).map((j) => ({
+    jobType: String(j.job_type),
+    status: String(j.status),
+    createdAt: j.created_at ? new Date(j.created_at).toISOString() : null,
+  }));
+
+  return out;
 }
