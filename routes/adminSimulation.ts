@@ -19,8 +19,12 @@
 //                                 Body: { maxAgeMinutes? }
 //   GET    /intake/users               — list kept sim users + file footprint
 //   GET    /intake/users/:id/verify    — prove a user's DB+disk footprint (R/O)
+//   GET    /intake/users/:id/truthstream — a user's card + reviews + report (R/O)
 //   POST   /intake/users/:id/reset-password — set a new password { password? }
 //   DELETE /intake/users/:id           — delete one sim user, then verify purge
+//   GET    /intake/reviewable-users    — sim users (+ TruthStream profile flag)
+//   GET    /intake/user-search?q=      — search any user for a reviewee
+//   POST   /intake/reviews/run         — run one targeted TruthStream review
 // ============================================================================
 
 import express, { Request, Response } from 'express';
@@ -36,6 +40,10 @@ import {
   verifyUserPurged,
   resetSimUserPassword,
   deleteSimUser,
+  listReviewableUsers,
+  searchUsers,
+  runTargetedReview,
+  getUserTruthStreamReport,
   SimulationBusyError,
 } from '../controllers/intakeSimulationController';
 
@@ -81,11 +89,14 @@ router.post('/intake/run', async (req: Request, res: Response) => {
   // the reserved sim domain server-side).
   const emailLocalPart =
     typeof req.body?.emailLocalPart === 'string' && req.body.emailLocalPart.length > 0 ? req.body.emailLocalPart : undefined;
+  // Optionally build a TruthStream report card for a kept user.
+  const truthCard = req.body?.truthCard === true;
+  const reviewTone = typeof req.body?.reviewTone === 'string' ? req.body.reviewTone : undefined;
 
-  audit('run_started', req, { dryRun, skipCleanup, label, customPassword: !!password, customEmail: !!emailLocalPart });
+  audit('run_started', req, { dryRun, skipCleanup, label, customPassword: !!password, customEmail: !!emailLocalPart, truthCard, reviewTone });
 
   try {
-    const report = await runIntakeSimulation({ dryRun, skipCleanup, password, emailLocalPart, label }, op);
+    const report = await runIntakeSimulation({ dryRun, skipCleanup, password, emailLocalPart, label, truthCard, reviewTone }, op);
     audit('run_finished', req, {
       runId: report.runId,
       status: report.status,
@@ -196,6 +207,19 @@ router.get('/intake/users/:id/verify', async (req: Request, res: Response) => {
   }
 });
 
+router.get('/intake/users/:id/truthstream', async (req: Request, res: Response) => {
+  const id = parseUserId(req, res);
+  if (id === null) return;
+  try {
+    const report = await getUserTruthStreamReport(id);
+    audit('user_truthstream_viewed', req, { userId: id, hasProfile: report.hasProfile, received: report.receivedReviews.length, hasAnalysis: !!report.analysis });
+    res.json({ success: true, data: report });
+  } catch (err) {
+    logger.error('Failed to read TruthStream report', err as Error);
+    res.status(500).json({ success: false, error: 'Failed to read TruthStream report' });
+  }
+});
+
 router.post('/intake/users/:id/reset-password', async (req: Request, res: Response) => {
   const id = parseUserId(req, res);
   if (id === null) return;
@@ -234,6 +258,68 @@ router.delete('/intake/users/:id', async (req: Request, res: Response) => {
     const safety = /safety stop|not a simulation user/i.test(msg);
     logger.error('Failed to delete sim user', err as Error);
     res.status(safety ? 400 : 500).json({ success: false, error: msg });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// TRUTHSTREAM REVIEW RUNNER
+//   GET  /intake/reviewable-users  — sim users (+ whether they have a profile)
+//   GET  /intake/user-search?q=    — search any user (sim or real) for a reviewee
+//   POST /intake/reviews/run       — run one targeted review { reviewerId,
+//                                    revieweeId, tone }
+// The reviewer must be a sim user (enforced in the controller); a real reviewee
+// is allowed but flagged in the response.
+// ---------------------------------------------------------------------------
+
+router.get('/intake/reviewable-users', async (req: Request, res: Response) => {
+  try {
+    const users = await listReviewableUsers();
+    audit('reviewable_users_listed', req, { count: users.length });
+    res.json({ success: true, data: users });
+  } catch (err) {
+    logger.error('Failed to list reviewable users', err as Error);
+    res.status(500).json({ success: false, error: 'Failed to list reviewable users' });
+  }
+});
+
+router.get('/intake/user-search', async (req: Request, res: Response) => {
+  const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  if (q.length < 2) {
+    res.status(400).json({ success: false, error: 'Search query must be at least 2 characters' });
+    return;
+  }
+  try {
+    const users = await searchUsers(q, 25);
+    audit('user_search', req, { q, count: users.length });
+    res.json({ success: true, data: users });
+  } catch (err) {
+    logger.error('User search failed', err as Error);
+    res.status(500).json({ success: false, error: 'User search failed' });
+  }
+});
+
+router.post('/intake/reviews/run', async (req: Request, res: Response) => {
+  const reviewerId = Number(req.body?.reviewerId);
+  const revieweeId = Number(req.body?.revieweeId);
+  const tone = typeof req.body?.tone === 'string' ? req.body.tone : undefined;
+  if (!Number.isInteger(reviewerId) || reviewerId <= 0 || !Number.isInteger(revieweeId) || revieweeId <= 0) {
+    res.status(400).json({ success: false, error: 'reviewerId and revieweeId must be positive integers' });
+    return;
+  }
+  audit('review_run_started', req, { reviewerId, revieweeId, tone });
+  try {
+    const result = await runTargetedReview({ reviewerId, revieweeId, tone });
+    audit('review_run_finished', req, {
+      reviewerId, revieweeId, revieweeIsSim: result.revieweeIsSim,
+      reviewId: result.reviewId, qualityScore: result.qualityScore,
+    });
+    res.json({ success: true, data: result });
+  } catch (err) {
+    const msg = (err as Error).message || 'Failed to run review';
+    // Validation / safety stops are client errors, not server faults.
+    const client = /not a simulation user|cannot review themselves|not found|no TruthStream profile|Invalid review|refusing/i.test(msg);
+    logger.error('Targeted review failed', err as Error);
+    res.status(client ? 400 : 500).json({ success: false, error: msg });
   }
 });
 
