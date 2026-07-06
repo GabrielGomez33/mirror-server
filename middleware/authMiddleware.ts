@@ -105,6 +105,16 @@ let subscriptionServiceRef: any = null;
 // ============================================================================
 const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
 
+// Monotonic sequence used to give every AuthMiddleware.rateLimit(...) registration
+// its OWN bucket namespace. Each route calls rateLimit(max, windowMs) exactly once
+// at module-load time, so the id captured in that closure is stable for the life of
+// the process and unique per route. Without this, the store was keyed on the caller
+// identity alone (`user_<id>`), so EVERY rate-limited route for a given user shared a
+// single counter — a request to a 60/min endpoint would consume budget belonging to a
+// 20/min endpoint, and a dashboard fanning out several GETs tripped the lowest limit
+// almost immediately. Namespacing per registration restores true per-route limits.
+let rateLimitBucketSeq = 0;
+
 class AuthMiddleware {
 
   // ==========================================================================
@@ -601,24 +611,38 @@ class AuthMiddleware {
   // ==========================================================================
 
   static rateLimit = (maxRequests: number, windowMs: number) => {
+    // Stable, unique namespace for THIS registration (see rateLimitBucketSeq above).
+    // Captured once per route so each route enforces its own (maxRequests, windowMs)
+    // instead of sharing one global per-user counter.
+    const bucketId = `rl${++rateLimitBucketSeq}`;
+
     return (req: Request, res: Response, next: NextFunction) => {
       const identifier = req.user?.id ?
         `user_${req.user.id}` :
         req.securityContext?.ipAddress || req.ip || 'unknown';
 
-      const now = Date.now();
-      const windowStart = now - windowMs;
+      // Per-route + per-caller key. Two different routes never touch the same bucket.
+      const key = `${bucketId}:${identifier}`;
 
-      let limitData = rateLimitStore.get(identifier);
-      if (!limitData || limitData.resetTime < windowStart) {
+      const now = Date.now();
+
+      // Fixed-window reset. Previously the reset test compared the fixed resetTime
+      // (now + windowMs) against a SLIDING windowStart (now - windowMs), which only
+      // fired once now > firstRequest + 2*windowMs — holding the window open for
+      // TWICE the configured duration and leaving retryAfter understated. Resetting
+      // when the window has actually elapsed (now >= resetTime) restores the intended
+      // window and makes retryAfter accurate.
+      let limitData = rateLimitStore.get(key);
+      if (!limitData || now >= limitData.resetTime) {
         limitData = { count: 0, resetTime: now + windowMs };
-        rateLimitStore.set(identifier, limitData);
+        rateLimitStore.set(key, limitData);
       }
 
       if (limitData.count >= maxRequests) {
         if (req.user) {
           SecurityMonitor.logSecurityEvent(req.user.id, 'rate_limit_exceeded', {
             identifier,
+            bucket: bucketId,
             count: limitData.count,
             maxRequests,
             windowMs,
@@ -627,10 +651,18 @@ class AuthMiddleware {
           }, 'medium');
         }
 
+        // resetTime is always in the future here (an elapsed window would have been
+        // reset above), so retryAfter is a truthful, >= 1s wait.
+        const retryAfter = Math.max(1, Math.ceil((limitData.resetTime - now) / 1000));
+        res.setHeader('Retry-After', retryAfter);
+        res.setHeader('X-RateLimit-Limit', maxRequests);
+        res.setHeader('X-RateLimit-Remaining', 0);
+        res.setHeader('X-RateLimit-Reset', Math.ceil(limitData.resetTime / 1000));
+
         return res.status(429).json({
           error: 'Rate limit exceeded.',
           code: 'RATE_LIMIT_EXCEEDED',
-          retryAfter: Math.ceil((limitData.resetTime - now) / 1000)
+          retryAfter
         });
       }
 
