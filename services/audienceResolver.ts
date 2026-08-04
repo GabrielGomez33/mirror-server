@@ -269,9 +269,16 @@ async function previewWaitlist(filter: AudienceFilter): Promise<AudiencePreview>
   const [countRows] = await DB.query(`SELECT COUNT(*) AS n FROM waitlist_signups w WHERE ${where}`, params);
   const total = Number((countRows as any[])[0]?.n ?? 0);
 
+  // waitlist_signups.email and email_suppressions.email were created with
+  // different collations (utf8mb4_0900_ai_ci vs utf8mb4_unicode_ci), so an
+  // implicit `=` across them raises "Illegal mix of collations". Force the
+  // comparison to the system collation (utf8mb4_unicode_ci, the convention used
+  // by email_suppressions / users). The literal is a fixed identifier, not user
+  // input. Migration 020 aligns the table so this hint becomes belt-and-braces.
   const [supRows] = await DB.query(
     `SELECT COUNT(*) AS n FROM waitlist_signups w
-       JOIN email_suppressions s ON s.email = LOWER(w.email)
+       JOIN email_suppressions s
+         ON s.email = LOWER(w.email) COLLATE utf8mb4_unicode_ci
       WHERE ${where}`,
     params,
   );
