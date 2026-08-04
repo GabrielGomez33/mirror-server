@@ -54,7 +54,31 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-const MIGRATIONS_DIR = path.resolve(__dirname, '..', 'migrations');
+// The .sql files live in <project-root>/migrations. `tsc` does NOT copy them
+// into dist/, so we cannot resolve relative to __dirname alone — the compiled
+// runner sits at dist/scripts/migrate.js while the migrations stay at the
+// source root. Try the candidates that cover both run modes and pick the first
+// that actually exists:
+//   * process.cwd()/migrations       — npm scripts always run at the pkg root
+//   * __dirname/../migrations         — ts-node (scripts/ -> root/migrations)
+//   * __dirname/../../migrations      — compiled (dist/scripts/ -> root)
+function resolveMigrationsDir(): string {
+  const candidates = [
+    path.resolve(process.cwd(), 'migrations'),
+    path.resolve(__dirname, '..', 'migrations'),
+    path.resolve(__dirname, '..', '..', 'migrations'),
+  ];
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(c) && fs.statSync(c).isDirectory()) return c;
+    } catch {
+      /* keep trying */
+    }
+  }
+  return candidates[0];
+}
+
+const MIGRATIONS_DIR = resolveMigrationsDir();
 
 // A table whose presence signals "this is an already-populated database" for
 // the baseline guard. `users` is core and exists after migration 011.
@@ -202,6 +226,15 @@ async function cmdBaseline(conn: mysql.Connection): Promise<void> {
   const applied = await appliedSet(conn);
   const files = listMigrationFiles();
 
+  if (files.length === 0) {
+    console.warn(
+      `\nWARNING: no .sql files found in ${MIGRATIONS_DIR}. Nothing to ` +
+      `baseline. Run this from the project root (where the migrations/ ` +
+      `directory lives).\n`
+    );
+    return;
+  }
+
   let marked = 0;
   const skipped: string[] = [];
 
@@ -247,6 +280,16 @@ async function cmdUp(conn: mysql.Connection): Promise<void> {
   await ensureLedger(conn);
   const applied = await appliedSet(conn);
   const files = listMigrationFiles();
+
+  if (files.length === 0) {
+    console.warn(
+      `\nWARNING: no .sql files found in ${MIGRATIONS_DIR}. Nothing to ` +
+      `migrate. Run this from the project root (where the migrations/ ` +
+      `directory lives).\n`
+    );
+    return;
+  }
+
   const pending = files.filter((f) => !applied.has(f));
 
   // Baseline guard: empty ledger but a populated DB means the migrations were
