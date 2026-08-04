@@ -265,25 +265,43 @@ export function compile(
       </div>`
     : '';
 
+  // Table-based centering: Gmail/Outlook do NOT reliably honour `margin:0 auto`
+  // on a <div>, so the column can hug the left. The email-proof pattern is an
+  // outer 100%-width table whose cell is align="center", holding a fixed
+  // max-width inner table. `align="center"` + margin:0 auto covers the clients
+  // that ignore max-width. This centres consistently across Gmail, Apple Mail,
+  // Outlook, and mobile.
   const html = `<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/></head>
 <body style="margin:0;padding:0;background:#0a0a0f;">
   <div style="display:none;max-height:0;overflow:hidden;opacity:0;">${escapeHtml(subject)}</div>
-  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:600px;margin:0 auto;padding:40px 20px;background:#0a0a0f;color:#e0e0e0;">
-    <div style="text-align:center;margin-bottom:32px;">
-      <h1 style="color:#ffffff;font-size:28px;margin:0;">Mirror</h1>
-    </div>
-    <div style="background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:12px;padding:32px;">
-      ${inner}
-      ${cta}
-    </div>
-    <div style="color:#666;font-size:12px;text-align:center;margin-top:32px;line-height:1.6;">
-      <p style="margin:0 0 8px;">${consentLine}</p>
-      <p style="margin:0 0 8px;">${escapeHtml(address)}</p>
-      <p style="margin:0;"><a href="{{unsubscribe_url}}" style="color:#888;text-decoration:underline;">Unsubscribe</a> &middot; Mirror &copy; ${year}</p>
-    </div>
-  </div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#0a0a0f;width:100%;border-collapse:collapse;">
+    <tr>
+      <td align="center" style="padding:40px 20px;">
+        <table role="presentation" align="center" width="600" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:600px;margin:0 auto;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#e0e0e0;border-collapse:collapse;">
+          <tr>
+            <td align="center" style="text-align:center;padding-bottom:32px;">
+              <h1 style="color:#ffffff;font-size:28px;margin:0;">Mirror</h1>
+            </td>
+          </tr>
+          <tr>
+            <td style="background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:12px;padding:32px;">
+              ${inner}
+              ${cta}
+            </td>
+          </tr>
+          <tr>
+            <td style="color:#666;font-size:12px;text-align:center;padding-top:32px;line-height:1.6;">
+              <p style="margin:0 0 8px;">${consentLine}</p>
+              <p style="margin:0 0 8px;">${escapeHtml(address)}</p>
+              <p style="margin:0;"><a href="{{unsubscribe_url}}" style="color:#888;text-decoration:underline;">Unsubscribe</a> &middot; Mirror &copy; ${year}</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
 </body>
 </html>`;
 
