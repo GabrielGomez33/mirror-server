@@ -28,6 +28,7 @@ import {
   unsubscribeUrl,
   resolveSource,
   consentLineFor,
+  ctaFor,
 } from '../services/emailBroadcastService';
 
 // Waitlist lifecycle values accepted as a read filter on the waitlist list
@@ -94,7 +95,8 @@ export async function previewAudienceHandler(req: Request, res: Response): Promi
       res.status(400).json({ success: false, error: 'audience is required' });
       return;
     }
-    const result = await previewAudience(audience);
+    const sampleLimit = Number(req.body?.sampleLimit) || 25;
+    const result = await previewAudience(audience, sampleLimit);
     res.json({ success: true, ...result });
   } catch (err) {
     logger.error('previewAudience failed', err as Error);
@@ -117,7 +119,7 @@ export async function previewContentHandler(req: Request, res: Response): Promis
     // Render the footer that matches the campaign's audience, so the preview is
     // faithful (e.g. the waitlist consent line, not the account one).
     const source = resolveSource(req.body?.audience);
-    const { html, text } = compile(subject, check.blocks, { consentLine: consentLineFor(source) });
+    const { html, text } = compile(subject, check.blocks, { consentLine: consentLineFor(source), cta: ctaFor(source) });
     const sample = { username: 'Alex', email: 'alex@example.com', unsubscribeUrl: unsubscribeUrl('alex@example.com') };
     const rendered = html
       .replace(/\{\{\s*username\s*\}\}/g, sample.username)

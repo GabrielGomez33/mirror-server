@@ -19,6 +19,7 @@
 import {
   resolveSource,
   consentLineFor,
+  ctaFor,
   buildUsersWhere,
   buildWaitlistWhere,
   buildRecipientInsert,
@@ -55,6 +56,13 @@ group('consentLineFor — accurate per audience (CAN-SPAM)');
 ok(/Mirror account/.test(consentLineFor('users')), 'users mentions account');
 ok(/waitlist/i.test(consentLineFor('waitlist')), 'waitlist mentions waitlist');
 ok(consentLineFor('users') !== consentLineFor('waitlist'), 'lines differ');
+
+// ---------------------------------------------------------------------------
+group('ctaFor — auto-attached link routes each audience correctly');
+ok(/\/Mirror\/?$/.test(ctaFor('users').url), 'users CTA -> the app (/Mirror/)');
+ok(!/\/Mirror/.test(ctaFor('waitlist').url), 'waitlist CTA -> landing (not the app)');
+ok(ctaFor('users').label.length > 0 && ctaFor('waitlist').label.length > 0, 'both have labels');
+ok(ctaFor('users').url !== ctaFor('waitlist').url, 'the two CTAs point to different places');
 
 // ---------------------------------------------------------------------------
 group('buildUsersWhere — behaviour preserved (byte-identical to original)');

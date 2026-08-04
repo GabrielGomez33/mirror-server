@@ -101,6 +101,28 @@ export function consentLineFor(source: AudienceSource): string {
   return "You're receiving this because you have a Mirror account.";
 }
 
+export interface EmailCta { url: string; label: string; }
+
+/**
+ * The primary call-to-action link automatically attached to a campaign body,
+ * chosen by audience so each group lands in the right place:
+ *   - waitlist  -> the public landing page (invitation / learn-more)
+ *   - users     -> the Mirror app itself (/Mirror/)
+ * URLs + labels are env-overridable so they can change without a deploy.
+ */
+export function ctaFor(source: AudienceSource): EmailCta {
+  if (source === 'waitlist') {
+    return {
+      url: process.env.EMAIL_LANDING_URL || 'https://www.theundergroundrailroad.world/',
+      label: process.env.EMAIL_LANDING_LABEL || 'Explore Mirror',
+    };
+  }
+  return {
+    url: process.env.EMAIL_APP_URL || 'https://www.theundergroundrailroad.world/Mirror/',
+    label: process.env.EMAIL_APP_LABEL || 'Open Mirror',
+  };
+}
+
 // ----------------------------------------------------------------------------
 // USERS source — WHERE builder (operates on alias `u`)
 // (Behaviour preserved verbatim from the original emailBroadcastService.)
@@ -234,13 +256,16 @@ export async function insertRecipients(campaignId: number, filter: AudienceFilte
 // Dispatches by source.
 // ----------------------------------------------------------------------------
 
-export async function previewAudience(filter: AudienceFilter): Promise<AudiencePreview> {
+export async function previewAudience(filter: AudienceFilter, sampleLimit = 25): Promise<AudiencePreview> {
+  // Clamp the sample window: bound the payload while letting the operator see a
+  // real list, not just 5 names. Passed as a bound param, never inlined.
+  const limit = Math.min(Math.max(Math.floor(sampleLimit) || 25, 1), 100);
   return resolveSource(filter) === 'waitlist'
-    ? previewWaitlist(filter)
-    : previewUsers(filter);
+    ? previewWaitlist(filter, limit)
+    : previewUsers(filter, limit);
 }
 
-async function previewUsers(filter: AudienceFilter): Promise<AudiencePreview> {
+async function previewUsers(filter: AudienceFilter, limit: number): Promise<AudiencePreview> {
   const { where, params } = buildUsersWhere(filter);
 
   const [countRows] = await DB.query(`SELECT COUNT(*) AS n FROM users u WHERE ${where}`, params);
@@ -255,15 +280,15 @@ async function previewUsers(filter: AudienceFilter): Promise<AudiencePreview> {
   const suppressed = Number((supRows as any[])[0]?.n ?? 0);
 
   const [sampleRows] = await DB.query(
-    `SELECT username, email FROM users u WHERE ${where} ORDER BY u.id DESC LIMIT 5`,
-    params,
+    `SELECT username, email FROM users u WHERE ${where} ORDER BY u.id DESC LIMIT ?`,
+    [...params, limit],
   );
   const sample = (sampleRows as any[]).map(r => ({ username: r.username, email: r.email }));
 
   return { total, suppressed, sample };
 }
 
-async function previewWaitlist(filter: AudienceFilter): Promise<AudiencePreview> {
+async function previewWaitlist(filter: AudienceFilter, limit: number): Promise<AudiencePreview> {
   const { where, params } = buildWaitlistWhere(filter);
 
   const [countRows] = await DB.query(`SELECT COUNT(*) AS n FROM waitlist_signups w WHERE ${where}`, params);
@@ -287,8 +312,8 @@ async function previewWaitlist(filter: AudienceFilter): Promise<AudiencePreview>
   // Waitlist has no username; surface the email local-part so the sample is
   // still human-readable in the admin preview.
   const [sampleRows] = await DB.query(
-    `SELECT email FROM waitlist_signups w WHERE ${where} ORDER BY w.id DESC LIMIT 5`,
-    params,
+    `SELECT email FROM waitlist_signups w WHERE ${where} ORDER BY w.id DESC LIMIT ?`,
+    [...params, limit],
   );
   const sample = (sampleRows as any[]).map(r => ({
     username: String(r.email || '').split('@')[0] || 'there',
