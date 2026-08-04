@@ -35,6 +35,19 @@ import { Logger } from '../utils/logger';
 import { DB } from '../db';
 import { mirrorRedis } from '../config/redis';
 import { emailService, EmailAttachment } from './emailService';
+import {
+  AudienceFilter,
+  AudienceSource,
+  insertRecipients,
+  resolveSource,
+  consentLineFor,
+} from './audienceResolver';
+
+// Audience concerns live in their own module now (users vs waitlist vs future
+// sources). Re-exported here so existing importers (adminEmailController) keep
+// working unchanged.
+export type { AudienceFilter, AudienceSource };
+export { previewAudience, resolveSource, consentLineFor } from './audienceResolver';
 
 const logger = new Logger('EmailBroadcast');
 
@@ -48,26 +61,6 @@ export type ContentBlock =
   | { type: 'button'; text: string; url: string }
   | { type: 'image'; url: string; alt?: string }
   | { type: 'divider' };
-
-export interface AudienceFilter {
-  mode: 'all' | 'filter' | 'specific';
-  /** Only users with email_verified=1. Defaults to true for deliverability. */
-  verifiedOnly?: boolean;
-  /** true => intake_completed=1, false => =0, undefined => no constraint. */
-  intakeCompleted?: boolean;
-  /** Restrict by users.role. */
-  role?: string | null;
-  /** ISO date — users created strictly before this. */
-  registeredBefore?: string;
-  /** ISO date — users created on/after this. */
-  registeredAfter?: string;
-  /** ISO date — users whose last_login >= this. */
-  activeSince?: string;
-  /** Exclude locked accounts. Defaults to true. */
-  excludeLocked?: boolean;
-  /** For mode='specific': explicit user ids. */
-  userIds?: number[];
-}
 
 export interface CampaignInput {
   title: string;
@@ -247,10 +240,19 @@ function renderBlockText(block: ContentBlock): string {
  * {{username}} / {{email}} / {{unsubscribe_url}} placeholders, substituted
  * (HTML-escaped) per recipient at send time. The shell text is fixed and safe.
  */
-export function compile(subject: string, blocks: ContentBlock[]): { html: string; text: string } {
+export function compile(
+  subject: string,
+  blocks: ContentBlock[],
+  opts?: { consentLine?: string },
+): { html: string; text: string } {
   const inner = blocks.map(renderBlockHtml).join('\n');
   const year = new Date().getFullYear();
   const address = process.env.EMAIL_PHYSICAL_ADDRESS || 'The Underground Railroad';
+  // CAN-SPAM: the "why are you getting this" line must be accurate for the
+  // audience. Defaults to the account line for backward-compatibility; the
+  // waitlist source overrides it (see consentLineFor()). Escaped — it renders
+  // inside the HTML footer.
+  const consentLine = escapeHtml(opts?.consentLine || "You're receiving this because you have a Mirror account.");
 
   const html = `<!doctype html>
 <html lang="en">
@@ -265,7 +267,7 @@ export function compile(subject: string, blocks: ContentBlock[]): { html: string
       ${inner}
     </div>
     <div style="color:#666;font-size:12px;text-align:center;margin-top:32px;line-height:1.6;">
-      <p style="margin:0 0 8px;">You're receiving this because you have a Mirror account.</p>
+      <p style="margin:0 0 8px;">${consentLine}</p>
       <p style="margin:0 0 8px;">${escapeHtml(address)}</p>
       <p style="margin:0;"><a href="{{unsubscribe_url}}" style="color:#888;text-decoration:underline;">Unsubscribe</a> &middot; Mirror &copy; ${year}</p>
     </div>
@@ -274,7 +276,9 @@ export function compile(subject: string, blocks: ContentBlock[]): { html: string
 </html>`;
 
   const innerText = blocks.map(renderBlockText).join('\n');
-  const text = `${innerText}\n\n--\nYou're receiving this because you have a Mirror account.\n${address}\nUnsubscribe: {{unsubscribe_url}}\nMirror © ${year}`;
+  // Plain-text footer: use the raw (unescaped) consent line.
+  const consentLineText = opts?.consentLine || "You're receiving this because you have a Mirror account.";
+  const text = `${innerText}\n\n--\n${consentLineText}\n${address}\nUnsubscribe: {{unsubscribe_url}}\nMirror © ${year}`;
 
   return { html, text };
 }
@@ -353,84 +357,6 @@ export async function addSuppression(
 
 export async function removeSuppression(email: string): Promise<void> {
   await DB.query('DELETE FROM email_suppressions WHERE email = ?', [normalizeEmail(email)]);
-}
-
-// ============================================================================
-// AUDIENCE QUERY BUILDER
-// ============================================================================
-// Returns a parameterised WHERE fragment + params operating on alias `u`.
-
-function buildAudienceWhere(filter: AudienceFilter): { where: string; params: any[] } {
-  const clauses: string[] = ["u.email IS NOT NULL", "u.email <> ''"];
-  const params: any[] = [];
-
-  if (filter.mode === 'specific') {
-    const ids = Array.isArray(filter.userIds) ? filter.userIds.filter(n => Number.isInteger(n)) : [];
-    if (ids.length === 0) {
-      // No valid ids -> match nothing.
-      clauses.push('1 = 0');
-    } else {
-      clauses.push('u.id IN (?)');
-      params.push(ids);
-    }
-    // For explicit selection we still honour verified/locked guards below.
-  }
-
-  // verifiedOnly defaults to true.
-  if (filter.verifiedOnly !== false) {
-    clauses.push('u.email_verified = 1');
-  }
-
-  // excludeLocked defaults to true.
-  if (filter.excludeLocked !== false) {
-    clauses.push("(u.account_locked = 0 OR u.account_locked IS NULL)");
-  }
-
-  if (typeof filter.intakeCompleted === 'boolean') {
-    clauses.push('u.intake_completed = ?');
-    params.push(filter.intakeCompleted ? 1 : 0);
-  }
-
-  if (filter.role) {
-    clauses.push('u.role = ?');
-    params.push(String(filter.role));
-  }
-
-  if (filter.registeredBefore) {
-    clauses.push('u.created_at < ?');
-    params.push(filter.registeredBefore);
-  }
-  if (filter.registeredAfter) {
-    clauses.push('u.created_at >= ?');
-    params.push(filter.registeredAfter);
-  }
-  if (filter.activeSince) {
-    clauses.push('u.last_login >= ?');
-    params.push(filter.activeSince);
-  }
-
-  return { where: clauses.join(' AND '), params };
-}
-
-export async function previewAudience(filter: AudienceFilter): Promise<{ total: number; suppressed: number; sample: { username: string; email: string }[] }> {
-  const { where, params } = buildAudienceWhere(filter);
-
-  const [countRows] = await DB.query(`SELECT COUNT(*) AS n FROM users u WHERE ${where}`, params);
-  const total = (countRows as any[])[0]?.n ?? 0;
-
-  const [supRows] = await DB.query(
-    `SELECT COUNT(*) AS n FROM users u JOIN email_suppressions s ON s.email = LOWER(u.email) WHERE ${where}`,
-    params,
-  );
-  const suppressed = (supRows as any[])[0]?.n ?? 0;
-
-  const [sampleRows] = await DB.query(
-    `SELECT username, email FROM users u WHERE ${where} ORDER BY u.id DESC LIMIT 5`,
-    params,
-  );
-  const sample = (sampleRows as any[]).map(r => ({ username: r.username, email: r.email }));
-
-  return { total, suppressed, sample };
 }
 
 // ============================================================================
@@ -516,16 +442,14 @@ async function materializeAudience(campaignId: number): Promise<void> {
   const campaign = await getCampaign(campaignId);
   if (!campaign) throw new Error('Campaign not found');
   const filter: AudienceFilter = campaign.audience_filter;
-  const { where, params } = buildAudienceWhere(filter);
 
-  // One set-based insert — never loads users into app memory.
-  await DB.query(
-    `INSERT IGNORE INTO email_campaign_recipients (campaign_id, user_id, email, status)
-     SELECT ?, u.id, LOWER(u.email), 'pending' FROM users u WHERE ${where}`,
-    [campaignId, ...params],
-  );
+  // Source-specific, set-based insert into the shared send list. The resolver
+  // owns WHICH people (users vs waitlist) and guarantees idempotency per source
+  // (INSERT IGNORE on the matching UNIQUE key). Never loads rows into memory.
+  await insertRecipients(campaignId, filter);
 
-  // Flag suppressed addresses so they're visible (and never sent).
+  // Flag suppressed addresses so they're visible (and never sent). Source-
+  // agnostic: operates on the send list by email.
   await DB.query(
     `UPDATE email_campaign_recipients r
        JOIN email_suppressions s ON s.email = r.email
@@ -564,7 +488,9 @@ export async function sendTest(input: CampaignInput, toEmail: string): Promise<{
   const blockCheck = validateBlocks(input.blocks);
   if (!blockCheck.ok) return { success: false, error: blockCheck.error };
 
-  const { html, text } = compile(input.subject, blockCheck.blocks);
+  // Test send mirrors the real send's footer for the selected audience.
+  const source = resolveSource(input.audience);
+  const { html, text } = compile(input.subject, blockCheck.blocks, { consentLine: consentLineFor(source) });
   const to = normalizeEmail(toEmail);
   const unsubUrl = unsubscribeUrl(to);
   const ctx = { username: 'there', email: to, unsubscribeUrl: unsubUrl };
@@ -609,7 +535,9 @@ export async function startCampaign(id: number): Promise<{ started: boolean; rea
   }
 
   const blocks: ContentBlock[] = campaign.content_json;
-  const { html, text } = compile(campaign.subject, blocks);
+  // Footer consent line must match the audience this campaign targets.
+  const source = resolveSource(campaign.audience_filter);
+  const { html, text } = compile(campaign.subject, blocks, { consentLine: consentLineFor(source) });
 
   // Atomic guard: only the caller that flips draft/scheduled -> sending wins.
   const [result] = await DB.query(
