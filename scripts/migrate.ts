@@ -3,43 +3,40 @@
 // ============================================================================
 // File: scripts/migrate.ts
 // ----------------------------------------------------------------------------
-// A small, dependency-light forward-only migration runner for the .sql files
-// in ./migrations. Replaces the old "mysql < migrations/xxx.sql" by-hand flow.
+// A small, dependency-light runner for the .sql files in ./migrations.
 //
-// Run via the npm scripts (see package.json):
-//   npm run migrate            # apply every pending migration, in order
-//   npm run migrate:status     # show applied vs pending, apply nothing
-//   npm run migrate:baseline   # record already-applied files WITHOUT running
-//                              #   them — use ONCE on a database whose
-//                              #   migrations were applied by hand. A file is
-//                              #   only recorded if the tables it creates
-//                              #   already exist, so a brand-new migration that
-//                              #   ships with this runner (e.g. 018) stays
-//                              #   pending and is applied by `npm run migrate`.
+// DESIGNED FOR A DRIFTED DATABASE.
+//   This production DB was built up by hand over time — some tables/columns
+//   exist that were never captured in a migration file, and some migration
+//   files (e.g. 017) were never applied. There is therefore NO reliable
+//   file<->schema correspondence, so this tool does NOT try to "bring the DB
+//   up to date" by running everything pending. That would apply migrations you
+//   never intended and could disrupt the live system.
 //
-// HOW IT WORKS
-//   * Applied migrations are recorded in a `schema_migrations` table (created
-//     automatically). A file is "pending" until a row with its filename
-//     exists. This makes `npm run migrate` safe to run repeatedly.
-//   * Files are applied in filename sort order. Keep the numeric prefixes
-//     (018_, 019_, ...) so new migrations sort after the existing ones.
-//   * Each .sql file is split into individual statements. `DELIMITER $$`
-//     directives (used by the trigger/event migrations) are honoured exactly
-//     like the mysql CLI, so BEGIN…END bodies are not split on their inner ';'.
-//   * A whole file runs inside ONE transaction where possible. MySQL DDL
-//     (CREATE TABLE, etc.) auto-commits and cannot be rolled back, so a
-//     failure mid-file may leave earlier statements applied — the same as the
-//     old manual flow. The runner stops on the first error and does NOT record
-//     the file as applied, so re-running retries it (write migrations to be
-//     idempotent: IF NOT EXISTS / DROP … IF EXISTS, as the existing ones are).
+//   Instead the primary command applies exactly ONE migration you name:
 //
-// SAFETY ON AN EXISTING DATABASE
-//   Production already had 001..017 (+ truthstream/add_* files) applied by
-//   hand. Running `npm run migrate` there with an empty ledger would try to
-//   re-apply them. The runner guards against this: if `schema_migrations` is
-//   empty but application tables already exist, it refuses and tells you to
-//   run `npm run migrate:baseline` first. After baselining, only genuinely new
-//   files (018_ and beyond) are applied.
+//     npm run migrate -- 018        # apply ONLY 018_waitlist_signups.sql
+//     npm run migrate -- 018_waitlist_signups.sql   # (full name also works)
+//     npm run migrate:status        # list files + which are recorded applied
+//
+//   For 018 that means: create the waitlist_signups table, nothing else.
+//
+// HOW `apply` WORKS
+//   * You pass a number ("018") or a filename. The runner finds the single
+//     matching file and runs only that file's statements. If your term matches
+//     0 or >1 files it stops and shows you the choices — never guesses.
+//   * `DELIMITER $$` directives (trigger/event migrations) are honoured like
+//     the mysql CLI, so BEGIN…END bodies are not split on their inner ';'.
+//   * After a successful apply it records the filename in a `schema_migrations`
+//     bookkeeping table (created if absent) purely so `migrate:status` can show
+//     what's been run. This record gates NOTHING and touches no other table —
+//     drop `schema_migrations` any time and the tool still works.
+//   * Write migrations idempotently (CREATE TABLE IF NOT EXISTS / DROP … IF
+//     EXISTS) — then re-applying one is harmless.
+//
+// OPT-IN BATCH MODE (not the default; use only if you know the DB matches)
+//   npm run migrate:pending        # apply every file not yet recorded applied
+//   npm run migrate:baseline       # record already-applied files, run nothing
 //
 // CONNECTION
 //   Uses the same env vars as db.ts (DB_HOST/DB_USER/DB_PASSWORD/DB_NAME),
@@ -54,13 +51,33 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-const MIGRATIONS_DIR = path.resolve(__dirname, '..', 'migrations');
+// The .sql files live in <project-root>/migrations. `tsc` does NOT copy them
+// into dist/, so we cannot resolve relative to __dirname alone — the compiled
+// runner sits at dist/scripts/migrate.js while the migrations stay at the
+// source root. Try the candidates that cover both run modes and pick the first
+// that actually exists:
+//   * process.cwd()/migrations       — npm scripts always run at the pkg root
+//   * __dirname/../migrations         — ts-node (scripts/ -> root/migrations)
+//   * __dirname/../../migrations      — compiled (dist/scripts/ -> root)
+function resolveMigrationsDir(): string {
+  const candidates = [
+    path.resolve(process.cwd(), 'migrations'),
+    path.resolve(__dirname, '..', 'migrations'),
+    path.resolve(__dirname, '..', '..', 'migrations'),
+  ];
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(c) && fs.statSync(c).isDirectory()) return c;
+    } catch {
+      /* keep trying */
+    }
+  }
+  return candidates[0];
+}
 
-// A table whose presence signals "this is an already-populated database" for
-// the baseline guard. `users` is core and exists after migration 011.
-const SENTINEL_TABLE = 'users';
+const MIGRATIONS_DIR = resolveMigrationsDir();
 
-type Command = 'up' | 'status' | 'baseline';
+type Command = 'apply' | 'up' | 'status' | 'baseline';
 
 // ---------------------------------------------------------------------------
 // SQL splitting — honours DELIMITER directives the way the mysql client does.
@@ -202,6 +219,15 @@ async function cmdBaseline(conn: mysql.Connection): Promise<void> {
   const applied = await appliedSet(conn);
   const files = listMigrationFiles();
 
+  if (files.length === 0) {
+    console.warn(
+      `\nWARNING: no .sql files found in ${MIGRATIONS_DIR}. Nothing to ` +
+      `baseline. Run this from the project root (where the migrations/ ` +
+      `directory lives).\n`
+    );
+    return;
+  }
+
   let marked = 0;
   const skipped: string[] = [];
 
@@ -243,56 +269,138 @@ async function cmdBaseline(conn: mysql.Connection): Promise<void> {
   console.log('');
 }
 
+// Apply exactly one file's statements and record it. Returns true on success.
+async function applyFile(conn: mysql.Connection, filename: string): Promise<boolean> {
+  const full = path.join(MIGRATIONS_DIR, filename);
+  const sql = fs.readFileSync(full, 'utf8');
+  const statements = splitStatements(sql);
+
+  process.stdout.write(`  → ${filename} (${statements.length} statement(s)) ... `);
+  try {
+    for (const stmt of statements) {
+      await conn.query(stmt);
+    }
+    // Bookkeeping only — records that this file ran. Gates nothing.
+    await conn.query(
+      `INSERT INTO schema_migrations (filename, checksum) VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE checksum = VALUES(checksum), applied_at = CURRENT_TIMESTAMP`,
+      [filename, sha256(sql)]
+    );
+    console.log('ok');
+    return true;
+  } catch (err) {
+    console.log('FAILED');
+    console.error(`\nError applying ${filename}:\n${(err as Error).message}\n`);
+    console.error(
+      '(MySQL DDL auto-commits, so statements before the failure may already ' +
+      'be applied. Write migrations idempotently — IF NOT EXISTS / DROP IF ' +
+      'EXISTS — then it is safe to fix and re-run.)\n'
+    );
+    return false;
+  }
+}
+
+// Resolve a user-supplied term ("018" or a filename) to a single migration
+// file. Returns { file } on a unique match, or { candidates } to disambiguate.
+function resolveTarget(target: string): { file?: string; candidates: string[] } {
+  const files = listMigrationFiles();
+  const norm = target.trim().replace(/\.sql$/i, '');
+
+  const exact = files.filter((f) => f === target || f.replace(/\.sql$/i, '') === norm);
+  if (exact.length === 1) return { file: exact[0], candidates: exact };
+
+  // Prefix match on a clean boundary: "018" -> "018_...", not "0180...".
+  const prefixed = files.filter((f) => f.replace(/\.sql$/i, '').startsWith(norm + '_'));
+  const matches = exact.length ? exact : prefixed;
+  return { file: matches.length === 1 ? matches[0] : undefined, candidates: matches };
+}
+
+// Validate an apply target against the filesystem — NO database needed, so a
+// typo fails instantly without opening a connection. Returns the resolved
+// filename, or null after printing the problem and setting a failing exit code.
+function resolveApplyTargetOrReport(target: string | undefined): string | null {
+  const files = listMigrationFiles();
+  if (files.length === 0) {
+    console.warn(
+      `\nWARNING: no .sql files found in ${MIGRATIONS_DIR}. Run from the ` +
+      `project root (where the migrations/ directory lives).\n`
+    );
+    process.exitCode = 1;
+    return null;
+  }
+
+  if (!target) {
+    console.error(
+      `\nUsage: npm run migrate -- <number|filename>\n` +
+      `  e.g.  npm run migrate -- 018\n\nAvailable migrations:\n` +
+      files.map((f) => `  • ${f}`).join('\n') + '\n'
+    );
+    process.exitCode = 1;
+    return null;
+  }
+
+  const { file, candidates } = resolveTarget(target);
+  if (!file) {
+    if (candidates.length === 0) {
+      console.error(`\nNo migration matches "${target}". Available:\n` +
+        files.map((f) => `  • ${f}`).join('\n') + '\n');
+    } else {
+      console.error(`\n"${target}" is ambiguous — matches:\n` +
+        candidates.map((f) => `  • ${f}`).join('\n') +
+        `\n\nBe more specific (e.g. the full filename).\n`);
+    }
+    process.exitCode = 1;
+    return null;
+  }
+  return file;
+}
+
+// ----------------------------------------------------------------------------
+// PRIMARY COMMAND: apply ONE already-resolved migration file and nothing else.
+// ----------------------------------------------------------------------------
+async function cmdApply(conn: mysql.Connection, file: string): Promise<void> {
+  await ensureLedger(conn);
+  console.log(`\nApplying a single migration: ${file}\n`);
+  const ok = await applyFile(conn, file);
+  if (ok) console.log(`\nDone. ${file} applied.\n`);
+  else process.exitCode = 1;
+}
+
+// ----------------------------------------------------------------------------
+// OPT-IN batch mode. Not the default — only sensible when the DB genuinely
+// matches the migration files. On a drifted DB, prefer `apply`.
+// ----------------------------------------------------------------------------
 async function cmdUp(conn: mysql.Connection): Promise<void> {
   await ensureLedger(conn);
   const applied = await appliedSet(conn);
   const files = listMigrationFiles();
-  const pending = files.filter((f) => !applied.has(f));
 
-  // Baseline guard: empty ledger but a populated DB means the migrations were
-  // applied by hand. Refuse to re-run them destructively.
-  if (applied.size === 0 && (await tableExists(conn, SENTINEL_TABLE))) {
-    console.error(
-      `\nRefusing to run: the migration ledger is empty but the '${SENTINEL_TABLE}' ` +
-      `table already exists.\nThis database was migrated by hand before this ` +
-      `runner existed.\n\n  Run  npm run migrate:baseline  once to record the ` +
-      `existing migrations,\n  then  npm run migrate  to apply new ones.\n`
+  if (files.length === 0) {
+    console.warn(
+      `\nWARNING: no .sql files found in ${MIGRATIONS_DIR}. Run from the ` +
+      `project root (where the migrations/ directory lives).\n`
     );
-    process.exitCode = 1;
     return;
   }
 
+  const pending = files.filter((f) => !applied.has(f));
   if (pending.length === 0) {
-    console.log('\nNothing to migrate — database is up to date.\n');
+    console.log('\nNothing pending — every file is recorded as applied.\n');
     return;
   }
 
-  console.log(`\nApplying ${pending.length} pending migration(s):\n`);
+  console.log(
+    `\nBatch mode will apply ${pending.length} file(s) NOT yet recorded ` +
+    `applied:\n` + pending.map((f) => `  • ${f}`).join('\n') +
+    `\n\nOn a drifted database this may run migrations you did not intend. ` +
+    `If that is not what you want, Ctrl-C now and use ` +
+    `\`npm run migrate -- <number>\` instead.\n`
+  );
 
   for (const f of pending) {
-    const full = path.join(MIGRATIONS_DIR, f);
-    const sql = fs.readFileSync(full, 'utf8');
-    const statements = splitStatements(sql);
-
-    process.stdout.write(`  → ${f} (${statements.length} statement(s)) ... `);
-    try {
-      for (const stmt of statements) {
-        await conn.query(stmt);
-      }
-      await conn.query(
-        'INSERT INTO schema_migrations (filename, checksum) VALUES (?, ?)',
-        [f, sha256(sql)]
-      );
-      console.log('ok');
-    } catch (err) {
-      console.log('FAILED');
-      console.error(`\nError applying ${f}:\n${(err as Error).message}\n`);
-      console.error(
-        'Stopped. This file was NOT recorded as applied; fix it and re-run ' +
-        '`npm run migrate`.\n(Note: MySQL DDL auto-commits, so statements before ' +
-        'the failure in this file may already be applied — the existing ' +
-        'migrations use IF NOT EXISTS / DROP IF EXISTS to stay replay-safe.)\n'
-      );
+    const ok = await applyFile(conn, f);
+    if (!ok) {
+      console.error('Stopped on first failure.\n');
       process.exitCode = 1;
       return;
     }
@@ -305,16 +413,41 @@ async function cmdUp(conn: mysql.Connection): Promise<void> {
 // Entry
 // ---------------------------------------------------------------------------
 async function main(): Promise<void> {
-  const arg = (process.argv[2] || 'up').toLowerCase();
-  const command: Command =
-    arg === 'status' ? 'status' : arg === 'baseline' ? 'baseline' : 'up';
+  const raw = (process.argv[2] || '').toLowerCase();
+
+  let command: Command;
+  let target: string | undefined;
+  if (raw === 'status') {
+    command = 'status';
+  } else if (raw === 'baseline') {
+    command = 'baseline';
+  } else if (raw === 'up' || raw === 'pending') {
+    command = 'up';
+  } else if (raw === 'apply') {
+    command = 'apply';
+    target = process.argv[3]; // preserve original case
+  } else {
+    // Bare invocation: treat the first arg (if any) as an apply target, so
+    // `node migrate.js 018` and `npm run migrate -- 018` both work.
+    command = 'apply';
+    target = process.argv[2];
+  }
+
+  // Validate an apply target BEFORE touching the database, so a typo or a
+  // wrong directory fails immediately without needing a live connection.
+  let fileToApply: string | null = null;
+  if (command === 'apply') {
+    fileToApply = resolveApplyTargetOrReport(target);
+    if (!fileToApply) return;
+  }
 
   let conn: mysql.Connection | undefined;
   try {
     conn = await makeConnection();
     if (command === 'status') await cmdStatus(conn);
     else if (command === 'baseline') await cmdBaseline(conn);
-    else await cmdUp(conn);
+    else if (command === 'up') await cmdUp(conn);
+    else await cmdApply(conn, fileToApply as string);
   } catch (err) {
     console.error(`\nMigration runner error: ${(err as Error).message}\n`);
     process.exitCode = 1;
