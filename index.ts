@@ -113,6 +113,7 @@ import { emailService } from './services/emailService';
 import adminEmailRoutes from './routes/adminEmail';
 import adminSimulationRoutes from './routes/adminSimulation';
 import emailPublicRoutes from './routes/emailPublic';
+import waitlistRoutes from './routes/waitlist';
 
 // ============================================================================
 // ERROR HANDLING UTILITIES
@@ -360,6 +361,13 @@ APP.use('/mirror/api/user/notification-preferences', notificationPreferencesRout
 // by an HMAC unsubscribe token and a shared webhook secret. Must stay ungated.
 APP.use('/mirror/api/email', emailPublicRoutes);
 console.log('[ROUTES] Public email routes mounted at /mirror/api/email (unsubscribe + webhooks)');
+
+// Public waitlist endpoint — NO auth/subscription gate. Anonymous visitors on
+// the marketing landing page (theundergroundrailroad.world) POST their email
+// here. Protected internally by email validation + a per-IP rate limit, and
+// externally by the origin-restricted CORS policy above. Must stay ungated.
+APP.use('/mirror/api/waitlist', waitlistRoutes);
+console.log('[ROUTES] Public waitlist route mounted at /mirror/api/waitlist');
 
 // Admin email broadcasts — reached only by the admin-server over localhost,
 // gated by the internal shared secret inside the router (requireInternalSecret).
