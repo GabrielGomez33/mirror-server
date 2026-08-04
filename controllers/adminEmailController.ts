@@ -26,7 +26,13 @@ import {
   validateBlocks,
   validateAttachments,
   unsubscribeUrl,
+  resolveSource,
+  consentLineFor,
 } from '../services/emailBroadcastService';
+
+// Waitlist lifecycle values accepted as a read filter on the waitlist list
+// endpoint. Guards the operator-supplied ?status= against injection / typos.
+const WAITLIST_STATUS_VALUES = new Set(['pending', 'confirmed', 'invited', 'converted', 'unsubscribed']);
 
 const logger = new Logger('AdminEmailController');
 
@@ -108,7 +114,10 @@ export async function previewContentHandler(req: Request, res: Response): Promis
       res.status(400).json({ success: false, error: check.error });
       return;
     }
-    const { html, text } = compile(subject, check.blocks);
+    // Render the footer that matches the campaign's audience, so the preview is
+    // faithful (e.g. the waitlist consent line, not the account one).
+    const source = resolveSource(req.body?.audience);
+    const { html, text } = compile(subject, check.blocks, { consentLine: consentLineFor(source) });
     const sample = { username: 'Alex', email: 'alex@example.com', unsubscribeUrl: unsubscribeUrl('alex@example.com') };
     const rendered = html
       .replace(/\{\{\s*username\s*\}\}/g, sample.username)
@@ -281,6 +290,49 @@ export async function getCampaignHandler(req: Request, res: Response): Promise<v
   } catch (err) {
     logger.error('getCampaign failed', err as Error);
     res.status(500).json({ success: false, error: 'Failed to fetch campaign' });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /waitlist?status=&limit=&offset=
+// Read-only view of the marketing waitlist so the admin UI can see the list
+// and pick it as a campaign audience. Counts-by-status + a page of rows.
+// ---------------------------------------------------------------------------
+export async function listWaitlistHandler(req: Request, res: Response): Promise<void> {
+  try {
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit)) || 100, 1), 500);
+    const offset = Math.max(parseInt(String(req.query.offset)) || 0, 0);
+
+    // Optional status filter, validated against the allow-list (never trusted
+    // straight into SQL).
+    const statusRaw = String(req.query.status || '').trim();
+    const status = WAITLIST_STATUS_VALUES.has(statusRaw) ? statusRaw : '';
+
+    // Counts by status (drives the UI summary + the "subscribable" number).
+    const [countRows] = await DB.query(
+      `SELECT status, COUNT(*) AS n FROM waitlist_signups GROUP BY status`,
+    );
+    const counts: Record<string, number> = {};
+    let total = 0;
+    for (const r of countRows as { status: string; n: number }[]) {
+      counts[r.status] = Number(r.n);
+      total += Number(r.n);
+    }
+
+    const where = status ? 'WHERE status = ?' : '';
+    const params = status ? [status, limit, offset] : [limit, offset];
+    const [rows] = await DB.query(
+      `SELECT id, email, source, status, created_at
+         FROM waitlist_signups ${where}
+        ORDER BY id DESC
+        LIMIT ? OFFSET ?`,
+      params,
+    );
+
+    res.json({ success: true, total, counts, rows, limit, offset });
+  } catch (err) {
+    logger.error('listWaitlist failed', err as Error);
+    res.status(500).json({ success: false, error: 'Failed to list waitlist' });
   }
 }
 

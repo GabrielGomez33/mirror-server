@@ -20,6 +20,7 @@ import {
   cancelCampaignHandler,
   listCampaignsHandler,
   getCampaignHandler,
+  listWaitlistHandler,
 } from '../controllers/adminEmailController';
 
 const router = express.Router();
@@ -29,6 +30,7 @@ router.use(requireInternalSecret);
 
 router.get('/health', emailHealthHandler);
 router.get('/users/search', searchRecipientsHandler);
+router.get('/waitlist', listWaitlistHandler);
 router.post('/preview-audience', previewAudienceHandler);
 router.post('/preview', previewContentHandler);
 router.post('/test', sendTestHandler);
