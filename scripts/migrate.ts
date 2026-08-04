@@ -9,9 +9,13 @@
 // Run via the npm scripts (see package.json):
 //   npm run migrate            # apply every pending migration, in order
 //   npm run migrate:status     # show applied vs pending, apply nothing
-//   npm run migrate:baseline   # mark ALL current files applied WITHOUT running
+//   npm run migrate:baseline   # record already-applied files WITHOUT running
 //                              #   them — use ONCE on a database whose
-//                              #   migrations were already applied by hand.
+//                              #   migrations were applied by hand. A file is
+//                              #   only recorded if the tables it creates
+//                              #   already exist, so a brand-new migration that
+//                              #   ships with this runner (e.g. 018) stays
+//                              #   pending and is applied by `npm run migrate`.
 //
 // HOW IT WORKS
 //   * Applied migrations are recorded in a `schema_migrations` table (created
@@ -181,25 +185,62 @@ async function cmdStatus(conn: mysql.Connection): Promise<void> {
   console.log('');
 }
 
+// Extract the table names a migration CREATEs, so baseline can tell an
+// already-applied historical migration (its tables exist) from a brand-new one
+// that merely happens to ship alongside the runner (its tables do not yet
+// exist and must actually run).
+function createdTables(sql: string): string[] {
+  const names: string[] = [];
+  const rx = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`?([A-Za-z0-9_]+)`?/gi;
+  let m: RegExpExecArray | null;
+  while ((m = rx.exec(sql)) !== null) names.push(m[1]);
+  return names;
+}
+
 async function cmdBaseline(conn: mysql.Connection): Promise<void> {
   await ensureLedger(conn);
   const applied = await appliedSet(conn);
   const files = listMigrationFiles();
 
   let marked = 0;
+  const skipped: string[] = [];
+
   for (const f of files) {
     if (applied.has(f)) continue;
     const sql = fs.readFileSync(path.join(MIGRATIONS_DIR, f), 'utf8');
+
+    // If this file creates tables and ANY of them is missing, it has NOT been
+    // applied yet — leave it pending so `npm run migrate` actually runs it.
+    // Files with no CREATE TABLE (pure ALTER / trigger / event) are assumed to
+    // be pre-existing history and are recorded. A genuinely new alter-only
+    // migration is the rare case the operator should apply/verify by hand.
+    const tables = createdTables(sql);
+    if (tables.length > 0) {
+      const existence = await Promise.all(tables.map((t) => tableExists(conn, t)));
+      if (existence.some((exists) => !exists)) {
+        skipped.push(f);
+        continue;
+      }
+    }
+
     await conn.query(
       'INSERT INTO schema_migrations (filename, checksum) VALUES (?, ?)',
       [f, sha256(sql)]
     );
     marked++;
   }
+
   console.log(
-    `\nBaseline complete: marked ${marked} file(s) as already-applied ` +
-    `(no SQL executed). Future 'npm run migrate' runs will apply only new files.\n`
+    `\nBaseline complete: recorded ${marked} already-applied file(s) ` +
+    `(no SQL executed).`
   );
+  if (skipped.length) {
+    console.log(
+      `Left pending (tables not present yet — will run on 'npm run migrate'):`
+    );
+    for (const f of skipped) console.log(`  • ${f}`);
+  }
+  console.log('');
 }
 
 async function cmdUp(conn: mysql.Connection): Promise<void> {
