@@ -38,16 +38,18 @@ import { emailService, EmailAttachment } from './emailService';
 import {
   AudienceFilter,
   AudienceSource,
+  EmailCta,
   insertRecipients,
   resolveSource,
   consentLineFor,
+  ctaFor,
 } from './audienceResolver';
 
 // Audience concerns live in their own module now (users vs waitlist vs future
 // sources). Re-exported here so existing importers (adminEmailController) keep
 // working unchanged.
-export type { AudienceFilter, AudienceSource };
-export { previewAudience, resolveSource, consentLineFor } from './audienceResolver';
+export type { AudienceFilter, AudienceSource, EmailCta };
+export { previewAudience, resolveSource, consentLineFor, ctaFor } from './audienceResolver';
 
 const logger = new Logger('EmailBroadcast');
 
@@ -243,7 +245,7 @@ function renderBlockText(block: ContentBlock): string {
 export function compile(
   subject: string,
   blocks: ContentBlock[],
-  opts?: { consentLine?: string },
+  opts?: { consentLine?: string; cta?: EmailCta | null },
 ): { html: string; text: string } {
   const inner = blocks.map(renderBlockHtml).join('\n');
   const year = new Date().getFullYear();
@@ -253,6 +255,15 @@ export function compile(
   // waitlist source overrides it (see consentLineFor()). Escaped — it renders
   // inside the HTML footer.
   const consentLine = escapeHtml(opts?.consentLine || "You're receiving this because you have a Mirror account.");
+
+  // Primary call-to-action, auto-attached per audience (waitlist -> landing,
+  // users -> the app). Rendered only when provided; URL is validated by
+  // safeUrl() so only http(s) links can appear, and the label is escaped.
+  const cta = opts?.cta && opts.cta.url
+    ? `<div style="text-align:center;margin:28px 0 4px;">
+        <a href="${safeUrl(opts.cta.url)}" style="display:inline-block;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;text-decoration:none;padding:14px 32px;border-radius:8px;font-weight:600;">${escapeHtml(opts.cta.label || 'Open Mirror')}</a>
+      </div>`
+    : '';
 
   const html = `<!doctype html>
 <html lang="en">
@@ -265,6 +276,7 @@ export function compile(
     </div>
     <div style="background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:12px;padding:32px;">
       ${inner}
+      ${cta}
     </div>
     <div style="color:#666;font-size:12px;text-align:center;margin-top:32px;line-height:1.6;">
       <p style="margin:0 0 8px;">${consentLine}</p>
@@ -278,7 +290,8 @@ export function compile(
   const innerText = blocks.map(renderBlockText).join('\n');
   // Plain-text footer: use the raw (unescaped) consent line.
   const consentLineText = opts?.consentLine || "You're receiving this because you have a Mirror account.";
-  const text = `${innerText}\n\n--\n${consentLineText}\n${address}\nUnsubscribe: {{unsubscribe_url}}\nMirror © ${year}`;
+  const ctaText = opts?.cta && opts.cta.url ? `\n${opts.cta.label || 'Open Mirror'}: ${opts.cta.url}\n` : '';
+  const text = `${innerText}\n${ctaText}\n--\n${consentLineText}\n${address}\nUnsubscribe: {{unsubscribe_url}}\nMirror © ${year}`;
 
   return { html, text };
 }
@@ -488,9 +501,9 @@ export async function sendTest(input: CampaignInput, toEmail: string): Promise<{
   const blockCheck = validateBlocks(input.blocks);
   if (!blockCheck.ok) return { success: false, error: blockCheck.error };
 
-  // Test send mirrors the real send's footer for the selected audience.
+  // Test send mirrors the real send's footer + auto-CTA for the audience.
   const source = resolveSource(input.audience);
-  const { html, text } = compile(input.subject, blockCheck.blocks, { consentLine: consentLineFor(source) });
+  const { html, text } = compile(input.subject, blockCheck.blocks, { consentLine: consentLineFor(source), cta: ctaFor(source) });
   const to = normalizeEmail(toEmail);
   const unsubUrl = unsubscribeUrl(to);
   const ctx = { username: 'there', email: to, unsubscribeUrl: unsubUrl };
@@ -535,9 +548,9 @@ export async function startCampaign(id: number): Promise<{ started: boolean; rea
   }
 
   const blocks: ContentBlock[] = campaign.content_json;
-  // Footer consent line must match the audience this campaign targets.
+  // Footer consent line + auto-CTA must match the audience this campaign targets.
   const source = resolveSource(campaign.audience_filter);
-  const { html, text } = compile(campaign.subject, blocks, { consentLine: consentLineFor(source) });
+  const { html, text } = compile(campaign.subject, blocks, { consentLine: consentLineFor(source), cta: ctaFor(source) });
 
   // Atomic guard: only the caller that flips draft/scheduled -> sending wins.
   const [result] = await DB.query(
