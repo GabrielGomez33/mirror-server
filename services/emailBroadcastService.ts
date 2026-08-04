@@ -245,7 +245,7 @@ function renderBlockText(block: ContentBlock): string {
 export function compile(
   subject: string,
   blocks: ContentBlock[],
-  opts?: { consentLine?: string; cta?: EmailCta | null },
+  opts?: { consentLine?: string; cta?: EmailCta | null; preheader?: string },
 ): { html: string; text: string } {
   const inner = blocks.map(renderBlockHtml).join('\n');
   const year = new Date().getFullYear();
@@ -265,6 +265,26 @@ export function compile(
       </div>`
     : '';
 
+  // Preheader = inbox preview text. Use the first heading/paragraph — genuine
+  // body content, NOT a hidden duplicate of the subject. Gmail's sender
+  // guidelines warn against hiding content (a subject-duplicate reads as
+  // keyword-stuffing); a real first-line preview is the standard, safe pattern.
+  // Omitted entirely when there is no text block, so we never ship empty hidden
+  // markup.
+  const firstBlockText = (() => {
+    for (const b of blocks) {
+      if ((b.type === 'heading' || b.type === 'paragraph') && typeof (b as { text?: unknown }).text === 'string') {
+        const t = String((b as { text?: string }).text).trim();
+        if (t) return t;
+      }
+    }
+    return '';
+  })();
+  const preheader = escapeHtml(String(opts?.preheader ?? firstBlockText).trim().slice(0, 140));
+  const preheaderHtml = preheader
+    ? `<div style="display:none;max-height:0;overflow:hidden;mso-hide:all;">${preheader}</div>`
+    : '';
+
   // Table-based centering: Gmail/Outlook do NOT reliably honour `margin:0 auto`
   // on a <div>, so the column can hug the left. The email-proof pattern is an
   // outer 100%-width table whose cell is align="center", holding a fixed
@@ -275,7 +295,7 @@ export function compile(
 <html lang="en">
 <head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/></head>
 <body style="margin:0;padding:0;background:#0a0a0f;">
-  <div style="display:none;max-height:0;overflow:hidden;opacity:0;">${escapeHtml(subject)}</div>
+  ${preheaderHtml}
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#0a0a0f;width:100%;border-collapse:collapse;">
     <tr>
       <td align="center" style="padding:40px 20px;">
@@ -529,6 +549,10 @@ export async function sendTest(input: CampaignInput, toEmail: string): Promise<{
   const result = await emailService.sendCustom(
     {
       to,
+      // Campaigns can send from a dedicated marketing address (keeps
+      // transactional reputation on noreply@ separate, per Gmail guidance).
+      // Must be on the authenticated domain. Falls back to the default From.
+      from: process.env.EMAIL_CAMPAIGN_FROM || undefined,
       subject: `[TEST] ${personalizeText(input.subject, ctx)}`,
       html: personalize(html, ctx),
       text: personalizeText(text, ctx),
@@ -659,6 +683,7 @@ export async function processCampaignBatch(campaignId: number): Promise<{ pendin
       const result = await emailService.sendCustom(
         {
           to: email,
+          from: process.env.EMAIL_CAMPAIGN_FROM || undefined,
           subject,
           html: personalize(html, ctx),
           text: personalizeText(text, ctx),

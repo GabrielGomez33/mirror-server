@@ -18,4 +18,9 @@ const router = express.Router();
 // POST /mirror/api/waitlist — capture a prospect email from the landing form.
 router.post('/', WaitlistController.subscribe.bind(WaitlistController) as RequestHandler);
 
+// GET/POST /mirror/api/waitlist/confirm — double opt-in confirmation link.
+// GET renders a human page; POST returns JSON. Protected by the HMAC token.
+router.get('/confirm', WaitlistController.confirm.bind(WaitlistController) as RequestHandler);
+router.post('/confirm', WaitlistController.confirm.bind(WaitlistController) as RequestHandler);
+
 export default router;
