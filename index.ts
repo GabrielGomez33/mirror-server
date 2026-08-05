@@ -270,6 +270,17 @@ const ALLOWED_ORIGINS = [
   'https://theundergroundrailroad.world',
 ];
 
+// Additional production origins (e.g. a new marketing/app domain) can be added
+// WITHOUT a code change or redeploy via EXTRA_ALLOWED_ORIGINS — a comma-separated
+// list of full origins, e.g.
+//   EXTRA_ALLOWED_ORIGINS=https://trymirror.world,https://www.trymirror.world
+// Each entry must be a full scheme+host origin (no trailing slash, no path).
+const extraOrigins = (process.env.EXTRA_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((o) => o.trim().replace(/\/+$/, ''))
+  .filter((o) => /^https?:\/\/[^/]+$/.test(o));
+if (extraOrigins.length) ALLOWED_ORIGINS.push(...extraOrigins);
+
 // Add development origins only in non-production
 if (process.env.NODE_ENV !== 'production') {
   ALLOWED_ORIGINS.push(
