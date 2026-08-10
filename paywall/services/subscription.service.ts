@@ -402,6 +402,122 @@ export class SubscriptionService {
   }
 
   // ========================================================================
+  // COMPLIMENTARY (COMP) GRANTS — e.g. verified students
+  // ========================================================================
+  //
+  // A comp is a premium entitlement with NO payment. It is stored on the SAME
+  // user_subscriptions row using provider='manual' and the sentinel
+  // provider_plan_id='student_comp'. That sentinel is what lets the expiry
+  // cron (and revoke) find comps WITHOUT ever touching a paid subscriber's row.
+  //
+  // Invariants this method upholds:
+  //   1. It NEVER overwrites a live PayPal/Stripe subscription (would destroy
+  //      the provider linkage needed for renewal/cancellation). Such users are
+  //      already premium, so the comp is simply unnecessary.
+  //   2. It sends NO payment email (activateSubscription does — reusing it here
+  //      would email students a fake "$9.99 charged" receipt).
+  //   3. Re-granting (annual re-verification) is idempotent: it just moves
+  //      current_period_end forward.
+
+  static readonly COMP_PLAN_ID = 'student_comp';
+
+  /**
+   * Grant (or extend) a complimentary premium subscription.
+   * @returns granted=false with a reason when the user already has premium via
+   *          a real payment provider (we intentionally leave that untouched).
+   */
+  async grantStudentComp(userId: number, opts: {
+    expiresAt: Date;
+    matchedDomain: string;
+  }): Promise<{ granted: boolean; reason?: string }> {
+    const current = await this.getSubscriptionFromDB(userId);
+
+    // Do not clobber a live paid subscription (paypal/stripe, not fully expired).
+    const hasLiveProviderSub =
+      (current.provider === 'paypal' || current.provider === 'stripe') &&
+      current.status !== 'expired';
+    if (hasLiveProviderSub) {
+      logger.info('Student comp skipped — user already has a paid subscription', { userId });
+      return { granted: false, reason: 'active_provider_subscription' };
+    }
+
+    await DB.query(`
+      UPDATE user_subscriptions
+      SET tier = 'premium',
+          status = 'active',
+          provider = 'manual',
+          provider_plan_id = ?,
+          provider_subscription_id = ?,
+          provider_customer_id = NULL,
+          current_period_start = NOW(),
+          current_period_end = ?,
+          grace_period_end = NULL,
+          cancelled_at = NULL,
+          cancel_reason = NULL
+      WHERE user_id = ?
+    `, [
+      SubscriptionService.COMP_PLAN_ID,
+      `student:${userId}`,
+      opts.expiresAt,
+      userId,
+    ]);
+
+    await this.invalidateCache(userId);
+
+    await this.logEvent({
+      userId,
+      eventType: 'subscription.comp_granted',
+      metadata: {
+        reason: 'student',
+        matchedDomain: opts.matchedDomain,
+        expiresAt: opts.expiresAt.toISOString(),
+      },
+    });
+
+    logger.info('Student comp granted', {
+      userId,
+      matchedDomain: opts.matchedDomain,
+      expiresAt: opts.expiresAt.toISOString(),
+    });
+
+    return { granted: true };
+  }
+
+  /**
+   * Revoke a student comp (abuse / admin / verification revoked).
+   * Only affects rows still carrying the comp sentinel — a user who has since
+   * started paying is never downgraded by this.
+   */
+  async revokeStudentComp(userId: number, reason: string): Promise<boolean> {
+    const [result] = await DB.query(`
+      UPDATE user_subscriptions
+      SET status = 'free',
+          tier = 'free',
+          provider = NULL,
+          provider_plan_id = NULL,
+          provider_subscription_id = NULL,
+          current_period_end = NULL,
+          cancel_reason = ?
+      WHERE user_id = ?
+        AND provider = 'manual'
+        AND provider_plan_id = ?
+    `, [reason, userId, SubscriptionService.COMP_PLAN_ID]);
+
+    const affected = (result as any).affectedRows || 0;
+    if (affected > 0) {
+      await this.invalidateCache(userId);
+      await this.logEvent({
+        userId,
+        eventType: 'subscription.comp_revoked',
+        metadata: { reason },
+      });
+      logger.info('Student comp revoked', { userId, reason });
+      return true;
+    }
+    return false;
+  }
+
+  // ========================================================================
   // USAGE TRACKING
   // ========================================================================
 
@@ -619,6 +735,106 @@ export class SubscriptionService {
       logger.info(`Expired ${affected} cancelled subscriptions`);
     }
     return affected;
+  }
+
+  /**
+   * Expire time-boxed student comps. Run every hour (same cadence as trials).
+   * Downgrades ONLY rows carrying the comp sentinel whose period has ended,
+   * flips the student_verifications record to 'expired', and emails a
+   * re-verify prompt. A user who started paying is skipped by construction
+   * (their provider_plan_id is no longer 'student_comp').
+   */
+  async checkAndExpireStudentComps(): Promise<number> {
+    const [rows] = await DB.query(`
+      SELECT us.user_id, u.email
+      FROM user_subscriptions us
+      JOIN users u ON us.user_id = u.id
+      WHERE us.provider = 'manual'
+        AND us.provider_plan_id = ?
+        AND us.status = 'active'
+        AND us.current_period_end IS NOT NULL
+        AND us.current_period_end < NOW()
+    `, [SubscriptionService.COMP_PLAN_ID]);
+
+    const users = rows as any[];
+    let expired = 0;
+
+    for (const row of users) {
+      try {
+        await DB.query(`
+          UPDATE user_subscriptions
+          SET status = 'free', tier = 'free', provider = NULL,
+              provider_plan_id = NULL, provider_subscription_id = NULL,
+              current_period_end = NULL, cancel_reason = 'Student verification expired'
+          WHERE user_id = ? AND provider = 'manual' AND provider_plan_id = ?
+        `, [row.user_id, SubscriptionService.COMP_PLAN_ID]);
+
+        await DB.query(`
+          UPDATE student_verifications
+          SET status = 'expired'
+          WHERE user_id = ? AND status = 'active'
+        `, [row.user_id]);
+
+        await this.invalidateCache(row.user_id);
+
+        await this.logEvent({
+          userId: row.user_id,
+          eventType: 'subscription.comp_expired',
+          metadata: { reason: 'student' },
+        });
+
+        if (row.email) {
+          await emailService.queueEmail(row.email, 'student_access_expired', {
+            reverifyUrl: `${process.env.APP_URL || 'https://www.theundergroundrailroad.world/Mirror'}/students`,
+          });
+        }
+
+        expired++;
+        logger.info('Student comp expired, downgraded to free', { userId: row.user_id });
+      } catch (error) {
+        logger.error('Failed to expire student comp', error as Error, { userId: row.user_id });
+      }
+    }
+
+    if (expired > 0) logger.info(`Expired ${expired} student comps`);
+    return expired;
+  }
+
+  /**
+   * Notify students whose comp expires in ~7 days so they can re-verify.
+   * Uses a 1-day slice (6–7 days out) so each user is notified roughly once,
+   * rather than every run.
+   */
+  async sendStudentCompExpiringNotifications(): Promise<number> {
+    const [rows] = await DB.query(`
+      SELECT us.user_id, us.current_period_end, u.email
+      FROM user_subscriptions us
+      JOIN users u ON us.user_id = u.id
+      WHERE us.provider = 'manual'
+        AND us.provider_plan_id = ?
+        AND us.status = 'active'
+        AND us.current_period_end BETWEEN DATE_ADD(NOW(), INTERVAL 6 DAY) AND DATE_ADD(NOW(), INTERVAL 7 DAY)
+    `, [SubscriptionService.COMP_PLAN_ID]);
+
+    const users = rows as any[];
+    let sent = 0;
+
+    for (const row of users) {
+      try {
+        const daysLeft = Math.max(0, Math.ceil(
+          (new Date(row.current_period_end).getTime() - Date.now()) / (24 * 60 * 60 * 1000)
+        ));
+        await emailService.queueEmail(row.email, 'student_access_expiring', {
+          daysLeft: String(daysLeft),
+          reverifyUrl: `${process.env.APP_URL || 'https://www.theundergroundrailroad.world/Mirror'}/students`,
+        });
+        sent++;
+      } catch (error) {
+        logger.error('Failed to send student comp expiring notification', error as Error, { userId: row.user_id });
+      }
+    }
+
+    return sent;
   }
 
   // ========================================================================

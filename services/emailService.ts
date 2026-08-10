@@ -93,7 +93,11 @@ export type EmailTemplateName =
   | 'payment_confirmed'
   | 'payment_failed'
   | 'trial_ending'
-  | 'subscription_cancelled';
+  | 'subscription_cancelled'
+  | 'student_verification'
+  | 'student_access_granted'
+  | 'student_access_expiring'
+  | 'student_access_expired';
 
 export interface EmailTemplateData {
   [key: string]: string | number | boolean | undefined;
@@ -319,6 +323,93 @@ const EMAIL_TEMPLATES: Record<EmailTemplateName, {
       </div>
     `,
     text: (data) => `Mirror Premium cancelled. You have access until ${data.accessUntil}. Resubscribe anytime from your dashboard.`,
+  },
+
+  // --------------------------------------------------------------------------
+  // Student access program (Goal #1)
+  // --------------------------------------------------------------------------
+  // Sent to the CAMPUS email address to prove control of it. The link carries a
+  // single-use token; clicking it grants the comp to the account that requested it.
+  student_verification: {
+    subject: 'Confirm your school email for free Mirror Premium',
+    html: (data) => `
+      <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; background: #0a0a0f; color: #e0e0e0;">
+        <div style="text-align: center; margin-bottom: 32px;">
+          <h1 style="color: #ffffff; font-size: 28px; margin: 0;">Mirror</h1>
+          <p style="color: #888; font-size: 14px; margin: 8px 0 0;">Students get Premium, free</p>
+        </div>
+        <div style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 32px;">
+          <h2 style="color: #fff; margin: 0 0 16px;">Confirm your school email</h2>
+          <p style="color: #ccc; line-height: 1.6;">You're one click away from free Mirror Premium. Confirm this school email address to activate your student access. This link expires in ${data.expiresInHours} hours.</p>
+          <div style="text-align: center; margin: 32px 0;">
+            <a href="${data.verificationUrl}" style="display: inline-block; background: linear-gradient(135deg, #6366f1, #8b5cf6); color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600;">Confirm & activate</a>
+          </div>
+          <p style="color: #888; font-size: 13px;">If the button doesn't work, copy this link: ${data.verificationUrl}</p>
+        </div>
+        <p style="color: #666; font-size: 12px; text-align: center; margin-top: 32px;">If you didn't request student access to Mirror, you can safely ignore this email — no account is affected.</p>
+      </div>
+    `,
+    text: (data) => `Confirm your school email for free Mirror Premium: ${data.verificationUrl} — This link expires in ${data.expiresInHours} hours. If you didn't request this, ignore this email.`,
+  },
+
+  student_access_granted: {
+    subject: 'Your free Mirror Premium is active 🎓',
+    html: (data) => `
+      <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; background: #0a0a0f; color: #e0e0e0;">
+        <div style="text-align: center; margin-bottom: 32px;">
+          <h1 style="color: #ffffff; font-size: 28px; margin: 0;">Mirror</h1>
+        </div>
+        <div style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 32px;">
+          <h2 style="color: #fff; margin: 0 0 16px;">You're in — Premium unlocked</h2>
+          <p style="color: #ccc; line-height: 1.6;">Your student status is confirmed and Mirror Premium is now active on your account, free through <strong>${data.expiresOn}</strong>. We'll remind you to re-verify before then so you never lose access while you're enrolled.</p>
+          <div style="text-align: center; margin: 32px 0;">
+            <a href="${data.appUrl}/dashboard" style="display: inline-block; background: linear-gradient(135deg, #6366f1, #8b5cf6); color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600;">Open Mirror</a>
+          </div>
+        </div>
+        <p style="color: #666; font-size: 12px; text-align: center; margin-top: 32px;">Premium as a student is complimentary — you won't be charged.</p>
+      </div>
+    `,
+    text: (data) => `Your student status is confirmed — Mirror Premium is active free through ${data.expiresOn}. Open Mirror at ${data.appUrl}/dashboard. You won't be charged.`,
+  },
+
+  student_access_expiring: {
+    subject: 'Re-verify to keep your free Mirror Premium',
+    html: (data) => `
+      <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; background: #0a0a0f; color: #e0e0e0;">
+        <div style="text-align: center; margin-bottom: 32px;">
+          <h1 style="color: #ffffff; font-size: 28px; margin: 0;">Mirror</h1>
+        </div>
+        <div style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 32px;">
+          <h2 style="color: #fff; margin: 0 0 16px;">Your student access ends in ${data.daysLeft} days</h2>
+          <p style="color: #ccc; line-height: 1.6;">Still enrolled? Re-verify your school email to keep Mirror Premium free for another year. It takes about a minute.</p>
+          <div style="text-align: center; margin: 32px 0;">
+            <a href="${data.reverifyUrl}" style="display: inline-block; background: linear-gradient(135deg, #6366f1, #8b5cf6); color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600;">Re-verify now</a>
+          </div>
+        </div>
+        <p style="color: #666; font-size: 12px; text-align: center; margin-top: 32px;">If you've graduated, no action is needed — access will simply return to the free plan.</p>
+      </div>
+    `,
+    text: (data) => `Your free Mirror Premium (student) ends in ${data.daysLeft} days. Re-verify your school email to keep it: ${data.reverifyUrl}`,
+  },
+
+  student_access_expired: {
+    subject: 'Your student Mirror Premium has ended',
+    html: (data) => `
+      <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; background: #0a0a0f; color: #e0e0e0;">
+        <div style="text-align: center; margin-bottom: 32px;">
+          <h1 style="color: #ffffff; font-size: 28px; margin: 0;">Mirror</h1>
+        </div>
+        <div style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 32px;">
+          <h2 style="color: #fff; margin: 0 0 16px;">Your student access has ended</h2>
+          <p style="color: #ccc; line-height: 1.6;">Your account is now on the free plan. If you're still enrolled, re-verify your school email to restore Premium at no cost.</p>
+          <div style="text-align: center; margin: 32px 0;">
+            <a href="${data.reverifyUrl}" style="display: inline-block; background: linear-gradient(135deg, #6366f1, #8b5cf6); color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600;">Re-verify student status</a>
+          </div>
+        </div>
+        <p style="color: #666; font-size: 12px; text-align: center; margin-top: 32px;">Your data and history are untouched — only Premium features are paused.</p>
+      </div>
+    `,
+    text: (data) => `Your student Mirror Premium has ended and your account is on the free plan. Still enrolled? Re-verify: ${data.reverifyUrl}`,
   },
 };
 

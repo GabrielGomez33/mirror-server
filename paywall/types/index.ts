@@ -107,6 +107,9 @@ export type SubscriptionEventType =
   | 'subscription.cancelled'
   | 'subscription.reactivated'
   | 'subscription.expired'
+  | 'subscription.comp_granted'   // complimentary grant (e.g. verified student)
+  | 'subscription.comp_revoked'   // comp pulled (abuse / admin / paid takeover)
+  | 'subscription.comp_expired'   // comp reached its time-box and lapsed
   | 'payment.completed'
   | 'payment.failed'
   | 'payment.recovered'
