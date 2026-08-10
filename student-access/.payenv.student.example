@@ -1,0 +1,34 @@
+# ============================================================================
+# STUDENT ACCESS — environment (all optional; safe defaults shown)
+# ============================================================================
+# These are read by paywall/student.config.ts at startup. Add to your .payenv
+# (or process env). Every value is clamped to a safe range; garbage falls back
+# to the default.
+
+# Master switch. Set to false to instantly disable the endpoints (returns 403);
+# existing student comps keep running until they expire.
+STUDENT_ACCESS_ENABLED=true
+
+# Verification stance:
+#   allowlist   (RECOMMENDED) — only domains in accredited_domains(status=active)
+#   suffix_edu  — any *.edu (weak; look-alike TLDs still rejected). Eyes-open opt-in.
+#   hybrid      — allowlist first, then fall back to *.edu
+STUDENT_ALLOWLIST_MODE=allowlist
+
+# How long a comp lasts before re-verification is required (months). Clamp 1..60.
+STUDENT_GRANT_MONTHS=12
+
+# Age gate (attestation). Clamp 13..100. Keep at 18 for the psychological-analysis product.
+STUDENT_MIN_AGE=18
+
+# Campus-email confirmation link lifetime (hours). Clamp 1..168.
+STUDENT_TOKEN_EXPIRY_HOURS=24
+
+# Per-user cooldown between confirmation emails (seconds). Clamp 10..3600.
+STUDENT_RESEND_COOLDOWN_SECONDS=60
+
+# Max pending (unused, unexpired) tokens per user before old ones are purged. Clamp 1..20.
+STUDENT_MAX_ACTIVE_TOKENS=5
+
+# Anti-abuse: max verification requests per institution domain per day. Clamp 10..100000.
+STUDENT_MAX_PER_DOMAIN_PER_DAY=200

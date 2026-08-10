@@ -105,6 +105,8 @@ import { PayPalProvider } from './paywall/providers/paypal.provider';
 import { SubscriptionService } from './paywall/services/subscription.service';
 import { createPayPalWebhookRouter } from './paywall/webhooks/paypal.webhooks';
 import { createSubscriptionRoutes } from './routes/subscriptionRoutes';
+import { createStudentRoutes } from './routes/studentRoutes';
+import { loadStudentConfig } from './paywall/student.config';
 import { emailService } from './services/emailService';
 
 // ============================================================================
@@ -207,6 +209,11 @@ AuthMiddleware.setSubscriptionGateRules(
 );
 
 console.log(`[STARTUP] Paywall system initialized (provider: ${paywallConfig.provider}, mode: ${paywallConfig.mode})`);
+
+// Student access program (Goal #1). Entitlement runs through the SAME
+// subscriptionService (grantStudentComp) — no separate access path.
+const studentConfig = loadStudentConfig();
+console.log(`[STARTUP] Student access: ${studentConfig.enabled ? 'ENABLED' : 'disabled'} (mode: ${studentConfig.mode}, grant: ${studentConfig.grantMonths}mo, minAge: ${studentConfig.minAge})`);
 
 // ============================================================================
 // EXPRESS APP SETUP
@@ -448,6 +455,13 @@ APP.use('/mirror/api/subscription',
   createSubscriptionRoutes(paywallConfig, subscriptionService, paypalProvider)
 );
 console.log('[ROUTES] Subscription routes mounted at /mirror/api/subscription');
+
+// Student access — NOT umbrella-gated: /verify is the emailed-token on-ramp
+// (unauthenticated) and /request is how a FREE user becomes premium, so a
+// premium gate here would be a lockout. The router applies verifyToken to the
+// authenticated endpoints itself.
+APP.use('/mirror/api/student', createStudentRoutes(subscriptionService, studentConfig));
+console.log('[ROUTES] Student access routes mounted at /mirror/api/student');
 
 
 // ============================================================================
@@ -907,8 +921,9 @@ async function startServer(): Promise<void> {
       try {
         const trials = await subscriptionService.checkAndExpireTrials();
         const grace = await subscriptionService.checkAndExpireGracePeriods();
-        if (trials > 0 || grace > 0) {
-          console.log(`[PAYWALL CRON] Expired ${trials} trials, ${grace} grace periods`);
+        const studentComps = await subscriptionService.checkAndExpireStudentComps();
+        if (trials > 0 || grace > 0 || studentComps > 0) {
+          console.log(`[PAYWALL CRON] Expired ${trials} trials, ${grace} grace periods, ${studentComps} student comps`);
         }
       } catch (error) {
         logError('[PAYWALL CRON] Expiry check error', error);
@@ -919,8 +934,9 @@ async function startServer(): Promise<void> {
     setInterval(async () => {
       try {
         const sent = await subscriptionService.sendTrialEndingNotifications();
-        if (sent > 0) {
-          console.log(`[PAYWALL CRON] Sent ${sent} trial ending notifications`);
+        const studentSoon = await subscriptionService.sendStudentCompExpiringNotifications();
+        if (sent > 0 || studentSoon > 0) {
+          console.log(`[PAYWALL CRON] Sent ${sent} trial-ending, ${studentSoon} student re-verify notifications`);
         }
       } catch (error) {
         logError('[PAYWALL CRON] Trial notification error', error);
