@@ -13,6 +13,7 @@ import {
   TierType,
 } from './directoryController';
 import { v4 as uuidv4 } from 'uuid';
+import { stepsPresentInPayload, markStepsCompleted } from '../services/intakeCompletion';
 import { recordIqNormSample } from './iqNormsController';
 
 // ============================================================================
@@ -689,19 +690,46 @@ export class IntakeDataManager {
  */
 export const storeIntakeDataHandler: RequestHandler = async (req, res) => {
   try {
-    const { userId, intakeData } = req.body as { userId?: string | number; intakeData?: IntakeDataStructure };
+    const { intakeData } = req.body as { userId?: string | number; intakeData?: IntakeDataStructure };
 
-    if (!userId || !intakeData) {
+    // SECURITY: the target user is ALWAYS the authenticated caller. req.user.id
+    // is set by verifyToken (mounted on this route); a body userId, if present,
+    // was already asserted to match by assertSelfBody. We deliberately do NOT
+    // read the body userId here, so the write cannot be redirected to another
+    // account even if the upstream guard chain were ever changed (IDOR defense
+    // in depth — the historical hole was trusting req.body.userId directly).
+    const authUserId = Number(req.user?.id);
+    if (!Number.isFinite(authUserId) || authUserId <= 0) {
+      res.status(401).json({ success: false, error: 'Unauthenticated.' });
+      return;
+    }
+
+    if (!intakeData) {
       res.status(400).json({
         success: false,
-        error: 'userId and intakeData are required',
+        error: 'intakeData is required',
+      });
+      return;
+    }
+
+    // DEFENSE (anti-junk): a store must carry at least one real assessment
+    // section. This rejects contentless payloads like { name: "x" } that would
+    // otherwise create a new "latest" intake record masking real data. The
+    // incremental Core flow always sends >= 1 section, so it is unaffected;
+    // name-only / progress-only saves belong on the /intake/progress endpoints.
+    const presentSectionsForGuard = stepsPresentInPayload(intakeData);
+    if (presentSectionsForGuard.length === 0) {
+      res.status(400).json({
+        success: false,
+        error: 'Intake payload contains no assessment sections.',
+        code: 'EMPTY_INTAKE',
       });
       return;
     }
 
     // Boundary: string for storage layer, number for DataAccessContext
-    const uidStr = String(userId);
-    const uidNum = Number(userId);
+    const uidStr = String(authUserId);
+    const uidNum = authUserId;
     const sessionId = (req.headers['x-session-id'] as string) || '';
 
     const context: DataAccessContext = {
@@ -715,8 +743,22 @@ export const storeIntakeDataHandler: RequestHandler = async (req, res) => {
 
     const result = await IntakeDataManager.storeIntakeData(uidStr, intakeData, context);
 
-    // Mark user's intake as completed so auth endpoints return intakeCompleted: true
-    await DB.query('UPDATE users SET intake_completed = TRUE WHERE id = ?', [uidNum]);
+    // Legacy bridge (replaces the old unconditional "intake_completed = TRUE on
+    // any submit"): mark a core progress step completed for EACH section this
+    // payload actually carries, then re-derive users.intake_completed from the
+    // accumulated per-step progress (the single source of truth). A full
+    // monolithic submit marks all 5 -> intake_completed = 1; a partial submit
+    // marks only what it contains. Best-effort: a progress bookkeeping failure
+    // must never fail an otherwise-successful data store.
+    try {
+      const presentSteps = stepsPresentInPayload(intakeData);
+      if (presentSteps.length > 0) {
+        await markStepsCompleted(uidNum, presentSteps);
+      }
+    } catch (progressErr) {
+      console.warn('[intake] progress derivation failed (data stored OK):',
+        (progressErr as Error).message);
+    }
 
     // Record a de-identified IQ self-norm sample (first attempt only, scored
     // server-side). Best-effort: never allowed to fail the intake submission.

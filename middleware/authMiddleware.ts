@@ -8,6 +8,7 @@ import express, { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { DB } from '../db';
 import { TokenManager, SecurityMonitor } from '../controllers/authController';
+import { paramMatchesSelf, bodyIdVerdict } from '../utils/selfAssertion';
 
 // Extend Express Request interface to include user data and subscription
 declare global {
@@ -344,6 +345,57 @@ class AuthMiddleware {
       });
     }
   };
+
+  // ==========================================================================
+  // SELF-ASSERTION GUARDS — defense against IDOR on user-scoped routes
+  // --------------------------------------------------------------------------
+  // A valid token proves WHO you are, not WHAT you may touch. These guards
+  // enforce that a user-scoped :param / body field refers to the authenticated
+  // user themselves. Mount AFTER verifyToken. On mismatch: 403 + security log.
+  // Factory form (returns a RequestHandler) so the field name is explicit at
+  // the call site and the guard stays a pure, reusable unit.
+  // ==========================================================================
+
+  /** Ensure req.params[paramName] === authenticated user id. */
+  static assertSelfParam = (paramName: string = 'userId') =>
+    (req: Request, res: Response, next: NextFunction): void => {
+      const claimed = (req.params as Record<string, string>)[paramName];
+      if (!paramMatchesSelf(req.user?.id, claimed)) {
+        void SecurityMonitor.logSecurityEvent(req.user?.id ?? null, 'idor_attempt', {
+          method: req.method,
+          claimed: claimed ?? null,
+          via: `param:${paramName}`,
+        }, 'high', req.originalUrl);
+        res.status(403).json({ error: 'Forbidden.', code: 'FORBIDDEN_CROSS_USER' });
+        return;
+      }
+      next();
+    };
+
+  /**
+   * Ensure req.body[field] === authenticated user id WHEN present. A missing
+   * body id is allowed (the handler uses req.user.id); a PRESENT id that
+   * disagrees is a tampering signal and is rejected.
+   */
+  static assertSelfBody = (field: string = 'userId') =>
+    (req: Request, res: Response, next: NextFunction): void => {
+      const raw = (req.body as Record<string, unknown> | undefined)?.[field];
+      const verdict = bodyIdVerdict(req.user?.id, raw);
+      if (verdict === 'unauth') {
+        res.status(401).json({ error: 'Unauthenticated.', code: 'NO_TOKEN' });
+        return;
+      }
+      if (verdict === 'reject') {
+        void SecurityMonitor.logSecurityEvent(Number(req.user?.id), 'idor_attempt', {
+          method: req.method,
+          claimed: String(raw),
+          via: `body:${field}`,
+        }, 'high', req.originalUrl);
+        res.status(403).json({ error: 'Forbidden.', code: 'FORBIDDEN_CROSS_USER' });
+        return;
+      }
+      next();
+    };
 
   // ==========================================================================
   // SUBSCRIPTION GATE — Umbrella middleware for all authenticated routes
