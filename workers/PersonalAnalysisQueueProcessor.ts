@@ -24,6 +24,7 @@
 import crypto from 'crypto';
 import { DB } from '../db';
 import { IntakeDataManager } from '../controllers/intakeController';
+import { resolveLatest } from '../services/intakeReadModel';
 import { DataAccessContext } from '../controllers/directoryController';
 
 // ============================================================================
@@ -302,13 +303,9 @@ class PersonalAnalysisQueueProcessor {
         reason: 'personal_analysis_queue_processing',
       };
 
-      const result = await IntakeDataManager.getLatestIntakeData(
-        String(userId),
-        context,
-        false // Don't include file contents
-      );
-
-      const rawIntake = result?.intakeData || null;
+      // Merged read-view: Core (full) overlaid on Entry (preliminary), so Dina
+      // can analyze from EITHER source. Same `intakeData` shape as before.
+      const rawIntake = await resolveLatest(Number(userId), context);
 
       if (rawIntake) {
         intakeData = {

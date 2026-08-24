@@ -19,6 +19,7 @@ import userRoutes from './routes/user';
 import storageRoutes from './routes/storage';
 import debugRoutes from './routes/debug';
 import intakeRoutes from './routes/intake';
+import intakeEntryRoutes from './routes/intakeEntry';
 import dashboardRoutes from './routes/dashboard';
 import journalRoutes from './routes/journal';
 import pushRoutes from './routes/push'
@@ -368,6 +369,9 @@ APP.use('/mirror/api/auth', authRoutes);
 APP.use('/mirror/api/user', AuthMiddleware.subscriptionGate as express.RequestHandler, userRoutes);
 APP.use('/mirror/api/storage', storageRoutes);
 APP.use('/mirror/api/debug', debugRoutes);
+// Entry ("initial") intake — mounted BEFORE the general intake router so the
+// more specific /entry path is unambiguous. Its own authenticated pipeline.
+APP.use('/mirror/api/intake/entry', intakeEntryRoutes);
 APP.use('/mirror/api/intake', intakeRoutes);
 APP.use('/mirror/api/dashboard', dashboardRoutes);
 APP.use('/mirror/api/journal', AuthMiddleware.subscriptionGate as express.RequestHandler, journalRoutes);

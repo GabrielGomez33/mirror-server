@@ -10,6 +10,7 @@
 import express, { RequestHandler } from 'express';
 import jwt from 'jsonwebtoken';
 import { IntakeDataManager } from '../controllers/intakeController';
+import { resolveLatest } from '../services/intakeReadModel';
 import { DataAccessContext } from '../controllers/directoryController';
 
 const router = express.Router();
@@ -63,13 +64,9 @@ export const getPersonalIntelligenceHandler: RequestHandler = async (req, res) =
         reason: 'dashboard_complete_data_retrieval'
       };
 
-      const result = await IntakeDataManager.getLatestIntakeData(
-        String(userId),
-        context,
-        false // Don't include file contents for dashboard
-      );
-
-      completeIntakeData = result?.intakeData || null;
+      // Merged read-view: Core (full) overlaid on Entry (preliminary), so the
+      // dashboard lights up from EITHER source. Same shape as before.
+      completeIntakeData = await resolveLatest(Number(userId), context);
 
       console.log(`📊 COMPLETE intake data retrieved:`, {
         hasData: !!completeIntakeData,
