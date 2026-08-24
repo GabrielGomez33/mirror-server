@@ -17,11 +17,60 @@ import {
   coerceJson,
   entryToIntakeSections,
   mergeCoreOverEntry,
+  mergeCoreRecordsNewestFirst,
+  isNonEmptyValue,
   type EntryResult,
 } from '../utils/intakeMerge';
 
 // Re-export the pure helpers so existing importers of this module keep working.
 export { coerceJson, entryToIntakeSections, mergeCoreOverEntry, EntryResult };
+
+// The load-bearing Core sections. Once all are gathered we can stop scanning.
+const CORE_SECTION_KEYS = ['personalityResult', 'astrologicalResult', 'iqResults', 'faceAnalysis', 'voiceMetadata'];
+// Cap the number of historical records we decrypt per resolve (perf bound).
+const MAX_CORE_RECORDS_SCANNED = 8;
+
+/**
+ * The user's Core intake, assembled by merging their recent stored records
+ * (newest non-empty wins per key). This is deliberately NOT "the single latest
+ * record" — a later partial/junk submission (e.g. `{name:"x"}`) must never mask
+ * an earlier full one. Scans newest-first and stops early once every core
+ * section is found.
+ */
+export async function getMergedCoreIntake(
+  userId: number | string,
+  context: DataAccessContext
+): Promise<Record<string, any> | null> {
+  let metas: Array<{ intakeId: string }>;
+  try {
+    metas = (await IntakeDataManager.listUserIntakes(String(userId))) as Array<{ intakeId: string }>;
+  } catch (e) {
+    console.error(`[intakeReadModel] listUserIntakes failed for user ${userId}:`, (e as Error)?.message || e);
+    return null;
+  }
+  if (!metas || metas.length === 0) return null;
+
+  const recordsNewestFirst: Array<Record<string, any>> = [];
+  const found = new Set<string>();
+  let scanned = 0;
+  for (const m of metas) {
+    if (scanned >= MAX_CORE_RECORDS_SCANNED) break;
+    scanned++;
+    try {
+      const r = await IntakeDataManager.retrieveIntakeData(String(userId), m.intakeId, context, false);
+      const rec = r?.intakeData as Record<string, any> | undefined;
+      if (rec) {
+        recordsNewestFirst.push(rec);
+        for (const k of CORE_SECTION_KEYS) if (isNonEmptyValue(rec[k])) found.add(k);
+      }
+    } catch (e) {
+      console.error(`[intakeReadModel] retrieve ${m.intakeId} failed for user ${userId}:`, (e as Error)?.message || e);
+    }
+    if (found.size === CORE_SECTION_KEYS.length) break; // full profile assembled
+  }
+  const merged = mergeCoreRecordsNewestFirst(recordsNewestFirst);
+  return Object.keys(merged).length ? merged : null;
+}
 
 // --- DB-backed API ----------------------------------------------------------
 
@@ -55,12 +104,10 @@ export async function resolveLatest(
   context: DataAccessContext
 ): Promise<Record<string, any> | null> {
   const uidNum = Number(userId);
-  const [coreRes, entry] = await Promise.all([
-    // NOTE: do NOT swallow silently — a failed CORE read is exactly the kind of
-    // production regression that must be visible in logs, not hidden as an empty
-    // dashboard. We still degrade gracefully (return null for this source) so
-    // Entry can carry the render, but we log the real reason.
-    IntakeDataManager.getLatestIntakeData(String(userId), context, false).catch((e) => {
+  const [core, entry] = await Promise.all([
+    // Assemble Core across recent records (newest non-empty wins) so a partial
+    // "latest" never masks an earlier full submission. Logs real failures.
+    getMergedCoreIntake(userId, context).catch((e) => {
       console.error(`[intakeReadModel] CORE read failed for user ${userId}:`, (e as Error)?.message || e);
       return null;
     }),
@@ -69,7 +116,6 @@ export async function resolveLatest(
       return null;
     }),
   ]);
-  const core = (coreRes?.intakeData as Record<string, any> | undefined) ?? null;
   const merged = mergeCoreOverEntry(entryToIntakeSections(entry), core);
   console.log(
     `[intakeReadModel] resolveLatest user=${userId} core=${!!core} entry=${!!entry} ` +

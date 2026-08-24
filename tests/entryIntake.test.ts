@@ -16,6 +16,8 @@ import {
   coerceJson,
   entryToIntakeSections,
   mergeCoreOverEntry,
+  mergeCoreRecordsNewestFirst,
+  isNonEmptyValue,
   type EntryResult,
 } from '../utils/intakeMerge';
 
@@ -102,6 +104,51 @@ eq(entryToIntakeSections(null), {}, 'null entry -> {}');
 ok(mergeCoreOverEntry({}, null) === null, 'both empty -> null');
 eq(mergeCoreOverEntry(sections, null), sections, 'entry-only -> entry sections');
 eq(mergeCoreOverEntry({}, { iqResults: { iqScore: 100 } }), { iqResults: { iqScore: 100 } }, 'core-only passthrough');
+
+// ---------------------------------------------------------------------------
+group('isNonEmptyValue');
+ok(isNonEmptyValue({ a: 1 }) === true, 'non-empty object -> true');
+ok(isNonEmptyValue({}) === false, 'empty object -> false');
+ok(isNonEmptyValue('x') === true, 'non-empty string -> true');
+ok(isNonEmptyValue('  ') === false, 'blank string -> false');
+ok(isNonEmptyValue([]) === false, 'empty array -> false');
+ok(isNonEmptyValue([1]) === true, 'non-empty array -> true');
+ok(isNonEmptyValue(0) === true, 'zero (number) -> true');
+ok(isNonEmptyValue(null) === false, 'null -> false');
+ok(isNonEmptyValue(undefined) === false, 'undefined -> false');
+
+// ---------------------------------------------------------------------------
+group('mergeCoreRecordsNewestFirst — a junk latest must NOT mask a full record');
+{
+  // This is the user-48 production case: newest record is {name:"x"}, the real
+  // full intake is older. The merge must recover every section.
+  const junkNewest = { name: 'x' };
+  const fullOlder = {
+    name: 'Gabriel',
+    personalityResult: { mbtiType: 'INFP' },
+    astrologicalResult: { western: { sunSign: 'Leo' } },
+    iqResults: { iqScore: 128 },
+    faceAnalysis: { expressions: {} },
+    voiceMetadata: { duration: 8 },
+  };
+  const merged = mergeCoreRecordsNewestFirst([junkNewest, fullOlder]); // newest first
+  eq((merged as any).personalityResult, { mbtiType: 'INFP' }, 'personality recovered from older full record');
+  eq((merged as any).astrologicalResult, { western: { sunSign: 'Leo' } }, 'astrology recovered');
+  eq((merged as any).iqResults, { iqScore: 128 }, 'iq recovered');
+  ok(!!(merged as any).faceAnalysis && !!(merged as any).voiceMetadata, 'face + voice recovered');
+  eq((merged as any).name, 'x', 'newest non-empty name wins (cosmetic, newest record)');
+}
+{
+  // Newer record UPDATES a section -> newest non-empty wins.
+  const merged = mergeCoreRecordsNewestFirst([
+    { personalityResult: { mbtiType: 'ENTJ' } }, // newer
+    { personalityResult: { mbtiType: 'INFP' }, iqResults: { iqScore: 100 } }, // older
+  ]);
+  eq((merged as any).personalityResult, { mbtiType: 'ENTJ' }, 'newer personality wins');
+  eq((merged as any).iqResults, { iqScore: 100 }, 'older iq still filled in');
+}
+ok(mergeCoreRecordsNewestFirst([]) && Object.keys(mergeCoreRecordsNewestFirst([])).length === 0, 'empty -> {}');
+ok(Object.keys(mergeCoreRecordsNewestFirst([null, undefined, { a: 1 }])).length === 1, 'skips null/undefined records');
 
 // ---------------------------------------------------------------------------
 console.log(`\n${failed === 0 ? '✓' : '✗'} entryIntake: ${passed} passed, ${failed} failed\n`);
