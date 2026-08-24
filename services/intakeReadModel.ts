@@ -56,9 +56,24 @@ export async function resolveLatest(
 ): Promise<Record<string, any> | null> {
   const uidNum = Number(userId);
   const [coreRes, entry] = await Promise.all([
-    IntakeDataManager.getLatestIntakeData(String(userId), context, false).catch(() => null),
-    getEntryResult(uidNum).catch(() => null),
+    // NOTE: do NOT swallow silently — a failed CORE read is exactly the kind of
+    // production regression that must be visible in logs, not hidden as an empty
+    // dashboard. We still degrade gracefully (return null for this source) so
+    // Entry can carry the render, but we log the real reason.
+    IntakeDataManager.getLatestIntakeData(String(userId), context, false).catch((e) => {
+      console.error(`[intakeReadModel] CORE read failed for user ${userId}:`, (e as Error)?.message || e);
+      return null;
+    }),
+    getEntryResult(uidNum).catch((e) => {
+      console.error(`[intakeReadModel] ENTRY read failed for user ${userId}:`, (e as Error)?.message || e);
+      return null;
+    }),
   ]);
   const core = (coreRes?.intakeData as Record<string, any> | undefined) ?? null;
-  return mergeCoreOverEntry(entryToIntakeSections(entry), core);
+  const merged = mergeCoreOverEntry(entryToIntakeSections(entry), core);
+  console.log(
+    `[intakeReadModel] resolveLatest user=${userId} core=${!!core} entry=${!!entry} ` +
+    `sections=${merged ? Object.keys(merged).join(',') : 'none'}`
+  );
+  return merged;
 }
