@@ -10,6 +10,11 @@ import {
   getLatestIntakeHandler
 } from '../controllers/intakeController';
 import { getIqNormsHandler } from '../controllers/iqNormsController';
+import {
+  getProgressHandler,
+  putProgressStepHandler,
+  completeProgressStepHandler,
+} from '../controllers/intakeProgressController';
 
 const router = express.Router();
 
@@ -55,6 +60,22 @@ router.get('/list/:userId', verify, selfParam, listUserIntakesHandler);
  * GET /api/intake/latest/:userId  (auth + self)
  */
 router.get('/latest/:userId', verify, selfParam, getLatestIntakeHandler);
+
+// ============================================================================
+// CORE PER-STEP PROGRESS (authenticated; self-scoped by token, no :userId)
+//   The user is always req.user.id — there is no user id in the path or body,
+//   so these routes carry no IDOR surface. :step is validated against the
+//   CORE_STEPS allowlist in the controller before any SQL.
+// ============================================================================
+
+/** GET the five steps' status + derived intake completion. */
+router.get('/progress', verify, getProgressHandler);
+
+/** PUT a resumable draft for one step (server-side "come back later"). */
+router.put('/progress/:step', verify, putProgressStepHandler);
+
+/** POST to mark one step complete and re-derive intake_completed. */
+router.post('/progress/:step/complete', verify, completeProgressStepHandler);
 
 /**
  * Get IQ self-norm percentile for a raw score, relative to other Mirror users.

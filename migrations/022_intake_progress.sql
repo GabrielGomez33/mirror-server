@@ -86,3 +86,25 @@ CREATE TABLE IF NOT EXISTS core_intake_progress (
   INDEX idx_user_status (user_id, status),
   CONSTRAINT fk_core_progress_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ----------------------------------------------------------------------------
+-- (d) BACKFILL — protect users who already finished intake under the old
+--     semantics. Before this migration, intake_completed was set TRUE on the
+--     first /store, and the monolithic SubmitStep required ALL five sections
+--     (photo, voice, iq, astrology, personality) to submit — so an existing
+--     intake_completed=1 user genuinely provided all five. We seed all five
+--     'completed' rows for them; otherwise the new derivation would recount 0
+--     completed steps on their next write and REGRESS intake_completed to 0.
+--     INSERT IGNORE + UNIQUE(user_id, step_key) makes this idempotent.
+-- ----------------------------------------------------------------------------
+INSERT IGNORE INTO core_intake_progress (user_id, step_key, status, completed_at)
+SELECT u.id, s.step_key, 'completed', NOW()
+FROM users u
+CROSS JOIN (
+  SELECT 'visual'      AS step_key UNION ALL
+  SELECT 'vocal'       UNION ALL
+  SELECT 'iq'          UNION ALL
+  SELECT 'astrology'   UNION ALL
+  SELECT 'personality'
+) s
+WHERE u.intake_completed = 1;

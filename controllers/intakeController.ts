@@ -13,6 +13,7 @@ import {
   TierType,
 } from './directoryController';
 import { v4 as uuidv4 } from 'uuid';
+import { stepsPresentInPayload, markStepsCompleted } from '../services/intakeCompletion';
 import { recordIqNormSample } from './iqNormsController';
 
 // ============================================================================
@@ -727,8 +728,22 @@ export const storeIntakeDataHandler: RequestHandler = async (req, res) => {
 
     const result = await IntakeDataManager.storeIntakeData(uidStr, intakeData, context);
 
-    // Mark user's intake as completed so auth endpoints return intakeCompleted: true
-    await DB.query('UPDATE users SET intake_completed = TRUE WHERE id = ?', [uidNum]);
+    // Legacy bridge (replaces the old unconditional "intake_completed = TRUE on
+    // any submit"): mark a core progress step completed for EACH section this
+    // payload actually carries, then re-derive users.intake_completed from the
+    // accumulated per-step progress (the single source of truth). A full
+    // monolithic submit marks all 5 -> intake_completed = 1; a partial submit
+    // marks only what it contains. Best-effort: a progress bookkeeping failure
+    // must never fail an otherwise-successful data store.
+    try {
+      const presentSteps = stepsPresentInPayload(intakeData);
+      if (presentSteps.length > 0) {
+        await markStepsCompleted(uidNum, presentSteps);
+      }
+    } catch (progressErr) {
+      console.warn('[intake] progress derivation failed (data stored OK):',
+        (progressErr as Error).message);
+    }
 
     // Record a de-identified IQ self-norm sample (first attempt only, scored
     // server-side). Best-effort: never allowed to fail the intake submission.
