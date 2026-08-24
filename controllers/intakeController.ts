@@ -689,19 +689,31 @@ export class IntakeDataManager {
  */
 export const storeIntakeDataHandler: RequestHandler = async (req, res) => {
   try {
-    const { userId, intakeData } = req.body as { userId?: string | number; intakeData?: IntakeDataStructure };
+    const { intakeData } = req.body as { userId?: string | number; intakeData?: IntakeDataStructure };
 
-    if (!userId || !intakeData) {
+    // SECURITY: the target user is ALWAYS the authenticated caller. req.user.id
+    // is set by verifyToken (mounted on this route); a body userId, if present,
+    // was already asserted to match by assertSelfBody. We deliberately do NOT
+    // read the body userId here, so the write cannot be redirected to another
+    // account even if the upstream guard chain were ever changed (IDOR defense
+    // in depth — the historical hole was trusting req.body.userId directly).
+    const authUserId = Number(req.user?.id);
+    if (!Number.isFinite(authUserId) || authUserId <= 0) {
+      res.status(401).json({ success: false, error: 'Unauthenticated.' });
+      return;
+    }
+
+    if (!intakeData) {
       res.status(400).json({
         success: false,
-        error: 'userId and intakeData are required',
+        error: 'intakeData is required',
       });
       return;
     }
 
     // Boundary: string for storage layer, number for DataAccessContext
-    const uidStr = String(userId);
-    const uidNum = Number(userId);
+    const uidStr = String(authUserId);
+    const uidNum = authUserId;
     const sessionId = (req.headers['x-session-id'] as string) || '';
 
     const context: DataAccessContext = {
