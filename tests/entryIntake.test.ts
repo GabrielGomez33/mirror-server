@@ -150,6 +150,38 @@ group('mergeCoreRecordsNewestFirst — a junk latest must NOT mask a full record
 ok(mergeCoreRecordsNewestFirst([]) && Object.keys(mergeCoreRecordsNewestFirst([])).length === 0, 'empty -> {}');
 ok(Object.keys(mergeCoreRecordsNewestFirst([null, undefined, { a: 1 }])).length === 1, 'skips null/undefined records');
 
+group('mergeCoreRecordsNewestFirst — DEEP: a partial SECTION must not erase sibling fields');
+{
+  // The exact production case: a newest record with only western.sunSign must
+  // NOT wipe moon/rising/chinese/numerology from the earlier full chart.
+  const partialNewest = { astrologicalResult: { western: { sunSign: 'Leo' } } };
+  const fullOlder = {
+    astrologicalResult: {
+      western: { sunSign: 'Aries', moonSign: 'Cancer', risingSign: 'Virgo' },
+      chinese: { animal: 'Dragon', element: 'Wood' },
+      numerology: { lifePathNumber: 7 },
+      synthesis: { lifeDirection: 'x' },
+    },
+    personalityResult: { mbtiType: 'INFP' },
+  };
+  const merged = mergeCoreRecordsNewestFirst([partialNewest, fullOlder]); // newest first
+  const a = (merged as any).astrologicalResult;
+  eq(a.western.sunSign, 'Leo', 'newest sunSign wins');
+  eq(a.western.moonSign, 'Cancer', 'moonSign preserved from full chart');
+  eq(a.western.risingSign, 'Virgo', 'risingSign preserved');
+  eq(a.chinese, { animal: 'Dragon', element: 'Wood' }, 'chinese section preserved');
+  eq(a.numerology, { lifePathNumber: 7 }, 'numerology preserved');
+  eq((merged as any).personalityResult, { mbtiType: 'INFP' }, 'other sections intact');
+}
+{
+  // Empty nested object in the newer record must not wipe the older section.
+  const merged = mergeCoreRecordsNewestFirst([
+    { astrologicalResult: { western: {} } },
+    { astrologicalResult: { western: { sunSign: 'Leo' } } },
+  ]);
+  eq((merged as any).astrologicalResult.western.sunSign, 'Leo', 'empty {western:{}} does not erase sunSign');
+}
+
 // ---------------------------------------------------------------------------
 console.log(`\n${failed === 0 ? '✓' : '✗'} entryIntake: ${passed} passed, ${failed} failed\n`);
 process.exit(failed === 0 ? 0 : 1);

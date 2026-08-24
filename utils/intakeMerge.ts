@@ -49,24 +49,49 @@ export function isNonEmptyValue(v: unknown): boolean {
   return true; // numbers, booleans
 }
 
+function isPlainObject(v: unknown): v is Record<string, any> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
 /**
- * Merge multiple intake records given NEWEST FIRST into one: for each key, the
- * newest record with a non-empty value wins. This recovers a complete profile
- * even when the newest stored record is partial/junk and would otherwise MASK
- * an earlier full submission (each /store appends a new "latest"). Essential for
- * incremental Core saves, where each step stores only its own section.
+ * Overlay `over` onto `base`, DEEP: nested plain objects merge recursively; a
+ * non-empty scalar/array in `over` wins; an empty value in `over` keeps base.
+ * (Arrays are treated as leaves — a non-empty newer array replaces an older one.)
+ */
+export function deepOverlay(base: any, over: any): any {
+  if (over === null || over === undefined) return base;
+  if (!isPlainObject(over)) return isNonEmptyValue(over) ? over : base;
+  const out: Record<string, any> = isPlainObject(base) ? { ...base } : {};
+  for (const [k, v] of Object.entries(over)) {
+    if (isPlainObject(v)) {
+      out[k] = deepOverlay(isPlainObject(out[k]) ? out[k] : {}, v);
+    } else if (isNonEmptyValue(v)) {
+      out[k] = v;
+    }
+    // empty scalar/array in `over` -> keep whatever base had
+  }
+  return out;
+}
+
+/**
+ * Merge multiple intake records given NEWEST FIRST into one complete profile.
+ * DEEP, newest-non-empty-wins at the LEAF level — so a later partial record can
+ * mask neither a whole section (e.g. a `{name:"x"}` latest) NOR a field within a
+ * section (e.g. an astrologicalResult carrying only `western.sunSign` must not
+ * erase moon/rising/chinese/numerology from an earlier full chart). Essential
+ * for incremental Core saves, where each step stores only part of a section.
  */
 export function mergeCoreRecordsNewestFirst(
   recordsNewestFirst: Array<Record<string, any> | null | undefined>
 ): Record<string, any> {
-  const merged: Record<string, any> = {};
-  for (const rec of recordsNewestFirst) {
+  let acc: Record<string, any> = {};
+  // Apply OLDEST first so newer records overlay (win) at each leaf.
+  for (let i = recordsNewestFirst.length - 1; i >= 0; i--) {
+    const rec = recordsNewestFirst[i];
     if (!rec || typeof rec !== 'object') continue;
-    for (const [k, v] of Object.entries(rec)) {
-      if (merged[k] === undefined && isNonEmptyValue(v)) merged[k] = v;
-    }
+    acc = deepOverlay(acc, rec);
   }
-  return merged;
+  return acc;
 }
 
 /**
