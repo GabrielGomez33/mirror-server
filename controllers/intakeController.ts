@@ -712,6 +712,21 @@ export const storeIntakeDataHandler: RequestHandler = async (req, res) => {
       return;
     }
 
+    // DEFENSE (anti-junk): a store must carry at least one real assessment
+    // section. This rejects contentless payloads like { name: "x" } that would
+    // otherwise create a new "latest" intake record masking real data. The
+    // incremental Core flow always sends >= 1 section, so it is unaffected;
+    // name-only / progress-only saves belong on the /intake/progress endpoints.
+    const presentSectionsForGuard = stepsPresentInPayload(intakeData);
+    if (presentSectionsForGuard.length === 0) {
+      res.status(400).json({
+        success: false,
+        error: 'Intake payload contains no assessment sections.',
+        code: 'EMPTY_INTAKE',
+      });
+      return;
+    }
+
     // Boundary: string for storage layer, number for DataAccessContext
     const uidStr = String(authUserId);
     const uidNum = authUserId;
