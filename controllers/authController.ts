@@ -405,10 +405,10 @@ async function dispatchInitialVerificationEmail(
 // ============================================================================
 async function loadUserContextFields(
   userId: number
-): Promise<{ email: string; emailVerified: boolean; intakeCompleted: boolean; subscriptionStatus: 'free' | 'premium' | 'enterprise' }> {
+): Promise<{ email: string; emailVerified: boolean; intakeCompleted: boolean; initialIntakeCompleted: boolean; subscriptionStatus: 'free' | 'premium' | 'enterprise' }> {
   try {
     const [rows] = await DB.query(
-      `SELECT email, email_verified, intake_completed FROM users WHERE id = ? LIMIT 1`,
+      `SELECT email, email_verified, intake_completed, initial_intake_completed FROM users WHERE id = ? LIMIT 1`,
       [userId]
     );
     const row = (rows as any[])[0] || {};
@@ -445,10 +445,11 @@ async function loadUserContextFields(
       email: String(row.email || ''),
       emailVerified: Boolean(row.email_verified),
       intakeCompleted: Boolean(row.intake_completed),
+      initialIntakeCompleted: Boolean(row.initial_intake_completed),
       subscriptionStatus,
     };
   } catch {
-    return { email: '', emailVerified: false, intakeCompleted: false, subscriptionStatus: 'free' };
+    return { email: '', emailVerified: false, intakeCompleted: false, initialIntakeCompleted: false, subscriptionStatus: 'free' };
   }
 }
 
@@ -565,6 +566,9 @@ export const registerUser: RequestHandler = async (req, res) => {
         email: userInfo.email,
         emailVerified: false,
         intakeCompleted: userInfo.intakeCompleted,
+        // A brand-new account has not done the fast Entry intake yet; the column
+        // defaults to 0. Reported explicitly so the client routes them to /entry.
+        initialIntakeCompleted: false,
         subscriptionStatus: 'free',
         sessionId,
         lastLogin: new Date().toISOString()
@@ -791,6 +795,7 @@ export const loginUser: RequestHandler = async (req, res) => {
         email: userInfo.email,
         emailVerified: contextFields.emailVerified,
         intakeCompleted: contextFields.intakeCompleted,
+        initialIntakeCompleted: contextFields.initialIntakeCompleted,
         subscriptionStatus: contextFields.subscriptionStatus,
         sessionId,
         lastLogin: new Date().toISOString()
@@ -992,6 +997,7 @@ export const verifyToken: RequestHandler = async (req, res) => {
         sessionId: decoded.sessionId,
         emailVerified: ctx.emailVerified,
         intakeCompleted: ctx.intakeCompleted,
+        initialIntakeCompleted: ctx.initialIntakeCompleted,
         subscriptionStatus: ctx.subscriptionStatus,
       },
       expiresAt: new Date(decoded.exp! * 1000).toISOString()
