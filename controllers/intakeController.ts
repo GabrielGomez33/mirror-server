@@ -14,6 +14,7 @@ import {
 } from './directoryController';
 import { v4 as uuidv4 } from 'uuid';
 import { stepsPresentInPayload, markStepsCompleted } from '../services/intakeCompletion';
+import { resolveLatest } from '../services/intakeReadModel';
 import { recordIqNormSample } from './iqNormsController';
 
 // ============================================================================
@@ -919,13 +920,22 @@ export const getLatestIntakeHandler: RequestHandler = async (req, res) => {
       reason: 'latest_intake_retrieval',
     };
 
-    const result = await IntakeDataManager.getLatestIntakeData(
-      String(userId),
-      context,
-      includeFiles
-    );
+    // Canonical MERGED read: Entry⊕Core with Core taking precedence at every
+    // leaf (services/intakeReadModel.resolveLatest). This is the single resolver
+    // all "latest intake" consumers should read through. It fixes two defects of
+    // the old core-only, single-record path: (a) Entry-only users 404'd here even
+    // though they finished onboarding, and (b) a partial latest Core record could
+    // mask an earlier fuller one. Files (photo/voice) live only on Core records —
+    // Entry carries no media — so we still source fileReferences/fileContents from
+    // the latest Core record, read concurrently. Absent for Entry-only users,
+    // which is correct: mergedIntakeData still carries their personality/astrology.
+    const [mergedIntakeData, coreResult] = await Promise.all([
+      resolveLatest(String(userId), context),
+      IntakeDataManager.getLatestIntakeData(String(userId), context, includeFiles),
+    ]);
 
-    if (!result) {
+    // 404 only when the user genuinely has NO intake at all — neither Entry nor Core.
+    if (!mergedIntakeData && !coreResult) {
       res.status(404).json({
         success: false,
         error: 'No intake data found for user',
@@ -935,13 +945,13 @@ export const getLatestIntakeHandler: RequestHandler = async (req, res) => {
 
     res.json({
       success: true,
-      intakeData: result.intakeData,
-      fileReferences: result.fileReferences,
+      intakeData: mergedIntakeData ?? coreResult?.intakeData ?? null,
+      fileReferences: coreResult?.fileReferences,
       ...(includeFiles &&
-        result.fileContents && {
+        coreResult?.fileContents && {
           fileContents: {
-            photo: result.fileContents.photo?.toString('base64'),
-            voice: result.fileContents.voice?.toString('base64'),
+            photo: coreResult.fileContents.photo?.toString('base64'),
+            voice: coreResult.fileContents.voice?.toString('base64'),
           },
         }),
       timestamp: new Date().toISOString(),

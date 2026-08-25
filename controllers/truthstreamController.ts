@@ -17,7 +17,7 @@ import { Logger } from '../utils/logger';
 import { truthStreamQueueManager } from '../services/TruthStreamQueueManager';
 import { truthStreamReviewScorer } from '../services/TruthStreamReviewScorer';
 import { IntakeDataManager } from '../controllers/intakeController';
-import { getMergedCoreIntake } from '../services/intakeReadModel';
+import { resolveLatest } from '../services/intakeReadModel';
 import type { DataAccessContext } from '../controllers/directoryController';
 
 const logger = new Logger('TruthStreamController');
@@ -1948,9 +1948,10 @@ async function buildSharedIntakeData(userId: number, sharedTypes: string[]): Pro
       reason: 'truth_card_shared_data',
     };
 
-    // Masking-proof: assemble core across recent records so a partial "latest"
-    // record cannot hide an earlier full submission. Same core sections as before.
-    const intakeData: Record<string, any> = (await getMergedCoreIntake(userId, context)) || {};
+    // Canonical merged read (resolveLatest): Entry⊕Core, Core precedence per leaf.
+    // Masking-proof across recent Core records AND includes Entry data, so an
+    // Entry-only user shares a populated Truth Card instead of a blank one.
+    const intakeData: Record<string, any> = (await resolveLatest(userId, context)) || {};
     if (!intakeData || Object.keys(intakeData).length === 0) return shared;
 
     if (sharedTypes.includes('personality') && intakeData.personalityResult) {
