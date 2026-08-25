@@ -20,6 +20,16 @@
 //                      /auth/register wrapper so the per-IP register rate limit
 //                      can't make this tool flaky and no verification email is
 //                      sent to a fake address.
+//   1b. entry_submit       — REAL POST /mirror/api/intake/entry/submit (the fast
+//                            two-tier onboarding). Writes entry_intake_results +
+//                            users.initial_intake_completed only.
+//   1c. entry_status       — REAL GET /mirror/api/intake/entry/status (completed).
+//   1d. entry_merge_readback — REAL GET /intake/latest with NO Core record yet:
+//                            proves an Entry-only user resolves (200 + both Entry
+//                            sections) instead of 404 (the merged-read fix).
+//   1e. idor_guard         — REAL GET /intake/latest/:otherId with the sim user's
+//                            token: proves the self-only guard returns 403
+//                            FORBIDDEN_CROSS_USER (no cross-user read).
 //   2. visual       — REAL POST /mirror/api/storage/store (tier1, photo) over
 //                      loopback with the sim user's JWT, and assemble the
 //                      faceAnalysis slice. (Front-end VisualStep.)
@@ -38,8 +48,10 @@
 //   8. verify_db    — assert the DB side effects landed.
 //   9. verify_files — assert the tier1/2/3 files exist on disk.
 //  10. results      — REAL GET /mirror/api/intake/latest/:userId (decrypts the
-//                      stored intake back out and checks it round-trips). This is
-//                      the data the front-end ResultsStep renders.
+//                      stored intake back out and checks it round-trips). Now also
+//                      asserts Core-only sections are present after the Core store,
+//                      proving Core merged OVER the earlier Entry data (precedence).
+//                      This is the data the front-end ResultsStep renders.
 //  11. cleanup      — delete the sim user through the EXISTING production teardown
 //                      (deleteUserFromDB: filesystem + transactional DB cascade)
 //                      and notify Dina's mirror module purge, so the rule "all
@@ -810,6 +822,74 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
       return { detail: `Created sim user #${userId} (${simUsername}) + directories + keys + session + premium${keptNote}`, data: { userId } };
     });
 
+    // ---- 1b. ENTRY INTAKE (real POST -> /intake/entry/submit) --------------
+    // The fast onboarding pipeline (two-tier intake). Runs BEFORE any Core data
+    // exists so the read-backs below prove the Entry path end-to-end and, most
+    // importantly, that an Entry-only user resolves through /intake/latest
+    // instead of 404'ing (the Part B fix). Entry writes ONLY entry_intake_results
+    // + users.initial_intake_completed; it never touches Core storage.
+    await step(steps, 'entry_submit', async () => {
+      const entryBody = {
+        personalityResult: buildPersonality(),
+        astrologyResult: buildAstrology(),
+        birthDate: '1990-06-15',
+        displayName: simUsername,
+      };
+      const res = await selfRequest('POST', '/mirror/api/intake/entry/submit', { json: entryBody, token: accessToken });
+      if (res.status !== 200 || !res.body?.success) {
+        throw new Error(`intake/entry/submit failed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
+      }
+      return { detail: 'Entry intake submitted (entry_intake_results + initial_intake_completed set)', data: { status: res.status } };
+    });
+
+    // ---- 1c. ENTRY STATUS (real GET -> /intake/entry/status) ---------------
+    await step(steps, 'entry_status', async () => {
+      const res = await selfRequest('GET', '/mirror/api/intake/entry/status', { token: accessToken });
+      if (res.status !== 200 || res.body?.completed !== true) {
+        throw new Error(`intake/entry/status not completed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
+      }
+      return { detail: 'Entry status reports completed=true' };
+    });
+
+    // ---- 1d. ENTRY-ONLY MERGE READBACK (real GET -> /intake/latest) --------
+    // The canonical Part B proof, live: with NO Core record yet, resolveLatest
+    // must surface the Entry data — HTTP 200 (not 404) carrying BOTH Entry
+    // sections. A regression here (the old core-only /latest) would 404.
+    await step(steps, 'entry_merge_readback', async () => {
+      const res = await selfRequest('GET', `/mirror/api/intake/latest/${userId}`, { token: accessToken });
+      if (res.status !== 200 || !res.body?.success) {
+        throw new Error(
+          `entry-only /latest returned HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 160)} ` +
+          `— Part B regression: an Entry-only user must resolve, not 404`,
+        );
+      }
+      const d = res.body.intakeData || {};
+      const missing: string[] = [];
+      if (!d.personalityResult) missing.push('personalityResult');
+      if (!d.astrologicalResult) missing.push('astrologicalResult');
+      if (missing.length) throw new Error(`entry-only /latest missing merged section(s): ${missing.join(', ')}`);
+      return {
+        detail: 'Entry-only /latest → 200 with merged personality + astrology (no Core record present)',
+        data: { sections: Object.keys(d) },
+      };
+    });
+
+    // ---- 1e. IDOR GUARD (real GET -> /intake/latest/:otherId) --------------
+    // The security boundary, live. The sim user's own token must NOT read a
+    // different user's intake. assertSelfParam rejects any non-self :userId with
+    // 403 BEFORE any lookup, so this exposes nothing and needs no second user.
+    await step(steps, 'idor_guard', async () => {
+      const otherId = userId! + 1;
+      const res = await selfRequest('GET', `/mirror/api/intake/latest/${otherId}`, { token: accessToken });
+      if (res.status !== 403 || res.body?.code !== 'FORBIDDEN_CROSS_USER') {
+        throw new Error(
+          `IDOR guard FAILED: cross-user GET /intake/latest/${otherId} returned HTTP ${res.status} ` +
+          `code=${res.body?.code ?? 'none'} (expected 403 FORBIDDEN_CROSS_USER)`,
+        );
+      }
+      return { detail: `Cross-user /latest/${otherId} correctly rejected — 403 FORBIDDEN_CROSS_USER` };
+    });
+
     // ---- 2. VISUAL (real upload -> /storage/store tier1) -------------------
     await step(steps, 'visual', async () => {
       const ref = await uploadToStorage(userId!, 'tier1', samplePhoto(), accessToken);
@@ -938,10 +1018,17 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
       if (res.status !== 200 || !res.body?.success) {
         throw new Error(`intake/latest failed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
       }
-      const name = res.body.intakeData?.name;
+      const d = res.body.intakeData || {};
+      const name = d.name;
       if (name !== simUsername) throw new Error(`results name mismatch: "${name}" !== "${simUsername}"`);
-      if (!res.body.intakeData?.personalityResult) throw new Error('results missing personalityResult');
-      return { detail: 'Latest intake retrieved and decrypted (name + personality round-trip intact)' };
+      if (!d.personalityResult) throw new Error('results missing personalityResult');
+      // Core precedence, live: after the Core store, the merged /latest must now
+      // carry Core-only sections (iqResults, faceAnalysis, voiceMetadata) that
+      // Entry never produced — proving Core overlaid Entry rather than the
+      // Entry-only readback masking the fuller Core submission.
+      const coreOnly = ['iqResults', 'faceAnalysis', 'voiceMetadata'].filter((k) => !d[k]);
+      if (coreOnly.length) throw new Error(`results missing Core-only section(s) after Core store: ${coreOnly.join(', ')}`);
+      return { detail: 'Latest intake round-trips (name + personality) AND now carries Core-only sections — Core merged over Entry' };
     });
 
     // ---- 10b. TRUTHSTREAM REPORT CARD (kept users only) --------------------

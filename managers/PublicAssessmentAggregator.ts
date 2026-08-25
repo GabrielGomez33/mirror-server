@@ -9,7 +9,7 @@
 import { DB } from '../db';
 import { mirrorRedis } from '../config/redis';
 import { IntakeDataManager } from '../controllers/intakeController';
-import { getMergedCoreIntake } from '../services/intakeReadModel';
+import { resolveLatest } from '../services/intakeReadModel';
 import { DataAccessContext } from '../controllers/directoryController';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -96,9 +96,10 @@ export class PublicAssessmentAggregator {
 
       let intakeData = null;
       try {
-        // Masking-proof: assemble core across recent records so a partial
-        // "latest" record cannot hide an earlier full submission.
-        intakeData = await getMergedCoreIntake(userId, context);
+        // Canonical merged read (resolveLatest): Entry⊕Core, Core precedence per
+        // leaf. Masking-proof across recent Core records AND includes Entry data,
+        // so an Entry-only user's group sharing is populated, not "no data".
+        intakeData = await resolveLatest(userId, context);
         console.log(`✅ Retrieved intake data for user ${userId}:`, {
           hasData: !!intakeData,
           hasPersonality: !!intakeData?.personalityResult,

@@ -360,6 +360,15 @@ export async function deleteUserFromDB(userId: string, adminUserId: number): Pro
       sql: 'DELETE FROM intake_metadata WHERE user_id = ?', params: [userIdNum] },
     { label: 'personal_analyses', tolerant: true,
       sql: 'DELETE FROM personal_analyses WHERE user_id = ?', params: [userIdNum] },
+    // Two-tier intake tables (migration 022). Both declare ON DELETE CASCADE,
+    // so on a 022-migrated schema the final `DELETE FROM users` already clears
+    // them — but per this function's design (never trust CASCADE alone; a table
+    // re-created without the rule would block the parent delete) we clear them
+    // explicitly too. tolerant: an environment predating 022 simply skips them.
+    { label: 'entry_intake_results', tolerant: true,
+      sql: 'DELETE FROM entry_intake_results WHERE user_id = ?', params: [userIdNum] },
+    { label: 'core_intake_progress', tolerant: true,
+      sql: 'DELETE FROM core_intake_progress WHERE user_id = ?', params: [userIdNum] },
 
     // -- Subscriptions / usage -----------------------------------------
     { label: 'subscription_events', tolerant: true,

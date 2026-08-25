@@ -14,6 +14,7 @@ import {
 } from './directoryController';
 import { v4 as uuidv4 } from 'uuid';
 import { stepsPresentInPayload, markStepsCompleted } from '../services/intakeCompletion';
+import { resolveLatest } from '../services/intakeReadModel';
 import { recordIqNormSample } from './iqNormsController';
 
 // ============================================================================
@@ -919,13 +920,46 @@ export const getLatestIntakeHandler: RequestHandler = async (req, res) => {
       reason: 'latest_intake_retrieval',
     };
 
-    const result = await IntakeDataManager.getLatestIntakeData(
-      String(userId),
-      context,
-      includeFiles
-    );
+    // Canonical MERGED read: Entry⊕Core with Core taking precedence at every
+    // leaf (services/intakeReadModel.resolveLatest). This is the single resolver
+    // all "latest intake" consumers should read through. It fixes two defects of
+    // the old core-only, single-record path: (a) Entry-only users 404'd here even
+    // though they finished onboarding, and (b) a partial latest Core record could
+    // mask an earlier fuller one. Files (photo/voice) live only on Core records —
+    // Entry carries no media — so we still source fileReferences/fileContents from
+    // the latest Core record, read concurrently.
+    //
+    // ROBUSTNESS: the two reads are concurrent but INDEPENDENTLY fault-isolated.
+    // getLatestIntakeData() rethrows on a file-store error, so we .catch() it —
+    // otherwise a Core file hiccup would reject the whole request (500) even when
+    // resolveLatest already produced complete merged content. The merged content
+    // is the primary payload; missing files degrade to "content without media",
+    // never a hard failure. We still record whether the Core read ERRORED so we
+    // can answer 500 ("couldn't read") honestly instead of 404 ("no data") when
+    // the store is merely unavailable and there was nothing else to serve.
+    let coreReadErrored = false;
+    const [mergedIntakeData, coreResult] = await Promise.all([
+      resolveLatest(String(userId), context),
+      IntakeDataManager.getLatestIntakeData(String(userId), context, includeFiles).catch((e) => {
+        coreReadErrored = true;
+        console.error(
+          `[getLatestIntakeHandler] Core file read failed for user ${userId}:`,
+          (e as Error)?.message || e,
+        );
+        return null;
+      }),
+    ]);
 
-    if (!result) {
+    if (!mergedIntakeData && !coreResult) {
+      // Separate a genuine "no intake yet" from a transient read failure so the
+      // client never mistakes an outage for an empty (never-onboarded) user.
+      if (coreReadErrored) {
+        res.status(500).json({
+          success: false,
+          error: 'Failed to read intake data',
+        });
+        return;
+      }
       res.status(404).json({
         success: false,
         error: 'No intake data found for user',
@@ -935,13 +969,13 @@ export const getLatestIntakeHandler: RequestHandler = async (req, res) => {
 
     res.json({
       success: true,
-      intakeData: result.intakeData,
-      fileReferences: result.fileReferences,
+      intakeData: mergedIntakeData ?? coreResult?.intakeData ?? null,
+      fileReferences: coreResult?.fileReferences,
       ...(includeFiles &&
-        result.fileContents && {
+        coreResult?.fileContents && {
           fileContents: {
-            photo: result.fileContents.photo?.toString('base64'),
-            voice: result.fileContents.voice?.toString('base64'),
+            photo: coreResult.fileContents.photo?.toString('base64'),
+            voice: coreResult.fileContents.voice?.toString('base64'),
           },
         }),
       timestamp: new Date().toISOString(),
