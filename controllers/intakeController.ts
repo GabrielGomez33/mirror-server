@@ -927,15 +927,39 @@ export const getLatestIntakeHandler: RequestHandler = async (req, res) => {
     // though they finished onboarding, and (b) a partial latest Core record could
     // mask an earlier fuller one. Files (photo/voice) live only on Core records —
     // Entry carries no media — so we still source fileReferences/fileContents from
-    // the latest Core record, read concurrently. Absent for Entry-only users,
-    // which is correct: mergedIntakeData still carries their personality/astrology.
+    // the latest Core record, read concurrently.
+    //
+    // ROBUSTNESS: the two reads are concurrent but INDEPENDENTLY fault-isolated.
+    // getLatestIntakeData() rethrows on a file-store error, so we .catch() it —
+    // otherwise a Core file hiccup would reject the whole request (500) even when
+    // resolveLatest already produced complete merged content. The merged content
+    // is the primary payload; missing files degrade to "content without media",
+    // never a hard failure. We still record whether the Core read ERRORED so we
+    // can answer 500 ("couldn't read") honestly instead of 404 ("no data") when
+    // the store is merely unavailable and there was nothing else to serve.
+    let coreReadErrored = false;
     const [mergedIntakeData, coreResult] = await Promise.all([
       resolveLatest(String(userId), context),
-      IntakeDataManager.getLatestIntakeData(String(userId), context, includeFiles),
+      IntakeDataManager.getLatestIntakeData(String(userId), context, includeFiles).catch((e) => {
+        coreReadErrored = true;
+        console.error(
+          `[getLatestIntakeHandler] Core file read failed for user ${userId}:`,
+          (e as Error)?.message || e,
+        );
+        return null;
+      }),
     ]);
 
-    // 404 only when the user genuinely has NO intake at all — neither Entry nor Core.
     if (!mergedIntakeData && !coreResult) {
+      // Separate a genuine "no intake yet" from a transient read failure so the
+      // client never mistakes an outage for an empty (never-onboarded) user.
+      if (coreReadErrored) {
+        res.status(500).json({
+          success: false,
+          error: 'Failed to read intake data',
+        });
+        return;
+      }
       res.status(404).json({
         success: false,
         error: 'No intake data found for user',

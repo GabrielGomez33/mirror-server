@@ -47,6 +47,22 @@ ok(paramMatchesSelf('', '') === false, 'empty string (Number->0) -> false');    
 ok(paramMatchesSelf(48.5, 48.5) === false, 'non-integer id -> false');             // 3
 
 // ---------------------------------------------------------------------------
+// STRICT TYPING (fail-closed): only number|string may coerce to an id. Non-
+// scalar / boolean inputs must be rejected outright, even when they would
+// otherwise JS-coerce to a valid id (Number(['48'])===48, Number(true)===1).
+// These cannot reach paramMatchesSelf via a path param (always a string), but
+// bodyIdVerdict feeds JSON body values — which CAN be arrays/objects/booleans —
+// through the same toUserId, so the rule is proven on both.
+group('toUserId strict typing — non-scalars never become an id');
+ok(paramMatchesSelf(48, [48]) === false, 'array claimed [48] -> false');
+ok(paramMatchesSelf(48, ['48']) === false, "array claimed ['48'] -> false");
+ok(paramMatchesSelf(48, {}) === false, 'object claimed -> false');
+ok(paramMatchesSelf(1, true) === false, 'boolean claimed (Number(true)=1) -> false');
+ok(bodyIdVerdict(48, [48]) === 'reject', 'array body id -> reject (even if coerces to self)');
+ok(bodyIdVerdict(48, { id: 48 }) === 'reject', 'object body id -> reject');
+ok(bodyIdVerdict(1, true) === 'reject', 'boolean body id -> reject');
+
+// ---------------------------------------------------------------------------
 group('bodyIdVerdict — optional body userId');
 ok(bodyIdVerdict(undefined, 48) === 'unauth', 'no self + present id -> unauth');    // 4
 ok(bodyIdVerdict(null, 48) === 'unauth', 'null self -> unauth');                    // 4

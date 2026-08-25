@@ -8,12 +8,19 @@
 
 /**
  * Coerce an unknown to a valid user id, or null. A valid user id is a POSITIVE
- * integer (users.id is AUTO_INCREMENT starting at 1). This deliberately rejects
- * 0, negatives, non-integers, NaN, and — critically — `null`/`''`, which
- * `Number()` would otherwise coerce to the finite value 0 and let slip through.
+ * integer (users.id is AUTO_INCREMENT starting at 1).
+ *
+ * STRICT TYPING (fail-closed): only a `number` or a numeric `string` may become
+ * an id. Everything else — including `null`/`''` (which `Number()` maps to 0),
+ * booleans (`Number(true) === 1`), arrays (`Number(['5']) === 5`), and objects —
+ * is rejected outright. This matters because bodyIdVerdict() feeds JSON body
+ * values in here, and a JSON body can carry arrays/objects/booleans; we never
+ * want a non-scalar to coerce its way into an identity comparison. It also
+ * rejects 0, negatives, non-integers, and NaN.
  */
 export function toUserId(x: unknown): number | null {
-  if (x === null || x === undefined || x === '') return null;
+  if (typeof x !== 'number' && typeof x !== 'string') return null;
+  if (x === '') return null;
   const n = Number(x);
   return Number.isInteger(n) && n > 0 ? n : null;
 }
