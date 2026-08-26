@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# ----------------------------------------------------------------------------
+# Local pre-push gate (staging pipeline layer 1). Runs the SAME checks CI runs,
+# BEFORE code leaves your machine — so a red build never reaches a deploy branch.
+#
+# Enable once per clone:   git config core.hooksPath .githooks
+# Bypass in an emergency:  git push --no-verify   (use sparingly, and know why)
+# ----------------------------------------------------------------------------
+set -euo pipefail
+
+echo "▶ pre-push: npm run verify (unit tests + typecheck + build)…"
+if ! npm run verify; then
+  echo "✖ pre-push blocked: verify failed. Fix it, or push with --no-verify if you accept the risk." >&2
+  exit 1
+fi
+echo "✓ pre-push: verify passed."
