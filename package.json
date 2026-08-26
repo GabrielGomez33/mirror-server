@@ -12,6 +12,8 @@
     "migrate:baseline": "node dist/scripts/migrate.js baseline",
     "migrate:dev": "npx ts-node scripts/migrate.ts apply",
     "test:unit": "npx ts-node tests/audienceResolver.test.ts",
+    "test:ci": "ts-node tests/intakeAuthGuards.test.ts && ts-node tests/intakeCompletion.test.ts && ts-node tests/entryIntake.test.ts && ts-node tests/audienceResolver.test.ts && ts-node tests/student/studentConfig.test.ts && ts-node tests/student/studentDomainService.test.ts",
+    "verify": "npm run test:ci && tsc --noEmit && npm run build",
     "start": "node dist/index.js",
     "start:analysis-worker": "node dist/workers/AnalysisQueueProcessor.js",
     "start:dina-chat-worker": "node dist/workers/DinaChatQueueProcessor.js",

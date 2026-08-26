@@ -82,6 +82,13 @@ jobs:
       - name: TypeScript type-check (strict)
         run: npx tsc --noEmit
 
+      # BLOCKING: the pure unit suites (IDOR guards, intake completion/derivation,
+      # entry validation, audience resolver, student config/domain). A failure
+      # here fails the pipeline and blocks deploy — these are the regressions that
+      # previously reached production unnoticed because CI ran no tests.
+      - name: Unit tests
+        run: npm run test:ci
+
       - name: Build production artifacts
         run: npm run build
 
