@@ -177,3 +177,108 @@ and passed a full simulated intake on staging.
   which unit suites are green, then wire them blocking (they currently keep the
   blocking `tsc` + `build` gates).
 - Gate 7 observability workflow.
+
+---
+
+# BRING-UP ORDER — Mirror first (execute this now)
+
+Stand up staging for the **Mirror** user-facing system (client + mirror-server
+API) and validate the loop end-to-end. DINA staging comes next; admin later.
+For this first pass, run mirror-server-staging with `USE_DINA_STUB=true` so it
+boots cleanly without dina-staging (intake register/entry/core need no DINA; the
+sim's DINA purge is best-effort). Flip the stub off once dina-staging exists.
+
+## Exact GitHub secrets/variables the committed workflows expect
+These names are referenced verbatim in the workflows — create them exactly.
+
+**mirror-server repo:**
+- secret `STAGING_DEPLOY_PATH` = the staging server checkout dir (e.g. `/var/www/mirror-server-staging`)
+- secret `STAGING_MIRROR_INTERNAL_SECRET` = the staging internal secret (must equal `MIRROR_INTERNAL_SECRET` in the staging `.env`)
+- variable `STAGING_ENABLED` = `false` for now (flip to `true` in step 6)
+- (existing, reused: `SERVER_HOST`, `SERVER_USER`, `SERVER_SSH_KEY`)
+
+**Mirror repo:**
+- secret `STAGING_DIST_PATH` = staging client web root (e.g. `/var/www/mirror-client-staging/dist`)
+- secret `STAGING_VITE_API_URL` = staging API origin the client calls (e.g. `https://staging.theundergroundrailroad.world`)
+- secret `STAGING_VITE_PAYPAL_CLIENT_ID` / `STAGING_VITE_PAYPAL_PLAN_ID` = PayPal **sandbox** creds
+- variable `STAGING_ENABLED` = `false` for now
+
+## Step 0 — get the pipeline onto develop
+The staging jobs + test gates must exist ON `develop` to run there. Merge the
+current branch into `develop` (open the PR; it will exercise the new blocking
+Quality Gates for the first time). Do this before enabling branch protection so
+you are not blocked bootstrapping.
+
+## Step 1 — GitHub environments & protection
+- Create environment **`staging`** (no reviewers).
+- On environment **`production`**, add **Required reviewers = you**.
+- Branch protection: `master` and `develop` → require the **Quality Gates**
+  check + PR + CODEOWNERS review; no direct pushes to `master`.
+
+## Step 2 — staging database (schema from prod, NO prod data)
+The prod DB was built partly by hand, so migration files alone can't build it
+from empty. Copy the STRUCTURE only, then baseline the ledger:
+```bash
+mysql -e "CREATE DATABASE mirror_staging CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+mysqldump --no-data --routines --triggers mirror | mysql mirror_staging   # structure only — no rows
+mysql -e "CREATE USER 'mirror_staging'@'127.0.0.1' IDENTIFIED BY '<pw>'; \
+          GRANT ALL ON mirror_staging.* TO 'mirror_staging'@'127.0.0.1'; FLUSH PRIVILEGES;"
+```
+Then, from the staging checkout with the staging `.env`, record the ledger and
+apply anything newer than the dump:
+```bash
+npm run migrate:baseline     # mark existing schema as applied
+npm run migrate:status       # see what (if anything) is pending
+npm run migrate -- <n>       # apply each pending file, per-file (drift-aware)
+```
+
+## Step 3 — storage dirs
+```bash
+sudo mkdir -p /var/mirror/staging/storage /var/mirror/staging/users
+sudo chown -R "$USER" /var/mirror/staging
+```
+
+## Step 4 — staging server checkout + .env + PM2
+```bash
+git clone <mirror-server repo> /var/www/mirror-server-staging
+cd /var/www/mirror-server-staging && git checkout develop
+cp .env.example .env       # then edit per the [env] overrides:
+#   MIRRORPORT=9444  DB_NAME=mirror_staging  REDIS_DB=1
+#   MIRRORSTORAGE=/var/mirror/staging/storage  MIRRORUSERSTORAGE=/var/mirror/staging/users
+#   MIRROR_SELF_BASE_URL=https://127.0.0.1:9444  APP_URL=<staging origin>
+#   EMAIL_DRY_RUN=true  USE_DINA_STUB=true
+#   MIRROR_INTERNAL_SECRET=<== same value you put in STAGING_MIRROR_INTERNAL_SECRET>
+#   JWT_SECRET / JWT_REFRESH_SECRET / SYSTEM_MASTER_KEY = FRESH (openssl rand -hex 48)
+#   TUGRRPRIV / TUGRRCERT = staging cert (or loopback self-signed)
+npm ci && npm run build
+pm2 start ecosystem.staging.config.js && pm2 save
+curl -sk https://127.0.0.1:9444/mirror/api/health   # expect 200
+```
+
+## Step 5 — client staging web root + vhost
+```bash
+sudo mkdir -p /var/www/mirror-client-staging/dist
+```
+Add an Apache/nginx vhost for the staging origin: serve
+`/var/www/mirror-client-staging/dist` (SPA fallback) and reverse-proxy
+`/mirror/api` + WS to `https://127.0.0.1:9444`. Issue a staging TLS cert.
+
+## Step 6 — enable and fire
+- Set both repos' variable `STAGING_ENABLED=true`.
+- Push a commit to `develop` (or re-run the latest develop workflow).
+- Watch: **deploy-staging** (mirror-server + client) then **staging-acceptance**
+  (the intake simulation) — both must go green.
+
+## Step 7 — human validation
+Open the staging origin, register a throwaway user, complete Entry + one Core
+reflection, confirm it shows on MyMirror. Then you have a proven staging loop;
+DINA staging replicates the same pattern (ports 9445, dina_staging, flip
+USE_DINA_STUB=false).
+
+## Gotchas to expect on first run
+- **Health 200 but sim fails**: check the staging `MIRROR_INTERNAL_SECRET`
+  matches `STAGING_MIRROR_INTERNAL_SECRET` exactly.
+- **Server boots then workers error**: usually a missing staging env var — the
+  `[req]` ones in `.env.example`.
+- **Client loads but API 502**: the vhost isn't proxying `/mirror/api` to 9444,
+  or `STAGING_VITE_API_URL` was baked wrong (rebuild after fixing).
