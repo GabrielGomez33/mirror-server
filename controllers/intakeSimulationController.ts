@@ -1165,8 +1165,10 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
           });
           if (send.status !== 201) throw new Error(`@Dina chat message send failed: HTTP ${send.status}`);
           let dinaReplied = false;
-          for (let i = 0; i < 4 && !dinaReplied; i++) {
-            await new Promise((r) => setTimeout(r, 1500));
+          // Poll up to ~24s — a real mistral:7b reply (queue + Ollama inference) is
+          // several seconds; stays warn-only so LLM latency never flakes the gate.
+          for (let i = 0; i < 12 && !dinaReplied; i++) {
+            await new Promise((r) => setTimeout(r, 2000));
             const list = await selfRequest('GET', `/mirror/api/groups/${groupId}/chat/messages?limit=30`, { token: accessToken });
             const msgs = list.body?.data?.messages || [];
             dinaReplied = Array.isArray(msgs) && msgs.some((m: any) =>
