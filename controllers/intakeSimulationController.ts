@@ -1239,7 +1239,10 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
           if (!ok2xx(res.status) || !res.body?.success) {
             throw new Error(`reviews/received failed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
           }
-          const reviews = res.body?.data?.reviews || res.body?.data || [];
+          // Received reviews are returned under data.items (with data.reviews and a
+          // bare data array as tolerant fallbacks).
+          const d = res.body?.data;
+          const reviews = d?.items || d?.reviews || (Array.isArray(d) ? d : []);
           const count = Array.isArray(reviews) ? reviews.length : 0;
           if (count < 1) throw new Error(`expected >=1 received review, got ${count} (body: ${JSON.stringify(res.body).slice(0, 160)})`);
           return { detail: `reviews/received returns ${count} review(s) after the reciprocity gate`, data: { received: count } };
