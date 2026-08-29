@@ -1165,22 +1165,20 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
           });
           if (send.status !== 201) throw new Error(`@Dina chat message send failed: HTTP ${send.status}`);
           let dinaReplied = false;
-          // Poll up to ~24s — a real mistral:7b reply (queue + Ollama inference) is
-          // several seconds; stays warn-only so LLM latency never flakes the gate.
-          for (let i = 0; i < 12 && !dinaReplied; i++) {
+          // Match Dina PRECISELY — its own account id (DINA_USER_ID_SQL) or the
+          // exact username 'Dina' — never a broad "third-party" heuristic (a join/
+          // system message would false-positive). Poll up to ~40s so a real LLM
+          // reply (queue pickup + Ollama inference + stream + insert) is caught;
+          // warn-only, so latency never flakes the gate.
+          const dinaSqlId = String(process.env.DINA_USER_ID_SQL || '').trim();
+          for (let i = 0; i < 20 && !dinaReplied; i++) {
             await new Promise((r) => setTimeout(r, 2000));
             const list = await selfRequest('GET', `/mirror/api/groups/${groupId}/chat/messages?limit=30`, { token: accessToken });
             const msgs = list.body?.data?.messages || [];
-            // A reply is any message from a sender that is NEITHER the owner nor
-            // the helper — i.e. a third party (Dina), regardless of the system
-            // account's username. Fall back to name/metadata heuristics too.
-            const ownerId = String(userId);
-            const helperId = String(groupHelper!.userId);
             dinaReplied = Array.isArray(msgs) && msgs.some((m: any) => {
-              const sid = String(m.sender_user_id ?? m.senderUserId ?? m.sender_id ?? m.userId ?? '');
-              const uname = String(m.sender_username || m.senderName || m.sender_name || m.username || '');
-              const thirdParty = sid !== '' && sid !== ownerId && sid !== helperId;
-              return thirdParty || /dina/i.test(uname) || m?.metadata?.isDina === true || m?.is_dina === true;
+              const sid = String(m.sender_user_id ?? m.senderUserId ?? m.sender_id ?? m.userId ?? '').trim();
+              const uname = String(m.sender_username || m.senderName || m.sender_name || m.username || '').trim();
+              return (dinaSqlId !== '' && sid === dinaSqlId) || /^dina$/i.test(uname) || m?.metadata?.isDina === true || m?.is_dina === true;
             });
           }
           return {
