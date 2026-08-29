@@ -12,6 +12,7 @@
 // ============================================================================
 
 import { Logger } from '../utils/logger';
+import { isRetryableError as classifyRetryable } from '../utils/retryClassifier';
 
 /**
  * Group Analysis Result for LLM synthesis
@@ -389,15 +390,8 @@ export class DINALLMConnector {
   }
 
   private isRetryableError(error: any): boolean {
-    const message = error.message?.toLowerCase() || '';
-    if (error.name === 'TypeError' && message.includes('fetch')) return true;
-    if (message.includes('timeout') || message.includes('aborted')) return true;
-    // Use word-boundary regex to match HTTP status codes, not arbitrary digit sequences
-    if (message.match(/\b5\d{2}\b/)) return true;
-    if (message.includes('429') || message.includes('rate limit')) return true;
-    if (message.includes('econnrefused') || message.includes('enotfound')) return true;
-    if (message.match(/\b4\d{2}\b/)) return false;
-    return true;
+    // Retry/fail-fast policy lives in utils/retryClassifier (proven in isolation).
+    return classifyRetryable(error);
   }
 
   private sleep(ms: number): Promise<void> {
