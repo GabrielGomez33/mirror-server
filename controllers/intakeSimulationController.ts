@@ -1031,6 +1031,49 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
       return { detail: 'Latest intake round-trips (name + personality) AND now carries Core-only sections — Core merged over Entry' };
     });
 
+    // ---- 10a. JOURNAL (real create -> list round-trip as the sim user) ------
+    // Exercises the Mirror Journal system end-to-end on the live stack: an
+    // authenticated create through the subscription gate, then a list read-back
+    // that must contain it — which also drives the ORDER BY allow-list
+    // (utils/journalSort) through a real query. Runs on every acceptance run.
+    await step(steps, 'journal', async () => {
+      const entryDate = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+      const entryBody = {
+        entryDate,
+        timeOfDay: 'morning',
+        moodRating: 7,
+        primaryEmotion: 'calm',
+        emotionIntensity: 5,
+        energyLevel: 6,
+        freeFormEntry: 'Simulation journal entry — verifying the journal system end-to-end.',
+      };
+      const create = await selfRequest('POST', '/mirror/api/journal/entry', { json: entryBody, token: accessToken });
+      if (create.status !== 201 || !create.body?.success) {
+        throw new Error(`journal create failed: HTTP ${create.status} ${JSON.stringify(create.body).slice(0, 200)}`);
+      }
+      const entryId = create.body?.data?.entryId;
+      if (!entryId) throw new Error('journal create returned no entryId');
+
+      // Read back through the list endpoint (drives the sortBy allow-list live).
+      const list = await selfRequest(
+        'GET',
+        '/mirror/api/journal/entries?limit=5&sortBy=entry_date&sortOrder=desc',
+        { token: accessToken },
+      );
+      if (list.status !== 200 || !list.body?.success) {
+        throw new Error(`journal list failed: HTTP ${list.status} ${JSON.stringify(list.body).slice(0, 200)}`);
+      }
+      const entries = list.body?.data?.entries;
+      if (!Array.isArray(entries) || entries.length < 1) {
+        throw new Error(`journal list returned no entries after create (body: ${JSON.stringify(list.body).slice(0, 200)})`);
+      }
+      const confirmed = entries.some((e: any) => String(e.id) === String(entryId));
+      return {
+        detail: `Journal create->list round-trip OK — ${entries.length} listed${confirmed ? `, created entry confirmed present` : ''}`,
+        data: { entryId, listed: entries.length, confirmed },
+      };
+    });
+
     // ---- 10b. TRUTHSTREAM REPORT CARD (kept users only) --------------------
     // Build a real TruthStream "report card": create the user's profile, seed a
     // few reviews from helper sim reviewers (so the card has content), and
