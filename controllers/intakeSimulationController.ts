@@ -1074,6 +1074,201 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
       };
     });
 
+    // ---- 10c. MIRRORGROUPS (multi-user lifecycle on the live stack) --------
+    // Exercises the real group system end-to-end with a SECOND sim member:
+    // create -> join -> member->owner chat message -> propose+cast a vote ->
+    // @Dina chat (async, best-effort) -> leave -> delete. The helper member is
+    // always torn down in the finally, whatever happens. Deterministic steps
+    // hard-fail the gate (these systems must work); the async @Dina reply only
+    // warns. All calls go through the same authenticated loopback as a real client.
+    {
+      let groupId: string | null = null;
+      let groupHelper: { userId: number; token: string; username: string } | null = null;
+      const ok2xx = (s: number) => s >= 200 && s < 300;
+      try {
+        await step(steps, 'group_create', async () => {
+          const short = crypto.randomUUID().slice(0, 8);
+          const body = {
+            name: `Sim Group ${short}`,
+            description: 'Simulation group for end-to-end acceptance testing.',
+            type: 'family',
+            privacy: 'public', // honored regardless of type — enables direct join
+            maxMembers: 5,
+          };
+          const res = await selfRequest('POST', '/mirror/api/groups/create', { json: body, token: accessToken });
+          if (res.status !== 201 || !res.body?.success) {
+            throw new Error(`group create failed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
+          }
+          groupId = res.body?.data?.id;
+          if (!groupId) throw new Error('group create returned no id');
+          return { detail: `Public group created (${groupId})`, data: { groupId } };
+        });
+
+        await step(steps, 'group_join', async () => {
+          const h = await createHelperReviewer();
+          groupHelper = { userId: h.userId, token: h.token, username: h.username };
+          const res = await selfRequest('POST', `/mirror/api/groups/${groupId}/join`, { json: {}, token: h.token });
+          if (res.status !== 201 || !res.body?.success) {
+            throw new Error(`group join failed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
+          }
+          // Confirm membership from the owner's view (tolerant of list shape).
+          const members = await selfRequest('GET', `/mirror/api/groups/${groupId}/members`, { token: accessToken });
+          const list = members.body?.data?.members || members.body?.data || members.body?.members || [];
+          const count = Array.isArray(list) ? list.length : 0;
+          return {
+            detail: `Helper #${h.userId} joined (HTTP 201)${count ? ` — members list shows ${count}` : ''}`,
+            data: { helperUserId: h.userId, members: count },
+          };
+        });
+
+        await step(steps, 'group_message', async () => {
+          // Member sends; OWNER must see it — proves user-to-user messaging.
+          const marker = `sim-msg-${crypto.randomUUID().slice(0, 6)}`;
+          const send = await selfRequest('POST', `/mirror/api/groups/${groupId}/chat/messages`, {
+            json: { content: `Hello from member — ${marker}` }, token: groupHelper!.token,
+          });
+          if (send.status !== 201 || !send.body?.success) {
+            throw new Error(`send message failed: HTTP ${send.status} ${JSON.stringify(send.body).slice(0, 200)}`);
+          }
+          const list = await selfRequest('GET', `/mirror/api/groups/${groupId}/chat/messages?limit=20`, { token: accessToken });
+          if (list.status !== 200 || !list.body?.success) {
+            throw new Error(`list messages failed: HTTP ${list.status} ${JSON.stringify(list.body).slice(0, 200)}`);
+          }
+          const msgs = list.body?.data?.messages || [];
+          const seen = Array.isArray(msgs) && msgs.some((m: any) => String(m.content || '').includes(marker));
+          if (!seen) throw new Error(`owner did not see member's message (${marker}) among ${Array.isArray(msgs) ? msgs.length : 0}`);
+          return { detail: `Member→owner message delivered and visible to the owner`, data: { messages: msgs.length } };
+        });
+
+        await step(steps, 'group_vote', async () => {
+          const propose = await selfRequest('POST', `/mirror/api/groups/${groupId}/votes/propose`, {
+            json: { topic: 'Sim acceptance — proceed?', voteType: 'yes_no', durationSeconds: 120 }, token: accessToken,
+          });
+          if (!ok2xx(propose.status) || !propose.body?.success) {
+            throw new Error(`vote propose failed: HTTP ${propose.status} ${JSON.stringify(propose.body).slice(0, 200)}`);
+          }
+          const voteId = propose.body?.data?.voteId;
+          if (!voteId) throw new Error('vote propose returned no voteId');
+          const cast = await selfRequest('POST', `/mirror/api/groups/${groupId}/votes/${voteId}/cast`, {
+            json: { response: 'yes' }, token: groupHelper!.token,
+          });
+          if (!ok2xx(cast.status) || !cast.body?.success) {
+            throw new Error(`vote cast failed: HTTP ${cast.status} ${JSON.stringify(cast.body).slice(0, 200)}`);
+          }
+          return { detail: `Vote ${voteId} proposed by owner + cast 'yes' by member`, data: { voteId } };
+        });
+
+        await step(steps, 'group_dina_chat', async () => {
+          // @Dina is processed by an async worker; accept the post hard, poll softly.
+          const send = await selfRequest('POST', `/mirror/api/groups/${groupId}/chat/messages`, {
+            json: { content: '@Dina hello — are you online?' }, token: accessToken,
+          });
+          if (send.status !== 201) throw new Error(`@Dina chat message send failed: HTTP ${send.status}`);
+          let dinaReplied = false;
+          for (let i = 0; i < 4 && !dinaReplied; i++) {
+            await new Promise((r) => setTimeout(r, 1500));
+            const list = await selfRequest('GET', `/mirror/api/groups/${groupId}/chat/messages?limit=30`, { token: accessToken });
+            const msgs = list.body?.data?.messages || [];
+            dinaReplied = Array.isArray(msgs) && msgs.some((m: any) =>
+              /dina/i.test(String(m.sender_username || m.senderName || m.sender_name || '')) ||
+              m?.metadata?.isDina === true || m?.is_dina === true);
+          }
+          return {
+            detail: dinaReplied ? '@Dina replied in group chat' : '@Dina message accepted; no reply within budget (chat worker is async)',
+            severity: (dinaReplied ? 'pass' : 'warn') as StepSeverity,
+            data: { dinaReplied },
+          };
+        });
+
+        await step(steps, 'group_leave', async () => {
+          const res = await selfRequest('POST', `/mirror/api/groups/${groupId}/leave`, { json: {}, token: groupHelper!.token });
+          if (!ok2xx(res.status) || !res.body?.success) {
+            throw new Error(`group leave failed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
+          }
+          return { detail: `Member #${groupHelper!.userId} left the group`, data: {} };
+        });
+
+        await step(steps, 'group_delete', async () => {
+          const res = await selfRequest('DELETE', `/mirror/api/groups/${groupId}`, { token: accessToken });
+          if (!ok2xx(res.status) || !res.body?.success) {
+            throw new Error(`group delete failed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
+          }
+          return { detail: `Group ${groupId} deleted by owner`, data: {} };
+        });
+      } finally {
+        // Always remove the helper member, whatever happened above.
+        const helper = groupHelper as { userId: number } | null;
+        if (helper) {
+          try { await teardownSimUser(helper.userId, undefined); } catch { /* best effort */ }
+        }
+      }
+    }
+
+    // ---- 10d. TRUTHSTREAM SUBSYSTEMS (always-run, single exchange) ---------
+    // Faithful lighter pass covering the core TruthStream subsystems on every
+    // acceptance run: profile creation, the real review queue (submitReview drives
+    // /queue/start + /queue/complete), the reciprocity gate on reviews/received
+    // (you must GIVE one to VIEW yours), plus stats and milestones. Uses ONE
+    // helper reviewer, always torn down. The heavier full report-card (5 reviews)
+    // stays in the kept-user truthCard path below.
+    {
+      let tsHelper: { userId: number; token: string } | null = null;
+      const ok2xx = (s: number) => s >= 200 && s < 300;
+      try {
+        await step(steps, 'truthstream_profile', async () => {
+          const p = await ensureTruthStreamProfile(userId!, accessToken!);
+          return { detail: `TruthStream profile ${p.created ? 'created' : 'present'} (goal: ${p.goalCategory})`, data: { goalCategory: p.goalCategory } };
+        });
+
+        await step(steps, 'truthstream_review_exchange', async () => {
+          const tone = normalizeTone(options.reviewTone);
+          const h = await createHelperReviewer();
+          tsHelper = { userId: h.userId, token: h.token };
+          // Main user GIVES a review (satisfies the reciprocity gate to view received).
+          const given = await submitReview(userId!, accessToken!, h.userId, tone);
+          if (!given.reviewId) throw new Error('main user failed to submit a review (no reviewId)');
+          // Helper GIVES the main user a review (so main has one RECEIVED).
+          const received = await submitReview(h.userId, h.token, userId!, tone);
+          if (!received.reviewId) throw new Error('helper failed to submit a review to main user (no reviewId)');
+          return { detail: `Bidirectional review exchange OK (main↔helper #${h.userId})`, data: { given: given.reviewId, received: received.reviewId } };
+        });
+
+        await step(steps, 'truthstream_received', async () => {
+          // Reciprocity gate now satisfied — main user can view reviews received.
+          const res = await selfRequest('GET', `${TS_BASE}/reviews/received?limit=10`, { token: accessToken });
+          if (!ok2xx(res.status) || !res.body?.success) {
+            throw new Error(`reviews/received failed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
+          }
+          const reviews = res.body?.data?.reviews || res.body?.data || [];
+          const count = Array.isArray(reviews) ? reviews.length : 0;
+          if (count < 1) throw new Error(`expected >=1 received review, got ${count} (body: ${JSON.stringify(res.body).slice(0, 160)})`);
+          return { detail: `reviews/received returns ${count} review(s) after the reciprocity gate`, data: { received: count } };
+        });
+
+        await step(steps, 'truthstream_stats', async () => {
+          const stats = await selfRequest('GET', `${TS_BASE}/stats`, { token: accessToken });
+          if (!ok2xx(stats.status) || !stats.body?.success) {
+            throw new Error(`stats failed: HTTP ${stats.status} ${JSON.stringify(stats.body).slice(0, 200)}`);
+          }
+          if (!stats.body?.data) throw new Error('stats returned null data despite an active profile + reviews');
+          const mile = await selfRequest('GET', `${TS_BASE}/milestones`, { token: accessToken });
+          if (!ok2xx(mile.status) || !mile.body?.success) {
+            throw new Error(`milestones failed: HTTP ${mile.status} ${JSON.stringify(mile.body).slice(0, 200)}`);
+          }
+          const d = stats.body.data;
+          return {
+            detail: `stats + milestones OK (given=${d.total_reviews_given ?? d.reviewsGiven ?? '?'}, received=${d.total_reviews_received ?? d.reviewsReceived ?? '?'})`,
+            data: { stats: true, milestones: true },
+          };
+        });
+      } finally {
+        const helper = tsHelper as { userId: number } | null;
+        if (helper) {
+          try { await teardownSimUser(helper.userId, undefined); } catch { /* best effort */ }
+        }
+      }
+    }
+
     // ---- 10b. TRUTHSTREAM REPORT CARD (kept users only) --------------------
     // Build a real TruthStream "report card": create the user's profile, seed a
     // few reviews from helper sim reviewers (so the card has content), and
