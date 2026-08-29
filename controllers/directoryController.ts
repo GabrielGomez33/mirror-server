@@ -50,7 +50,11 @@ class DirectoryController {
   private basePath: string;
 
   constructor(basePath?: string) {
-    this.basePath = process.env.MIRRORUSERSTORAGE! ;
+    // Honor an explicit base path when one is supplied; otherwise fall back to
+    // the canonical user-storage root. Previously the argument was accepted but
+    // always ignored, so a caller passing a base path got a silent no-op — a
+    // latent footgun that masked storage-root misconfiguration.
+    this.basePath = basePath || process.env.MIRRORUSERSTORAGE!;
   }
 
   // ===== DIRECTORY MANAGEMENT =====

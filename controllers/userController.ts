@@ -64,8 +64,15 @@ import { DB } from '../db';
 import { generateUserKeys } from './encryptionController';
 import { createUserDirectories, deleteUserDirectories, DataAccessContext } from './directoryController';
 import { cleanupUserTruthStreamData } from './truthstreamController';
-const basePath = path.join(process.env.MIRRORSTORAGE!);
-const storagePath = path.join(basePath, 'users');
+// User data (directory tree + per-user encryption keys) lives under
+// MIRRORUSERSTORAGE — the SAME canonical root DirectoryController uses when it
+// loads those keys. This was previously derived as MIRRORSTORAGE + '/users',
+// which baked in a hidden invariant (MIRRORUSERSTORAGE === MIRRORSTORAGE/users).
+// When an environment set the two variables independently, key GENERATION and
+// key LOADING resolved to different directories and every registration failed at
+// the first key load (ENOENT aes_key.bin). Deriving from the single canonical
+// user-storage root removes that coupling so the two can never diverge.
+const storagePath = path.join(process.env.MIRRORUSERSTORAGE!);
 const SALT_ROUNDS = 10;
 
 // ============================================================================
