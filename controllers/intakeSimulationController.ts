@@ -1178,7 +1178,12 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
             dinaReplied = Array.isArray(msgs) && msgs.some((m: any) => {
               const sid = String(m.sender_user_id ?? m.senderUserId ?? m.sender_id ?? m.userId ?? '').trim();
               const uname = String(m.sender_username || m.senderName || m.sender_name || m.username || '').trim();
-              return (dinaSqlId !== '' && sid === dinaSqlId) || /^dina$/i.test(uname) || m?.metadata?.isDina === true || m?.is_dina === true;
+              const isDina = (dinaSqlId !== '' && sid === dinaSqlId) || /^dina$/i.test(uname) || m?.metadata?.isDina === true || m?.is_dina === true;
+              // Require actual content — not just a streaming placeholder row — so
+              // "replied" means the LLM answer really landed (its ms then reflects
+              // true inference latency, not the ~2s row creation).
+              const content = String(m.content ?? m.text ?? m.body ?? m.message ?? '').trim();
+              return isDina && content.length > 0;
             });
           }
           return {
