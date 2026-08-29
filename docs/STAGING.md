@@ -232,6 +232,27 @@ npm run migrate:status       # see what (if anything) is pending
 npm run migrate -- <n>       # apply each pending file, per-file (drift-aware)
 ```
 
+## Step 2b — seed REFERENCE/CONFIG data (NOT user data)
+The `--no-data` dump gives us zero prod PII (good, secure) but also drops the
+**reference/config** tables the app needs to function — e.g. the TruthStream
+questionnaires. Copy the DATA of the config tables only (never the user tables),
+data-only + `--replace` so it is idempotent and leaves staging's schema intact:
+```bash
+# Reference/config tables — safe to copy (no user PII). Extend this list as new
+# config tables are discovered (the staging acceptance sim names any that are
+# missing, e.g. "no active questionnaire for goal_category ...").
+REF_TABLES="truth_stream_questionnaires"
+for t in $REF_TABLES; do
+  mysqldump --no-create-info --skip-triggers --replace --complete-insert mirror "$t" | mysql mirror_staging
+done
+# verify (example): active questionnaires present for every goal category
+mysql -e "SELECT goal_category, is_active, version FROM mirror_staging.truth_stream_questionnaires ORDER BY goal_category;"
+```
+Rule of thumb: a table is **reference/config** if its rows are authored by the
+team and shared by all users (questionnaires, norms, templates, category
+lists); it is **user data** if rows are created per-account (profiles, reviews,
+messages, intake) — those stay EMPTY in staging and are created by the sim.
+
 ## Step 3 — storage dirs
 ```bash
 sudo mkdir -p /var/mirror/staging/storage /var/mirror/staging/users
