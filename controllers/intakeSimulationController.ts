@@ -1171,9 +1171,17 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
             await new Promise((r) => setTimeout(r, 2000));
             const list = await selfRequest('GET', `/mirror/api/groups/${groupId}/chat/messages?limit=30`, { token: accessToken });
             const msgs = list.body?.data?.messages || [];
-            dinaReplied = Array.isArray(msgs) && msgs.some((m: any) =>
-              /dina/i.test(String(m.sender_username || m.senderName || m.sender_name || '')) ||
-              m?.metadata?.isDina === true || m?.is_dina === true);
+            // A reply is any message from a sender that is NEITHER the owner nor
+            // the helper — i.e. a third party (Dina), regardless of the system
+            // account's username. Fall back to name/metadata heuristics too.
+            const ownerId = String(userId);
+            const helperId = String(groupHelper!.userId);
+            dinaReplied = Array.isArray(msgs) && msgs.some((m: any) => {
+              const sid = String(m.sender_user_id ?? m.senderUserId ?? m.sender_id ?? m.userId ?? '');
+              const uname = String(m.sender_username || m.senderName || m.sender_name || m.username || '');
+              const thirdParty = sid !== '' && sid !== ownerId && sid !== helperId;
+              return thirdParty || /dina/i.test(uname) || m?.metadata?.isDina === true || m?.is_dina === true;
+            });
           }
           return {
             detail: dinaReplied ? '@Dina replied in group chat' : '@Dina message accepted; no reply within budget (chat worker is async)',

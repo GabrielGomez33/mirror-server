@@ -248,10 +248,20 @@ done
 # verify (example): active questionnaires present for every goal category
 mysql -e "SELECT goal_category, is_active, version FROM mirror_staging.truth_stream_questionnaires ORDER BY goal_category;"
 ```
-Rule of thumb: a table is **reference/config** if its rows are authored by the
-team and shared by all users (questionnaires, norms, templates, category
-lists); it is **user data** if rows are created per-account (profiles, reviews,
-messages, intake) — those stay EMPTY in staging and are created by the sim.
+Also seed the **Dina system user** — the bot account that authors @Dina chat
+replies (`mirror_group_messages.sender_user_id` FK). Its id is `DINA_USER_ID_SQL`
+in the mirror `.env` (e.g. 59); without it, @Dina generates a reply but cannot
+insert it (FK violation). It is a system account, not real PII:
+```bash
+DINA_UID=59   # match DINA_USER_ID_SQL in the staging .env
+mysqldump --no-create-info --skip-triggers --replace --complete-insert --where="id=$DINA_UID" mirror users | mysql mirror_staging
+mysql -e "SELECT id, username FROM mirror_staging.users WHERE id=$DINA_UID;"
+```
+Rule of thumb: a table/row is **reference/config** if it is authored by the team
+and shared by all users (questionnaires, norms, templates, category lists, the
+Dina system account); it is **user data** if rows are created per-account
+(profiles, reviews, messages, intake) — those stay EMPTY in staging and are
+created by the sim.
 
 ## Step 3 — storage dirs
 ```bash
