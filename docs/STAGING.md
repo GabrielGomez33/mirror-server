@@ -313,3 +313,70 @@ USE_DINA_STUB=false).
   `[req]` ones in `.env.example`.
 - **Client loads but API 502**: the vhost isn't proxying `/mirror/api` to 9444,
   or `STAGING_VITE_API_URL` was baked wrong (rebuild after fixing).
+
+# ============================================================================
+# DINA-STAGING BRING-UP (second environment — validated)
+# ============================================================================
+# Same-host, fully isolated dina-server staging on 9445, owned by the `dina`
+# system user (separation of concerns — NOT mirror_app). Validated end-to-end via
+# mirror-server's acceptance sim (@Dina chat produces a real LLM reply against it).
+
+## D1 — artifacts (committed)
+`ecosystem.staging.config.js` (dina-server-staging, root PM2, GPU device 0) and
+the `deploy-staging` job in dina-server `.github/workflows/ci-cd.yml`
+(develop + STAGING_ENABLED, health-checks 9445/dina/api/v1/health). Staging
+overrides are documented at the bottom of dina-server `.env.example`.
+
+## D2 — storage + checkout (owned by `dina`)
+```bash
+sudo mkdir -p /var/www/staging/dina-storage /var/www/staging/saga-storage
+sudo chown -R dina:dina /var/www/staging/dina-storage /var/www/staging/saga-storage
+sudo mkdir -p /var/www/staging/dina-server && sudo chown dina:dina /var/www/staging/dina-server
+sudo -u dina -H bash -c 'cd /var/www/staging/dina-server && \
+  git clone -b develop <repo> . && npm ci && npm run build'
+```
+
+## D3 — DB + structure from prod (as administrator)
+```bash
+CREATE DATABASE dina_staging CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER 'dina_staging'@'localhost'/'@127.0.0.1' IDENTIFIED BY '<pw>';
+GRANT ALL ON dina_staging.* TO 'dina_staging'@...;
+mysqldump --no-data --routines --triggers dina | mysql dina_staging   # structure only
+```
+
+## D4 — staging .env (as `dina`, in the checkout)
+Key isolation values: `DINA_PORT=9445`, `DB_NAME=dina_staging` + dedicated user,
+`REDIS_URL=redis://localhost:6379/2` + `REDIS_DB=2` (dina's Redis is 6379; mirror's
+is 6380), staging `DINA_STORAGE`/`SAGA_ROOT`, DISTINCT `JWT_SECRET`/`ENCRYPTION_KEY`/
+`DINA_ENCRYPTION_KEY`, `EMAIL_PROVIDER=console`, reuse prod TLS certs, shared
+`LLM_ENDPOINT=http://localhost:11434` (Ollama serialises — safe), `DINA_GPU_ARBITER=off`.
+
+## D5 — start + health (as `dina`, via `sudo pm2` — dina runs under root PM2)
+```bash
+cd /var/www/staging/dina-server && sudo pm2 start ecosystem.staging.config.js && sudo pm2 save
+curl -sk https://127.0.0.1:9445/dina/api/v1/health    # -> {"status":"healthy",...}
+```
+
+## D6 — wire mirror-staging -> dina-staging (real DINA, and close the isolation leak)
+In mirror-staging's `.env` (mirror's DinaWebSocketClient defaults to prod 8445 if
+DINA_WS_URL is unset — always set it):
+```
+USE_DINA_STUB=false
+DINA_ENDPOINT=https://127.0.0.1:9445/dina/api/v1/
+DINA_WS_URL=wss://127.0.0.1:9445/dina/ws
+DINA_SERVER_URL=https://127.0.0.1:9445
+```
+`sudo pm2 restart ecosystem.staging.config.js --update-env`, then re-run the sim —
+`group_dina_chat` must report "@Dina replied in group chat" (a real LLM answer,
+proven in dina-server-staging logs). The mirror WS client uses
+`rejectUnauthorized:false`, so the prod cert on the loopback listener is fine.
+
+## D7 — reference data (see Step 2b): the Dina system user (mirror_staging.users
+id DINA_USER_ID_SQL) MUST be seeded, or @Dina generates a reply but cannot insert
+it (FK fk_message_sender). Also seed truth_stream_questionnaires.
+
+## DINA GitHub config (dina-server repo)
+- secret `STAGING_DEPLOY_PATH=/var/www/staging/dina-server`
+- var `STAGING_ENABLED=true`
+- secret `SERVER_USER=dina` (the dina user needs passwordless `sudo pm2`, same as
+  mirror_app) — keeps deploys under the owning user (separation of concerns).
