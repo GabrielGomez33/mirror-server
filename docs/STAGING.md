@@ -96,6 +96,18 @@ acceptance gate, and unit-proven in `tests/emailIsolation.test.ts`):
    hands the tester to the live app). The gate fails a staging run if a link
    base resolves to the prod host.
 
+**Proving the send pipeline (not just config).** The `email_health` gate proves
+email is enabled + isolated + the provider authenticates. To prove a real send
+works end to end, set `STAGING_EMAIL_CANARY` to a mailbox you own (e.g.
+`gabrielgomez@trymirror.world`). Each staging-acceptance run then fires the
+`email_send` gate: it sends one real verification email through the actual
+template + provider path and asserts the provider **accepted** it (messageId, no
+error) — exercising template render, the staging `APP_URL` link base, and the
+verified sending domain. Provider-acceptance is the automatable signal; confirm
+true inbox **delivery** by eyeballing the canary box. Unset -> the gate warns
+(pipeline unproven). Under `EMAIL_DRY_RUN=true` it passes with a note instead of
+a real send.
+
 Two ways to run it, both isolated:
 - **Separate key + staging sending subdomain** (recommended, true separation):
   own `RESEND_API_KEY`, `EMAIL_FROM_ADDRESS=noreply@staging.<domain>`,
