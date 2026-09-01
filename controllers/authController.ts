@@ -57,6 +57,13 @@ import { writeToTier } from './directoryController';
 import { DB } from '../db';
 import { emailService } from '../services/emailService';
 import { Logger } from '../utils/logger';
+import {
+  normalisePassword,
+  normaliseUsername,
+  normaliseEmail,
+  passwordMeetsPolicy,
+  EMAIL_RE,
+} from '../utils/credentialPolicy';
 
 const authLogger = new Logger('AuthController');
 
@@ -102,71 +109,9 @@ DUMMY_HASH_PROMISE.catch((err) => {
 // that iOS autocorrect adds to an email like "you@gmail.com " is a
 // silent registration killer otherwise).
 
-const SMART_QUOTE_SINGLE_RE = /[‘’‚‛]/g;
-const SMART_QUOTE_DOUBLE_RE = /[“”„‟]/g;
-const SMART_DASH_RE         = /[–—―−]/g;
-const HORIZONTAL_ELLIPSIS_RE = /…/g;
-
-function normalisePassword(raw: unknown): string {
-  if (typeof raw !== 'string') return '';
-  return raw
-    .replace(SMART_QUOTE_SINGLE_RE, "'")
-    .replace(SMART_QUOTE_DOUBLE_RE, '"')
-    .replace(SMART_DASH_RE, '-')
-    .replace(HORIZONTAL_ELLIPSIS_RE, '...');
-}
-
-function normaliseUsername(raw: unknown): string {
-  if (typeof raw !== 'string') return '';
-  // Strip ALL internal whitespace — usernames have never been allowed to
-  // contain spaces and iOS's auto-period-after-double-space can sneak one
-  // in just before the field loses focus.
-  return raw.replace(/\s+/g, '').slice(0, 64);
-}
-
-function normaliseEmail(raw: unknown): string {
-  if (typeof raw !== 'string') return '';
-  // Trim, drop interior whitespace (autocorrect dust), bound the length.
-  // We do NOT lower-case here — the SQL collation handles case-insensitivity
-  // and preserving the case the user picked feels more honest.
-  return raw.trim().replace(/\s+/g, '').slice(0, 254);
-}
-
-// ============================================================================
-// PASSWORD POLICY (single source of truth — used by register + changePassword)
-// ============================================================================
-//
-// Rules:
-//   - 8–128 chars (upper bound stops pathological inputs reaching bcrypt)
-//   - At least one lowercase, uppercase, digit, AND non-alphanumeric.
-//
-// We deliberately accept ANY non-alphanumeric, non-whitespace byte as the
-// "special character". The previous narrow set `[@$!%*?&]` rejected:
-//   - iOS Suggested Strong Password (which uses hyphens),
-//   - mobile users hitting `,` or `.` on the main keyboard,
-//   - everyday users picking `_`, `#`, `^`, `(`, etc.
-// The client validation in client/src/components/intake/RegistrationStep.tsx
-// uses the same rule — keep these two in sync.
-
-const REGISTRATION_PASSWORD_MIN = 8;
-const REGISTRATION_PASSWORD_MAX = 128;
-
-function passwordMeetsPolicy(pw: string): boolean {
-  if (typeof pw !== 'string') return false;
-  if (pw.length < REGISTRATION_PASSWORD_MIN) return false;
-  if (pw.length > REGISTRATION_PASSWORD_MAX) return false;
-  if (!/[a-z]/.test(pw)) return false;
-  if (!/[A-Z]/.test(pw)) return false;
-  if (!/\d/.test(pw)) return false;
-  if (!/[^A-Za-z0-9\s]/.test(pw)) return false;
-  return true;
-}
-
-// RFC-5322-lite email regex. Good enough to reject obvious garbage without
-// false negatives on real addresses; verification clicks are the
-// authoritative check. Hoisted here (instead of next to changeEmail) so
-// registerUser can use it without relying on const-hoisting subtleties.
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// Input normalisation + password policy + email regex live in
+// utils/credentialPolicy (imported above) so they can be proven in isolation.
+// The register/login/change* handlers below use them unchanged.
 
 // JWT Payload interface
 interface JWTPayload {

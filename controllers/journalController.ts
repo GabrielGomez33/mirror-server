@@ -7,6 +7,7 @@ import { Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { DB } from '../db';
 import { validateJournalEntry, calculateSentiment, extractThemes } from '../utils/journalHelpers';
+import { journalOrderByClause } from '../utils/journalSort';
 
 // ============================================================================
 // TYPES
@@ -300,11 +301,9 @@ export class JournalController {
         tagArray.forEach(tag => params.push(`"${tag}"`));
       }
 
-      // Sorting
-      const allowedSortFields = ['entry_date', 'mood_rating', 'created_at', 'word_count', 'sentiment_score'];
-      const sortField = allowedSortFields.includes(sortBy as string) ? sortBy : 'entry_date';
-      const sortDir = sortOrder === 'asc' ? 'ASC' : 'DESC';
-      query += ` ORDER BY ${sortField} ${sortDir}`;
+      // Sorting — ORDER BY cannot be parameterised, so the field is allow-listed
+      // in utils/journalSort (proven injection-safe in tests/journalSort.test.ts).
+      query += ` ${journalOrderByClause(sortBy, sortOrder)}`;
 
       // Pagination
       query += ` LIMIT ? OFFSET ?`;

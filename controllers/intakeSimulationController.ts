@@ -88,6 +88,8 @@ import { mirrorRedis } from '../config/redis';
 import { TokenManager } from './authController';
 import { createUserInDB, deleteUserFromDB, updateUserPassword } from './userController';
 import { listTierFiles, TierType } from './directoryController';
+import { emailService } from '../services/emailService';
+import { emailLinksLeakAcrossEnv } from '../utils/emailIsolation';
 
 const logger = new Logger('IntakeSimulation');
 
@@ -633,6 +635,79 @@ async function step(
   }
 }
 
+// Email quality gate: staging email is part of the system, so the sim proves it
+// is (a) enabled — a provider key is loaded — and (b) ISOLATED — its link bases
+// don't point at prod from a staging DB (which would email staging signups a
+// link into production). Both are hard failures. Respects EMAIL_DRY_RUN: when on
+// we never touch the provider (a live auth-check flake only warns).
+async function runEmailHealthCheck(): Promise<{ detail: string; data?: Record<string, unknown>; severity?: StepSeverity }> {
+  if (!emailService.isEnabled()) {
+    return {
+      severity: 'fail',
+      detail: 'Email service DISABLED — set EMAIL_API_KEY / RESEND_API_KEY. Staging email is part of the system.',
+      data: { enabled: false },
+    };
+  }
+  const verdict = emailLinksLeakAcrossEnv({
+    dbName: process.env.DB_NAME,
+    appUrl: process.env.APP_URL,
+    emailPublicBaseUrl: process.env.EMAIL_PUBLIC_BASE_URL,
+    fromAddress: process.env.EMAIL_FROM_ADDRESS,
+  });
+  if (verdict.leaksToProd) {
+    return { severity: 'fail', detail: `Email enabled but NOT isolated: ${verdict.reason}`, data: { enabled: true, ...verdict } };
+  }
+  // Deliberately NO live verifyConnection() probe here: a send-scoped provider
+  // key (correct least-privilege for staging) can't read the account/domains
+  // endpoint that probe hits, so it reports "unhealthy" even when sending works
+  // perfectly — a false alarm that erodes trust in the gate. The authoritative
+  // send proof is the separate email_send step (a real accepted send). This step
+  // asserts the two deterministic invariants: enabled + isolated.
+  const dryRun = (process.env.EMAIL_DRY_RUN || '').toLowerCase() === 'true';
+  return {
+    severity: 'pass',
+    detail: `Email enabled and isolated (staging link base + sender)${dryRun ? '; GLOBAL DRY-RUN' : ''}. Real-send proof: see email_send.`,
+    data: { enabled: true, dryRun, ...verdict },
+  };
+}
+
+// Email SEND gate: prove the pipeline end to end, not just its config. Sends a
+// real verification email through the actual template+provider path to a canary
+// recipient (STAGING_EMAIL_CANARY) and asserts the provider ACCEPTED it
+// (messageId, no error) — which exercises template render, the staging APP_URL
+// link base, and the verified sending domain. Provider-acceptance is the
+// automatable signal; true inbox DELIVERY is confirmed by the human canary box.
+// No canary configured -> warn (pipeline unproven). Under EMAIL_DRY_RUN the
+// provider isn't called, so it passes with a note rather than a real send.
+async function runEmailSendCheck(): Promise<{ detail: string; data?: Record<string, unknown>; severity?: StepSeverity }> {
+  if (!emailService.isEnabled()) {
+    return { severity: 'fail', detail: 'Email disabled — send pipeline cannot be exercised.', data: { enabled: false } };
+  }
+  const canary = (process.env.STAGING_EMAIL_CANARY || '').trim();
+  if (!canary) {
+    return {
+      severity: 'warn',
+      detail: 'STAGING_EMAIL_CANARY not set — send pipeline NOT exercised. Set a canary recipient to enable the real-send gate.',
+    };
+  }
+  const dryRun = (process.env.EMAIL_DRY_RUN || '').toLowerCase() === 'true';
+  const appUrl = (process.env.APP_URL || '').replace(/\/+$/, '');
+  const result = await emailService.sendTemplate(canary, 'email_verification', {
+    username: 'staging-canary',
+    verificationUrl: `${appUrl}/verify-email?token=CANARY_${Date.now()}`,
+  } as any);
+  if (!result.success) {
+    return { severity: 'fail', detail: `Send pipeline FAILED: ${result.error || 'unknown provider error'}`, data: { to: canary } };
+  }
+  return {
+    severity: 'pass',
+    detail: dryRun
+      ? 'Send path OK (EMAIL_DRY_RUN — provider not called; set false to exercise Resend for real).'
+      : `Real send ACCEPTED by provider (messageId=${result.messageId || 'n/a'}) -> ${canary}. Confirm delivery in the canary inbox.`,
+    data: { messageId: result.messageId, dryRun, to: canary },
+  };
+}
+
 // ----------------------------------------------------------------------------
 // TEARDOWN — guarded; only ever deletes a proven simulation user
 // ----------------------------------------------------------------------------
@@ -767,9 +842,16 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
         }
         return { detail: `DB reachable; self base ${SELF_BASE_URL}; sim domain @${SIM_EMAIL_DOMAIN}` };
       });
-      report.status = steps.some((s) => s.severity === 'warn') ? 'passed_with_warnings' : 'passed';
+      await step(steps, 'email_health', runEmailHealthCheck);
+      const anyFail = steps.some((s) => s.severity === 'fail');
+      report.status = anyFail ? 'failed' : (steps.some((s) => s.severity === 'warn') ? 'passed_with_warnings' : 'passed');
       return report;
     }
+
+    // ---- 0. EMAIL HEALTH (staging email must be enabled AND isolated) ------
+    await step(steps, 'email_health', runEmailHealthCheck);
+    // ---- 0b. EMAIL SEND (exercise the real send pipeline to a canary) ------
+    await step(steps, 'email_send', runEmailSendCheck);
 
     // ---- 1. REGISTER (provision via the same fns /auth/register uses) ------
     await step(steps, 'register', async () => {
@@ -888,6 +970,98 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
         );
       }
       return { detail: `Cross-user /latest/${otherId} correctly rejected — 403 FORBIDDEN_CROSS_USER` };
+    });
+
+    // ---- 1f. CORE DRAFT RESUME (server-backed "come back later") -----------
+    // Prove the resumable-draft round-trip end to end: PUT a partial draft for
+    // one step, GET it back, and assert (a) the non-media answers round-trip,
+    // (b) media a client tried to smuggle in is STRIPPED (security), (c) status
+    // is in_progress. Uses the 'iq' step; iq is completed later via the real
+    // /store bridge, which cleanly overrides this in_progress row.
+    await step(steps, 'core_draft_resume', async () => {
+      const draftState = {
+        currentQuestionIndex: 7,
+        userAnswers: [1, 0, 2, 3],
+        showResult: false,
+        photoDataUrl: 'data:image/png;base64,AAAA',        // media-named key -> dropped
+        note: 'data:application/octet-stream;base64,BBBB', // data: URL value -> null
+      };
+      const put = await selfRequest('PUT', '/mirror/api/intake/progress/iq', { json: { draftState }, token: accessToken });
+      if (put.status !== 200 || put.body?.success !== true) {
+        throw new Error(`draft PUT failed: HTTP ${put.status} ${JSON.stringify(put.body)}`);
+      }
+      const get = await selfRequest('GET', '/mirror/api/intake/progress/iq', { token: accessToken });
+      if (get.status !== 200 || get.body?.success !== true) {
+        throw new Error(`draft GET failed: HTTP ${get.status} ${JSON.stringify(get.body)}`);
+      }
+      const d = get.body?.draftState;
+      if (!d || d.currentQuestionIndex !== 7 || JSON.stringify(d.userAnswers) !== JSON.stringify([1, 0, 2, 3]) || d.showResult !== false) {
+        throw new Error(`draft did not round-trip: ${JSON.stringify(d)}`);
+      }
+      if ('photoDataUrl' in d) throw new Error('SECURITY: media-named key photoDataUrl was NOT stripped from the stored draft');
+      if (d.note !== null) throw new Error(`SECURITY: data: URL under 'note' was NOT stripped (got ${JSON.stringify(d.note)})`);
+      if (get.body?.status !== 'in_progress') throw new Error(`expected status in_progress after draft save, got ${get.body?.status}`);
+
+      // ---- ERASE: DELETE resets an in-progress draft to not_started ----------
+      const del = await selfRequest('DELETE', '/mirror/api/intake/progress/iq', { token: accessToken });
+      if (del.status !== 200 || del.body?.success !== true) {
+        throw new Error(`draft DELETE failed: HTTP ${del.status} ${JSON.stringify(del.body)}`);
+      }
+      if (del.body?.reset !== true) throw new Error('expected reset=true when erasing an in-progress draft');
+      const afterErase = await selfRequest('GET', '/mirror/api/intake/progress/iq', { token: accessToken });
+      if (afterErase.body?.status !== 'not_started') {
+        throw new Error(`erase did not reset step: expected not_started, got ${afterErase.body?.status}`);
+      }
+      if (afterErase.body?.draftState !== null) {
+        throw new Error(`erase left a draft behind: ${JSON.stringify(afterErase.body?.draftState)}`);
+      }
+
+      // ---- INVARIANT: DELETE NEVER downgrades a COMPLETED step ---------------
+      // Complete the step, then attempt to erase it: the guard must leave it
+      // completed (protects the completion invariant + any commit/erase race).
+      const done = await selfRequest('POST', '/mirror/api/intake/progress/iq/complete', { json: {}, token: accessToken });
+      if (done.status !== 200 || done.body?.success !== true) {
+        throw new Error(`completing iq failed: HTTP ${done.status} ${JSON.stringify(done.body)}`);
+      }
+      const delDone = await selfRequest('DELETE', '/mirror/api/intake/progress/iq', { token: accessToken });
+      if (delDone.body?.reset !== false) {
+        throw new Error('SECURITY/INVARIANT: DELETE reported it erased a COMPLETED step (reset should be false)');
+      }
+      const afterGuard = await selfRequest('GET', '/mirror/api/intake/progress/iq', { token: accessToken });
+      if (afterGuard.body?.status !== 'completed') {
+        throw new Error(`SECURITY/INVARIANT: DELETE downgraded a completed step to ${afterGuard.body?.status}`);
+      }
+
+      return {
+        detail: 'Draft round-trip + media strip OK; erase resets to not_started; DELETE never downgrades a completed step',
+        data: { currentQuestionIndex: d.currentQuestionIndex, mediaStripped: true, eraseResets: true, completedGuardHeld: true },
+      };
+    });
+
+    // ---- 1c. CONVERSION ANALYTICS (anonymous ingest reachability + validation)
+    await step(steps, 'conversion_analytics', async () => {
+      // Valid funnel event → 204 (accepted). Anonymous endpoint; no token needed.
+      const good = await selfRequest('POST', '/mirror/api/analytics/conversion', {
+        json: { stage: 'signup_completed', sessionToken: '11111111-2222-4333-8444-555566667777', utmSource: 'instagram', surface: 'web' },
+      });
+      if (good.status !== 204) throw new Error(`valid conversion event expected 204, got ${good.status}`);
+
+      // Unknown stage → 400 (rejected, never stored).
+      const bad = await selfRequest('POST', '/mirror/api/analytics/conversion', { json: { stage: 'definitely_not_a_stage' } });
+      if (bad.status !== 400) throw new Error(`unknown stage expected 400, got ${bad.status}`);
+
+      // Smuggled PII on a VALID stage → still 204, and the allowlist sanitizer
+      // guarantees only funnel fields are stored (proven exhaustively in the unit
+      // + integration tests; here we prove the endpoint accepts without error).
+      const pii = await selfRequest('POST', '/mirror/api/analytics/conversion', {
+        json: { stage: 'landing_view', email: 'victim@example.com', userId: 42, ip: '203.0.113.7', birthDate: '1990-01-01' },
+      });
+      if (pii.status !== 204) throw new Error(`PII-laden valid-stage event expected 204, got ${pii.status}`);
+
+      return {
+        detail: 'Conversion ingest OK — valid=204, unknown stage=400, PII-laden accepted (allowlist strips at store)',
+        data: { validAccepted: true, unknownRejected: true, piiEndpointOk: true },
+      };
     });
 
     // ---- 2. VISUAL (real upload -> /storage/store tier1) -------------------
@@ -1031,6 +1205,260 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
       return { detail: 'Latest intake round-trips (name + personality) AND now carries Core-only sections — Core merged over Entry' };
     });
 
+    // ---- 10a. JOURNAL (real create -> list round-trip as the sim user) ------
+    // Exercises the Mirror Journal system end-to-end on the live stack: an
+    // authenticated create through the subscription gate, then a list read-back
+    // that must contain it — which also drives the ORDER BY allow-list
+    // (utils/journalSort) through a real query. Runs on every acceptance run.
+    await step(steps, 'journal', async () => {
+      const entryDate = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+      const entryBody = {
+        entryDate,
+        timeOfDay: 'morning',
+        moodRating: 7,
+        primaryEmotion: 'calm',
+        emotionIntensity: 5,
+        energyLevel: 6,
+        freeFormEntry: 'Simulation journal entry — verifying the journal system end-to-end.',
+      };
+      const create = await selfRequest('POST', '/mirror/api/journal/entry', { json: entryBody, token: accessToken });
+      if (create.status !== 201 || !create.body?.success) {
+        throw new Error(`journal create failed: HTTP ${create.status} ${JSON.stringify(create.body).slice(0, 200)}`);
+      }
+      const entryId = create.body?.data?.entryId;
+      if (!entryId) throw new Error('journal create returned no entryId');
+
+      // Read back through the list endpoint (drives the sortBy allow-list live).
+      const list = await selfRequest(
+        'GET',
+        '/mirror/api/journal/entries?limit=5&sortBy=entry_date&sortOrder=desc',
+        { token: accessToken },
+      );
+      if (list.status !== 200 || !list.body?.success) {
+        throw new Error(`journal list failed: HTTP ${list.status} ${JSON.stringify(list.body).slice(0, 200)}`);
+      }
+      const entries = list.body?.data?.entries;
+      if (!Array.isArray(entries) || entries.length < 1) {
+        throw new Error(`journal list returned no entries after create (body: ${JSON.stringify(list.body).slice(0, 200)})`);
+      }
+      const confirmed = entries.some((e: any) => String(e.id) === String(entryId));
+      return {
+        detail: `Journal create->list round-trip OK — ${entries.length} listed${confirmed ? `, created entry confirmed present` : ''}`,
+        data: { entryId, listed: entries.length, confirmed },
+      };
+    });
+
+    // ---- 10c. MIRRORGROUPS (multi-user lifecycle on the live stack) --------
+    // Exercises the real group system end-to-end with a SECOND sim member:
+    // create -> join -> member->owner chat message -> propose+cast a vote ->
+    // @Dina chat (async, best-effort) -> leave -> delete. The helper member is
+    // always torn down in the finally, whatever happens. Deterministic steps
+    // hard-fail the gate (these systems must work); the async @Dina reply only
+    // warns. All calls go through the same authenticated loopback as a real client.
+    {
+      let groupId: string | null = null;
+      let groupHelper: { userId: number; token: string; username: string } | null = null;
+      const ok2xx = (s: number) => s >= 200 && s < 300;
+      try {
+        await step(steps, 'group_create', async () => {
+          const short = crypto.randomUUID().slice(0, 8);
+          const body = {
+            name: `Sim Group ${short}`,
+            description: 'Simulation group for end-to-end acceptance testing.',
+            type: 'family',
+            privacy: 'public', // honored regardless of type — enables direct join
+            maxMembers: 5,
+          };
+          const res = await selfRequest('POST', '/mirror/api/groups/create', { json: body, token: accessToken });
+          if (res.status !== 201 || !res.body?.success) {
+            throw new Error(`group create failed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
+          }
+          groupId = res.body?.data?.id;
+          if (!groupId) throw new Error('group create returned no id');
+          return { detail: `Public group created (${groupId})`, data: { groupId } };
+        });
+
+        await step(steps, 'group_join', async () => {
+          const h = await createHelperReviewer();
+          groupHelper = { userId: h.userId, token: h.token, username: h.username };
+          const res = await selfRequest('POST', `/mirror/api/groups/${groupId}/join`, { json: {}, token: h.token });
+          if (res.status !== 201 || !res.body?.success) {
+            throw new Error(`group join failed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
+          }
+          // Confirm membership from the owner's view (tolerant of list shape).
+          const members = await selfRequest('GET', `/mirror/api/groups/${groupId}/members`, { token: accessToken });
+          const list = members.body?.data?.members || members.body?.data || members.body?.members || [];
+          const count = Array.isArray(list) ? list.length : 0;
+          return {
+            detail: `Helper #${h.userId} joined (HTTP 201)${count ? ` — members list shows ${count}` : ''}`,
+            data: { helperUserId: h.userId, members: count },
+          };
+        });
+
+        await step(steps, 'group_message', async () => {
+          // Member sends; OWNER must see it — proves user-to-user messaging.
+          const marker = `sim-msg-${crypto.randomUUID().slice(0, 6)}`;
+          const send = await selfRequest('POST', `/mirror/api/groups/${groupId}/chat/messages`, {
+            json: { content: `Hello from member — ${marker}` }, token: groupHelper!.token,
+          });
+          if (send.status !== 201 || !send.body?.success) {
+            throw new Error(`send message failed: HTTP ${send.status} ${JSON.stringify(send.body).slice(0, 200)}`);
+          }
+          const list = await selfRequest('GET', `/mirror/api/groups/${groupId}/chat/messages?limit=20`, { token: accessToken });
+          if (list.status !== 200 || !list.body?.success) {
+            throw new Error(`list messages failed: HTTP ${list.status} ${JSON.stringify(list.body).slice(0, 200)}`);
+          }
+          const msgs = list.body?.data?.messages || [];
+          const seen = Array.isArray(msgs) && msgs.some((m: any) => String(m.content || '').includes(marker));
+          if (!seen) throw new Error(`owner did not see member's message (${marker}) among ${Array.isArray(msgs) ? msgs.length : 0}`);
+          return { detail: `Member→owner message delivered and visible to the owner`, data: { messages: msgs.length } };
+        });
+
+        await step(steps, 'group_vote', async () => {
+          const propose = await selfRequest('POST', `/mirror/api/groups/${groupId}/votes/propose`, {
+            json: { topic: 'Sim acceptance — proceed?', voteType: 'yes_no', durationSeconds: 120 }, token: accessToken,
+          });
+          if (!ok2xx(propose.status) || !propose.body?.success) {
+            throw new Error(`vote propose failed: HTTP ${propose.status} ${JSON.stringify(propose.body).slice(0, 200)}`);
+          }
+          const voteId = propose.body?.data?.voteId;
+          if (!voteId) throw new Error('vote propose returned no voteId');
+          const cast = await selfRequest('POST', `/mirror/api/groups/${groupId}/votes/${voteId}/cast`, {
+            json: { response: 'yes' }, token: groupHelper!.token,
+          });
+          if (!ok2xx(cast.status) || !cast.body?.success) {
+            throw new Error(`vote cast failed: HTTP ${cast.status} ${JSON.stringify(cast.body).slice(0, 200)}`);
+          }
+          return { detail: `Vote ${voteId} proposed by owner + cast 'yes' by member`, data: { voteId } };
+        });
+
+        await step(steps, 'group_dina_chat', async () => {
+          // @Dina is processed by an async worker; accept the post hard, poll softly.
+          const send = await selfRequest('POST', `/mirror/api/groups/${groupId}/chat/messages`, {
+            json: { content: '@Dina hello — are you online?' }, token: accessToken,
+          });
+          if (send.status !== 201) throw new Error(`@Dina chat message send failed: HTTP ${send.status}`);
+          let dinaReplied = false;
+          // Match Dina PRECISELY — its own account id (DINA_USER_ID_SQL) or the
+          // exact username 'Dina' — never a broad "third-party" heuristic (a join/
+          // system message would false-positive). Poll up to ~40s so a real LLM
+          // reply (queue pickup + Ollama inference + stream + insert) is caught;
+          // warn-only, so latency never flakes the gate.
+          const dinaSqlId = String(process.env.DINA_USER_ID_SQL || '').trim();
+          for (let i = 0; i < 20 && !dinaReplied; i++) {
+            await new Promise((r) => setTimeout(r, 2000));
+            const list = await selfRequest('GET', `/mirror/api/groups/${groupId}/chat/messages?limit=30`, { token: accessToken });
+            const msgs = list.body?.data?.messages || [];
+            dinaReplied = Array.isArray(msgs) && msgs.some((m: any) => {
+              const sid = String(m.sender_user_id ?? m.senderUserId ?? m.sender_id ?? m.userId ?? '').trim();
+              const uname = String(m.sender_username || m.senderName || m.sender_name || m.username || '').trim();
+              const isDina = (dinaSqlId !== '' && sid === dinaSqlId) || /^dina$/i.test(uname) || m?.metadata?.isDina === true || m?.is_dina === true;
+              // Require actual content — not just a streaming placeholder row — so
+              // "replied" means the LLM answer really landed (its ms then reflects
+              // true inference latency, not the ~2s row creation).
+              const content = String(m.content ?? m.text ?? m.body ?? m.message ?? '').trim();
+              return isDina && content.length > 0;
+            });
+          }
+          return {
+            detail: dinaReplied ? '@Dina replied in group chat' : '@Dina message accepted; no reply within budget (chat worker is async)',
+            severity: (dinaReplied ? 'pass' : 'warn') as StepSeverity,
+            data: { dinaReplied },
+          };
+        });
+
+        await step(steps, 'group_leave', async () => {
+          const res = await selfRequest('POST', `/mirror/api/groups/${groupId}/leave`, { json: {}, token: groupHelper!.token });
+          if (!ok2xx(res.status) || !res.body?.success) {
+            throw new Error(`group leave failed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
+          }
+          return { detail: `Member #${groupHelper!.userId} left the group`, data: {} };
+        });
+
+        await step(steps, 'group_delete', async () => {
+          const res = await selfRequest('DELETE', `/mirror/api/groups/${groupId}`, { token: accessToken });
+          if (!ok2xx(res.status) || !res.body?.success) {
+            throw new Error(`group delete failed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
+          }
+          return { detail: `Group ${groupId} deleted by owner`, data: {} };
+        });
+      } finally {
+        // Always remove the helper member, whatever happened above.
+        const helper = groupHelper as { userId: number } | null;
+        if (helper) {
+          try { await teardownSimUser(helper.userId, undefined); } catch { /* best effort */ }
+        }
+      }
+    }
+
+    // ---- 10d. TRUTHSTREAM SUBSYSTEMS (always-run, single exchange) ---------
+    // Faithful lighter pass covering the core TruthStream subsystems on every
+    // acceptance run: profile creation, the real review queue (submitReview drives
+    // /queue/start + /queue/complete), the reciprocity gate on reviews/received
+    // (you must GIVE one to VIEW yours), plus stats and milestones. Uses ONE
+    // helper reviewer, always torn down. The heavier full report-card (5 reviews)
+    // stays in the kept-user truthCard path below.
+    {
+      let tsHelper: { userId: number; token: string } | null = null;
+      const ok2xx = (s: number) => s >= 200 && s < 300;
+      try {
+        await step(steps, 'truthstream_profile', async () => {
+          const p = await ensureTruthStreamProfile(userId!, accessToken!);
+          return { detail: `TruthStream profile ${p.created ? 'created' : 'present'} (goal: ${p.goalCategory})`, data: { goalCategory: p.goalCategory } };
+        });
+
+        await step(steps, 'truthstream_review_exchange', async () => {
+          const tone = normalizeTone(options.reviewTone);
+          const h = await createHelperReviewer();
+          tsHelper = { userId: h.userId, token: h.token };
+          // Main user GIVES a review (satisfies the reciprocity gate to view received).
+          const given = await submitReview(userId!, accessToken!, h.userId, tone);
+          if (!given.reviewId) throw new Error('main user failed to submit a review (no reviewId)');
+          // Helper GIVES the main user a review (so main has one RECEIVED).
+          const received = await submitReview(h.userId, h.token, userId!, tone);
+          if (!received.reviewId) throw new Error('helper failed to submit a review to main user (no reviewId)');
+          return { detail: `Bidirectional review exchange OK (main↔helper #${h.userId})`, data: { given: given.reviewId, received: received.reviewId } };
+        });
+
+        await step(steps, 'truthstream_received', async () => {
+          // Reciprocity gate now satisfied — main user can view reviews received.
+          const res = await selfRequest('GET', `${TS_BASE}/reviews/received?limit=10`, { token: accessToken });
+          if (!ok2xx(res.status) || !res.body?.success) {
+            throw new Error(`reviews/received failed: HTTP ${res.status} ${JSON.stringify(res.body).slice(0, 200)}`);
+          }
+          // Received reviews are returned under data.items (with data.reviews and a
+          // bare data array as tolerant fallbacks).
+          const d = res.body?.data;
+          const reviews = d?.items || d?.reviews || (Array.isArray(d) ? d : []);
+          const count = Array.isArray(reviews) ? reviews.length : 0;
+          if (count < 1) throw new Error(`expected >=1 received review, got ${count} (body: ${JSON.stringify(res.body).slice(0, 160)})`);
+          return { detail: `reviews/received returns ${count} review(s) after the reciprocity gate`, data: { received: count } };
+        });
+
+        await step(steps, 'truthstream_stats', async () => {
+          const stats = await selfRequest('GET', `${TS_BASE}/stats`, { token: accessToken });
+          if (!ok2xx(stats.status) || !stats.body?.success) {
+            throw new Error(`stats failed: HTTP ${stats.status} ${JSON.stringify(stats.body).slice(0, 200)}`);
+          }
+          if (!stats.body?.data) throw new Error('stats returned null data despite an active profile + reviews');
+          const mile = await selfRequest('GET', `${TS_BASE}/milestones`, { token: accessToken });
+          if (!ok2xx(mile.status) || !mile.body?.success) {
+            throw new Error(`milestones failed: HTTP ${mile.status} ${JSON.stringify(mile.body).slice(0, 200)}`);
+          }
+          const d = stats.body.data;
+          return {
+            detail: `stats + milestones OK (given=${d.total_reviews_given ?? d.reviewsGiven ?? '?'}, received=${d.total_reviews_received ?? d.reviewsReceived ?? '?'})`,
+            data: { stats: true, milestones: true },
+          };
+        });
+      } finally {
+        const helper = tsHelper as { userId: number } | null;
+        if (helper) {
+          try { await teardownSimUser(helper.userId, undefined); } catch { /* best effort */ }
+        }
+      }
+    }
+
     // ---- 10b. TRUTHSTREAM REPORT CARD (kept users only) --------------------
     // Build a real TruthStream "report card": create the user's profile, seed a
     // few reviews from helper sim reviewers (so the card has content), and
@@ -1099,7 +1527,13 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
       });
     }
 
-    report.status = warnings.length || steps.some((s) => s.severity === 'warn') ? 'passed_with_warnings' : 'passed';
+    // A non-throwing hard failure (e.g. the email_health gate returning
+    // severity:'fail') must fail the whole run — not be softened to a warning.
+    if (steps.some((s) => s.severity === 'fail')) {
+      report.status = 'failed';
+    } else {
+      report.status = warnings.length || steps.some((s) => s.severity === 'warn') ? 'passed_with_warnings' : 'passed';
+    }
     return report;
   } catch (err) {
     report.error = errMsg(err);

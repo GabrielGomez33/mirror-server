@@ -64,8 +64,12 @@ import { DB } from '../db';
 import { generateUserKeys } from './encryptionController';
 import { createUserDirectories, deleteUserDirectories, DataAccessContext } from './directoryController';
 import { cleanupUserTruthStreamData } from './truthstreamController';
-const basePath = path.join(process.env.MIRRORSTORAGE!);
-const storagePath = path.join(basePath, 'users');
+import { userStorageRoot } from '../utils/storagePaths';
+// User data (directory tree + per-user encryption keys) lives under the single
+// canonical user-storage root — the SAME root DirectoryController uses when it
+// loads those keys. Resolved through utils/storagePaths so key generation and
+// key loading can never diverge (see that module for the incident this guards).
+const storagePath = userStorageRoot();
 const SALT_ROUNDS = 10;
 
 // ============================================================================

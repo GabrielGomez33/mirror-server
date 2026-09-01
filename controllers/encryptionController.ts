@@ -2,6 +2,7 @@
 import { generateKeyPairSync, randomBytes, createCipheriv, createDecipheriv, createHash } from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
+import { userKeyDir as resolveUserKeyDir } from '../utils/storagePaths';
 
 // Types for encryption operations
 export interface EncryptionResult {
@@ -39,8 +40,8 @@ const AUTH_TAG_SIZE = 16; // 128 bits
  */
 export async function generateUserKeys(userId: string, basePath: string): Promise<void> {
   console.log(`[EncryptionController]: Initiating key generation for user ID: ${userId}`);
-  
-  const userKeyDir = path.join(basePath, userId, 'tier1', 'keys');
+
+  const userKeyDir = resolveUserKeyDir(userId, basePath);
   
   try {
     // Ensure the keys directory exists
@@ -107,7 +108,7 @@ export async function generateUserKeys(userId: string, basePath: string): Promis
  * Load user's encryption keys from storage
  */
 export async function loadUserKeys(userId: string, basePath: string): Promise<UserKeys> {
-  const userKeyDir = path.join(basePath, userId, 'tier1', 'keys');
+  const userKeyDir = resolveUserKeyDir(userId, basePath);
   
   try {
     const [aesKey, iv, publicKey, privateKey] = await Promise.all([
@@ -276,7 +277,7 @@ export function verifyDataIntegrity(data: Buffer, expectedHash: string, algorith
 export async function rotateUserAESKeys(userId: string, basePath: string): Promise<void> {
   console.log(`[EncryptionController]: Rotating AES keys for user ${userId}`);
   
-  const userKeyDir = path.join(basePath, userId, 'tier1', 'keys');
+  const userKeyDir = resolveUserKeyDir(userId, basePath);
   
   try {
     // Backup old keys
@@ -336,7 +337,7 @@ export async function rotateUserAESKeys(userId: string, basePath: string): Promi
  * Delete user keys securely
  */
 export async function deleteUserKeys(userId: string, basePath: string): Promise<void> {
-  const userKeyDir = path.join(basePath, userId, 'tier1', 'keys');
+  const userKeyDir = resolveUserKeyDir(userId, basePath);
   
   try {
     // List all key files
@@ -393,7 +394,7 @@ export async function deleteUserKeys(userId: string, basePath: string): Promise<
  * Check if user has valid keys
  */
 export async function validateUserKeys(userId: string, basePath: string): Promise<boolean> {
-  const userKeyDir = path.join(basePath, userId, 'tier1', 'keys');
+  const userKeyDir = resolveUserKeyDir(userId, basePath);
   
   try {
     // Check if all required key files exist

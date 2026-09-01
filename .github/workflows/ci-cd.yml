@@ -66,6 +66,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    # Throwaway MySQL for the DB-backed integration proof (draft storage +
+    # the never-downgrade-completed invariant). Ephemeral to the job; the test
+    # creates/drops its own tables in mirror_ci_test and touches nothing else.
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: ci_root_pw
+          MYSQL_DATABASE: mirror_ci_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci_root_pw"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=15
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -81,6 +98,28 @@ jobs:
 
       - name: TypeScript type-check (strict)
         run: npx tsc --noEmit
+
+      # BLOCKING: the pure unit suites (IDOR guards, intake completion/derivation,
+      # entry validation, audience resolver, student config/domain). A failure
+      # here fails the pipeline and blocks deploy — these are the regressions that
+      # previously reached production unnoticed because CI ran no tests.
+      - name: Unit tests
+        run: npm run test:ci
+
+      # BLOCKING: DB-backed integration proof against the throwaway MySQL above.
+      # Proves what only a real database can — the draft round-trip, media strip
+      # on store, and the data-integrity INVARIANT that a completed step can
+      # never be downgraded by a re-save or an erase. INTEGRATION_DB=1 makes the
+      # test run (it self-skips without it) and DB_NAME must match /test|ci/i or
+      # the test refuses to run its destructive DDL.
+      - name: Integration tests (DB round-trip + reset invariant)
+        env:
+          INTEGRATION_DB: '1'
+          DB_HOST: 127.0.0.1
+          DB_USER: root
+          DB_PASSWORD: ci_root_pw
+          DB_NAME: mirror_ci_test
+        run: npm run test:db
 
       - name: Build production artifacts
         run: npm run build
@@ -335,6 +374,161 @@ jobs:
               draft: false,
               prerelease: false
             });
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
+  # ===========================================================================
+  # JOB 3: DEPLOY TO STAGING  (staging pipeline gate 3)
+  # ---------------------------------------------------------------------------
+  # Runs on push to `develop`, but ONLY once staging has been provisioned and the
+  # repo variable STAGING_ENABLED is set to 'true' (see docs/STAGING.md). Until
+  # then this job is skipped, so merging the pipeline changes disrupts nothing.
+  #
+  # Same proven SSH+PM2 pattern as the prod deploy, targeting the ISOLATED staging
+  # stack: a separate checkout (STAGING_DEPLOY_PATH) tracking develop, its own
+  # .env (mirror_staging DB, port 9444, distinct secrets), and staging PM2 apps
+  # (ecosystem.staging.config.js -> *-staging).
+  # ===========================================================================
+  deploy-staging:
+    name: Deploy to Staging
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop' && vars.STAGING_ENABLED == 'true'
+    environment:
+      name: staging
+      url: https://127.0.0.1:9444/mirror/api/health
+
+    steps:
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Snapshot staging for rollback
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'SNAP'
+          cd ${{ secrets.STAGING_DEPLOY_PATH }}
+          git rev-parse HEAD > /tmp/.mirror-server-staging-rollback-commit
+          SNAP
+
+      - name: Deploy mirror-server (staging)
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'DEPLOY'
+          set -e
+          cd ${{ secrets.STAGING_DEPLOY_PATH }}
+          echo "[1/5] Pull develop"; git fetch origin develop; git reset --hard origin/develop
+          echo "[2/5] Install";      npm ci
+          echo "[3/5] Build";        npm run build
+          [ -f dist/index.js ] || { echo "ERROR: dist/index.js missing"; exit 1; }
+          echo "[4/5] Prune";        npm prune --omit=dev
+          # --update-env: the app is .env-driven via dotenv.config() (no override),
+          # so a plain restart keeps any value pm2 cached in the process env and
+          # ignores later .env edits. --update-env rebuilds the env so the current
+          # .env wins (e.g. a rotated MIRROR_INTERNAL_SECRET / email creds).
+          echo "[5/5] Restart staging PM2"; sudo pm2 restart ecosystem.staging.config.js --update-env
+          sleep 15; sudo pm2 list | grep -E 'staging' || true
+          DEPLOY
+
+      - name: Report pending migrations (staging DB)
+        continue-on-error: true
+        run: |
+          # Drift-aware: mirror-server migrations are applied PER FILE by a human
+          # (docs/STAGING.md). CI only REPORTS pending here so a schema change is
+          # never silently auto-applied. Apply pending files manually on staging,
+          # then re-run acceptance.
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} \
+            "cd ${{ secrets.STAGING_DEPLOY_PATH }} && npm run migrate:status || true"
+
+      - name: Verify staging PM2 processes online
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'CHECK'
+          set -e
+          OFFLINE=$(sudo pm2 jlist | python3 -c "
+          import json,sys
+          procs=json.load(sys.stdin)
+          expected={'mirror-server-staging','analysis-worker-staging','dina-chat-worker-staging','truthstream-worker-staging','personal-analysis-worker-staging','email-campaign-worker-staging'}
+          alive={p['name'] for p in procs if p['pm2_env']['status']=='online'}
+          print(' '.join(expected-alive))
+          ")
+          if [ -n "$OFFLINE" ]; then echo "::error::Staging processes not online: $OFFLINE"; sudo pm2 list; exit 1; fi
+          echo "All 6 staging PM2 processes online."
+          CHECK
+
+      - name: Staging health check
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'HEALTH'
+          set -e
+          for i in $(seq 1 12); do
+            CODE=$(curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:9444/mirror/api/health || echo 000)
+            [ "$CODE" = "200" ] && { echo "staging health OK"; exit 0; }
+            echo "attempt $i: $CODE"; sleep 5
+          done
+          echo "::error::staging health check failed"; exit 1
+          HEALTH
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
+
+  # ===========================================================================
+  # JOB 4: STAGING ACCEPTANCE  (staging pipeline gate 4)
+  # ---------------------------------------------------------------------------
+  # The real end-to-end gate: runs the Admin INTAKE SIMULATION against staging —
+  # a full register -> entry submit -> merged read -> IDOR guard -> core store ->
+  # teardown journey against the real staging DB and endpoints. If the sim run
+  # comes back status='failed', staging is NOT good to promote. This is the gate
+  # that would have caught the intake-storage regression before it shipped.
+  # ===========================================================================
+  staging-acceptance:
+    name: Staging Acceptance (intake simulation)
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop' && vars.STAGING_ENABLED == 'true'
+
+    steps:
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Run intake simulation against staging
+        run: |
+          # Loopback call on the host to staging mirror-server's internal
+          # simulation API (gated by MIRROR_INTERNAL_SECRET). That secret is a
+          # RUNTIME admin<->mirror secret living in the staging server's .env —
+          # NOT a CI secret. We read it from that .env over the SSH we already
+          # have (single source of truth), rather than duplicating it into
+          # GitHub where it would drift. dryRun=false, cleanup on (default).
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} \
+            "cd '${{ secrets.STAGING_DEPLOY_PATH }}' && \
+             SECRET=\$(node -e \"require('dotenv').config();process.stdout.write((process.env.MIRROR_INTERNAL_SECRET||'').trim())\") && \
+             if [ -z \"\$SECRET\" ]; then echo '{\"data\":{\"status\":\"missing\"},\"error\":\"MIRROR_INTERNAL_SECRET absent in staging .env\"}'; exit 0; fi && \
+             curl -sk -X POST https://127.0.0.1:9444/mirror/api/admin/simulation/intake/run \
+               -H 'Content-Type: application/json' \
+               -H \"x-internal-secret: \$SECRET\" \
+               -H 'x-admin-user: ci-acceptance' \
+               -d '{\"dryRun\":false,\"label\":\"ci-staging-acceptance\"}'" > sim.json
+          echo "--- simulation report ---"; cat sim.json | python3 -m json.tool || cat sim.json
+          STATUS=$(python3 -c "import json; print(json.load(open('sim.json')).get('data',{}).get('status','missing'))" 2>/dev/null || echo missing)
+          echo "sim status: $STATUS"
+          if [ "$STATUS" = "failed" ] || [ "$STATUS" = "missing" ]; then
+            echo "::error::Staging acceptance FAILED — intake simulation status=$STATUS. Do not promote."
+            exit 1
+          fi
+          echo "Staging acceptance passed (status=$STATUS)."
 
       - name: Cleanup SSH key
         if: always()

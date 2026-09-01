@@ -5,6 +5,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { DB } from '../db';
 import dotenv from 'dotenv';
+import { userStorageRoot } from '../utils/storagePaths';
 import { 
   loadUserKeys, 
   encryptBuffer, 
@@ -50,7 +51,19 @@ class DirectoryController {
   private basePath: string;
 
   constructor(basePath?: string) {
-    this.basePath = process.env.MIRRORUSERSTORAGE! ;
+    // Honor an explicit base path when one is supplied; otherwise fall back to
+    // the canonical user-storage root (utils/storagePaths). Previously the
+    // argument was accepted but always ignored, so a caller passing a base path
+    // got a silent no-op — a latent footgun that masked storage-root
+    // misconfiguration.
+    this.basePath = basePath || userStorageRoot();
+  }
+
+  /** The resolved user-storage root this controller reads/writes under.
+   *  Exposed so tests can assert it matches userStorageRoot() (the property the
+   *  key-split incident violated). */
+  public getBasePath(): string {
+    return this.basePath;
   }
 
   // ===== DIRECTORY MANAGEMENT =====
