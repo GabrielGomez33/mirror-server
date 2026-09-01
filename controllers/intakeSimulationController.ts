@@ -672,6 +672,43 @@ async function runEmailHealthCheck(): Promise<{ detail: string; data?: Record<st
   };
 }
 
+// Email SEND gate: prove the pipeline end to end, not just its config. Sends a
+// real verification email through the actual template+provider path to a canary
+// recipient (STAGING_EMAIL_CANARY) and asserts the provider ACCEPTED it
+// (messageId, no error) — which exercises template render, the staging APP_URL
+// link base, and the verified sending domain. Provider-acceptance is the
+// automatable signal; true inbox DELIVERY is confirmed by the human canary box.
+// No canary configured -> warn (pipeline unproven). Under EMAIL_DRY_RUN the
+// provider isn't called, so it passes with a note rather than a real send.
+async function runEmailSendCheck(): Promise<{ detail: string; data?: Record<string, unknown>; severity?: StepSeverity }> {
+  if (!emailService.isEnabled()) {
+    return { severity: 'fail', detail: 'Email disabled — send pipeline cannot be exercised.', data: { enabled: false } };
+  }
+  const canary = (process.env.STAGING_EMAIL_CANARY || '').trim();
+  if (!canary) {
+    return {
+      severity: 'warn',
+      detail: 'STAGING_EMAIL_CANARY not set — send pipeline NOT exercised. Set a canary recipient to enable the real-send gate.',
+    };
+  }
+  const dryRun = (process.env.EMAIL_DRY_RUN || '').toLowerCase() === 'true';
+  const appUrl = (process.env.APP_URL || '').replace(/\/+$/, '');
+  const result = await emailService.sendTemplate(canary, 'email_verification', {
+    username: 'staging-canary',
+    verificationUrl: `${appUrl}/verify-email?token=CANARY_${Date.now()}`,
+  } as any);
+  if (!result.success) {
+    return { severity: 'fail', detail: `Send pipeline FAILED: ${result.error || 'unknown provider error'}`, data: { to: canary } };
+  }
+  return {
+    severity: 'pass',
+    detail: dryRun
+      ? 'Send path OK (EMAIL_DRY_RUN — provider not called; set false to exercise Resend for real).'
+      : `Real send ACCEPTED by provider (messageId=${result.messageId || 'n/a'}) -> ${canary}. Confirm delivery in the canary inbox.`,
+    data: { messageId: result.messageId, dryRun, to: canary },
+  };
+}
+
 // ----------------------------------------------------------------------------
 // TEARDOWN — guarded; only ever deletes a proven simulation user
 // ----------------------------------------------------------------------------
@@ -814,6 +851,8 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
 
     // ---- 0. EMAIL HEALTH (staging email must be enabled AND isolated) ------
     await step(steps, 'email_health', runEmailHealthCheck);
+    // ---- 0b. EMAIL SEND (exercise the real send pipeline to a canary) ------
+    await step(steps, 'email_send', runEmailSendCheck);
 
     // ---- 1. REGISTER (provision via the same fns /auth/register uses) ------
     await step(steps, 'register', async () => {
