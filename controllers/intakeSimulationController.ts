@@ -88,6 +88,8 @@ import { mirrorRedis } from '../config/redis';
 import { TokenManager } from './authController';
 import { createUserInDB, deleteUserFromDB, updateUserPassword } from './userController';
 import { listTierFiles, TierType } from './directoryController';
+import { emailService } from '../services/emailService';
+import { emailLinksLeakAcrossEnv } from '../utils/emailIsolation';
 
 const logger = new Logger('IntakeSimulation');
 
@@ -633,6 +635,42 @@ async function step(
   }
 }
 
+// Email quality gate: staging email is part of the system, so the sim proves it
+// is (a) enabled — a provider key is loaded — and (b) ISOLATED — its link bases
+// don't point at prod from a staging DB (which would email staging signups a
+// link into production). Both are hard failures. Respects EMAIL_DRY_RUN: when on
+// we never touch the provider (a live auth-check flake only warns).
+async function runEmailHealthCheck(): Promise<{ detail: string; data?: Record<string, unknown>; severity?: StepSeverity }> {
+  if (!emailService.isEnabled()) {
+    return {
+      severity: 'fail',
+      detail: 'Email service DISABLED — set EMAIL_API_KEY / RESEND_API_KEY. Staging email is part of the system.',
+      data: { enabled: false },
+    };
+  }
+  const verdict = emailLinksLeakAcrossEnv({
+    dbName: process.env.DB_NAME,
+    appUrl: process.env.APP_URL,
+    emailPublicBaseUrl: process.env.EMAIL_PUBLIC_BASE_URL,
+  });
+  if (verdict.leaksToProd) {
+    return { severity: 'fail', detail: `Email enabled but NOT isolated: ${verdict.reason}`, data: { enabled: true, ...verdict } };
+  }
+  const dryRun = (process.env.EMAIL_DRY_RUN || '').toLowerCase() === 'true';
+  if (dryRun) {
+    return { severity: 'pass', detail: 'Email enabled (GLOBAL DRY-RUN — provider not called); link base isolated.', data: { enabled: true, dryRun: true, ...verdict } };
+  }
+  // Live: a lightweight, non-sending provider auth check. A transient flake must
+  // warn (not fail CI) — enablement + isolation are the hard invariants.
+  let providerStatus = 'unknown';
+  try { providerStatus = (await emailService.healthCheck()).status; } catch { providerStatus = 'unreachable'; }
+  return {
+    severity: providerStatus === 'connected' ? 'pass' : 'warn',
+    detail: `Email enabled (provider health: ${providerStatus}); link base isolated.`,
+    data: { enabled: true, dryRun: false, providerStatus, ...verdict },
+  };
+}
+
 // ----------------------------------------------------------------------------
 // TEARDOWN — guarded; only ever deletes a proven simulation user
 // ----------------------------------------------------------------------------
@@ -767,9 +805,14 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
         }
         return { detail: `DB reachable; self base ${SELF_BASE_URL}; sim domain @${SIM_EMAIL_DOMAIN}` };
       });
-      report.status = steps.some((s) => s.severity === 'warn') ? 'passed_with_warnings' : 'passed';
+      await step(steps, 'email_health', runEmailHealthCheck);
+      const anyFail = steps.some((s) => s.severity === 'fail');
+      report.status = anyFail ? 'failed' : (steps.some((s) => s.severity === 'warn') ? 'passed_with_warnings' : 'passed');
       return report;
     }
+
+    // ---- 0. EMAIL HEALTH (staging email must be enabled AND isolated) ------
+    await step(steps, 'email_health', runEmailHealthCheck);
 
     // ---- 1. REGISTER (provision via the same fns /auth/register uses) ------
     await step(steps, 'register', async () => {
@@ -1353,7 +1396,13 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
       });
     }
 
-    report.status = warnings.length || steps.some((s) => s.severity === 'warn') ? 'passed_with_warnings' : 'passed';
+    // A non-throwing hard failure (e.g. the email_health gate returning
+    // severity:'fail') must fail the whole run — not be softened to a warning.
+    if (steps.some((s) => s.severity === 'fail')) {
+      report.status = 'failed';
+    } else {
+      report.status = warnings.length || steps.some((s) => s.severity === 'warn') ? 'passed_with_warnings' : 'passed';
+    }
     return report;
   } catch (err) {
     report.error = errMsg(err);
