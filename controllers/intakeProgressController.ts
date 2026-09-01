@@ -10,6 +10,7 @@
 import type { RequestHandler } from 'express';
 import {
   getProgress,
+  getStepDraft,
   saveStepDraft,
   completeStep,
   isCoreStep,
@@ -37,6 +38,31 @@ export const getProgressHandler: RequestHandler = async (req, res) => {
     res.json({ success: true, steps, intakeCompleted });
   } catch (err) {
     res.status(500).json({ success: false, error: 'Failed to load intake progress.' });
+  }
+};
+
+/**
+ * GET /mirror/api/intake/progress/:step — read ONE step's saved draft + status,
+ * for resuming a partially-filled step (server-backed, cross-device). The user
+ * is req.user.id (no :userId), and :step is allowlisted before any SQL, so there
+ * is no IDOR and no enum-injection surface.
+ */
+export const getProgressStepHandler: RequestHandler = async (req, res) => {
+  const userId = requireSelf(req);
+  if (userId === null) {
+    res.status(401).json({ success: false, error: 'Unauthenticated.' });
+    return;
+  }
+  const step = req.params.step;
+  if (!isCoreStep(step)) {
+    res.status(400).json({ success: false, error: 'Unknown intake step.' });
+    return;
+  }
+  try {
+    const draft = await getStepDraft(userId, step);
+    res.json({ success: true, ...draft });
+  } catch (err) {
+    res.status(500).json({ success: false, error: 'Failed to load intake draft.' });
   }
 };
 

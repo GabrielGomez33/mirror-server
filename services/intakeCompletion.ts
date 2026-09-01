@@ -16,6 +16,7 @@
 
 import { DB } from '../db';
 import type { PoolConnection } from 'mysql2/promise';
+import { sanitizeDraftState, projectStepDraft, type StepDraft } from '../utils/coreDraft';
 
 // The five deep-intake steps, in canonical order. This is the allowlist that
 // gates every `:step` path param — nothing else ever reaches SQL.
@@ -106,7 +107,10 @@ export async function saveStepDraft(
   step: CoreStep,
   draftState: unknown
 ): Promise<void> {
-  const json = draftState === undefined || draftState === null ? null : JSON.stringify(draftState);
+  // Content backstop: strip any media/blob a client tried to smuggle into the
+  // draft BEFORE it ever reaches storage (utils/coreDraft, pure + tested).
+  const clean = sanitizeDraftState(draftState);
+  const json = clean === null ? null : JSON.stringify(clean);
   if (json !== null && Buffer.byteLength(json, 'utf8') > MAX_DRAFT_BYTES) {
     throw new DraftTooLargeError();
   }
@@ -118,6 +122,22 @@ export async function saveStepDraft(
        status = IF(status = 'completed', 'completed', 'in_progress')`,
     [userId, step, json]
   );
+}
+
+/**
+ * Read ONE step's draft + status (the resume read-path). Returns a never-started
+ * shape when no row exists. draft_state is sanitized on the way IN (saveStepDraft)
+ * and projected safely on the way OUT (projectStepDraft), so a legacy/corrupt
+ * value degrades to null rather than throwing. JWT-scoped by the caller — this
+ * takes a userId, never a param, so there is no IDOR surface.
+ */
+export async function getStepDraft(userId: number, step: CoreStep): Promise<StepDraft> {
+  const [rows] = await DB.query(
+    `SELECT step_key, status, completed_at, draft_state
+       FROM core_intake_progress WHERE user_id = ? AND step_key = ? LIMIT 1`,
+    [userId, step]
+  );
+  return projectStepDraft(step, (rows as any[])[0]);
 }
 
 /**

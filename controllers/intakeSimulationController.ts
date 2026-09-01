@@ -972,6 +972,41 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
       return { detail: `Cross-user /latest/${otherId} correctly rejected — 403 FORBIDDEN_CROSS_USER` };
     });
 
+    // ---- 1f. CORE DRAFT RESUME (server-backed "come back later") -----------
+    // Prove the resumable-draft round-trip end to end: PUT a partial draft for
+    // one step, GET it back, and assert (a) the non-media answers round-trip,
+    // (b) media a client tried to smuggle in is STRIPPED (security), (c) status
+    // is in_progress. Uses the 'iq' step; iq is completed later via the real
+    // /store bridge, which cleanly overrides this in_progress row.
+    await step(steps, 'core_draft_resume', async () => {
+      const draftState = {
+        currentQuestionIndex: 7,
+        userAnswers: [1, 0, 2, 3],
+        showResult: false,
+        photoDataUrl: 'data:image/png;base64,AAAA',        // media-named key -> dropped
+        note: 'data:application/octet-stream;base64,BBBB', // data: URL value -> null
+      };
+      const put = await selfRequest('PUT', '/mirror/api/intake/progress/iq', { json: { draftState }, token: accessToken });
+      if (put.status !== 200 || put.body?.success !== true) {
+        throw new Error(`draft PUT failed: HTTP ${put.status} ${JSON.stringify(put.body)}`);
+      }
+      const get = await selfRequest('GET', '/mirror/api/intake/progress/iq', { token: accessToken });
+      if (get.status !== 200 || get.body?.success !== true) {
+        throw new Error(`draft GET failed: HTTP ${get.status} ${JSON.stringify(get.body)}`);
+      }
+      const d = get.body?.draftState;
+      if (!d || d.currentQuestionIndex !== 7 || JSON.stringify(d.userAnswers) !== JSON.stringify([1, 0, 2, 3]) || d.showResult !== false) {
+        throw new Error(`draft did not round-trip: ${JSON.stringify(d)}`);
+      }
+      if ('photoDataUrl' in d) throw new Error('SECURITY: media-named key photoDataUrl was NOT stripped from the stored draft');
+      if (d.note !== null) throw new Error(`SECURITY: data: URL under 'note' was NOT stripped (got ${JSON.stringify(d.note)})`);
+      if (get.body?.status !== 'in_progress') throw new Error(`expected status in_progress after draft save, got ${get.body?.status}`);
+      return {
+        detail: 'Draft round-trip OK — answers persisted, smuggled media stripped, status=in_progress',
+        data: { currentQuestionIndex: d.currentQuestionIndex, mediaStripped: true },
+      };
+    });
+
     // ---- 2. VISUAL (real upload -> /storage/store tier1) -------------------
     await step(steps, 'visual', async () => {
       const ref = await uploadToStorage(userId!, 'tier1', samplePhoto(), accessToken);

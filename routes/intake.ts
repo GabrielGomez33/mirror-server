@@ -12,6 +12,7 @@ import {
 import { getIqNormsHandler } from '../controllers/iqNormsController';
 import {
   getProgressHandler,
+  getProgressStepHandler,
   putProgressStepHandler,
   completeProgressStepHandler,
 } from '../controllers/intakeProgressController';
@@ -70,6 +71,9 @@ router.get('/latest/:userId', verify, selfParam, getLatestIntakeHandler);
 
 /** GET the five steps' status + derived intake completion. */
 router.get('/progress', verify, getProgressHandler);
+
+/** GET one step's saved draft + status (the resume read-path). */
+router.get('/progress/:step', verify, getProgressStepHandler);
 
 /** PUT a resumable draft for one step (server-side "come back later"). */
 router.put('/progress/:step', verify, putProgressStepHandler);
