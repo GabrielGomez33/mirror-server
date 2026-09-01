@@ -395,7 +395,11 @@ jobs:
           echo "[3/5] Build";        npm run build
           [ -f dist/index.js ] || { echo "ERROR: dist/index.js missing"; exit 1; }
           echo "[4/5] Prune";        npm prune --omit=dev
-          echo "[5/5] Restart staging PM2"; sudo pm2 restart ecosystem.staging.config.js
+          # --update-env: the app is .env-driven via dotenv.config() (no override),
+          # so a plain restart keeps any value pm2 cached in the process env and
+          # ignores later .env edits. --update-env rebuilds the env so the current
+          # .env wins (e.g. a rotated MIRROR_INTERNAL_SECRET / email creds).
+          echo "[5/5] Restart staging PM2"; sudo pm2 restart ecosystem.staging.config.js --update-env
           sleep 15; sudo pm2 list | grep -E 'staging' || true
           DEPLOY
 
