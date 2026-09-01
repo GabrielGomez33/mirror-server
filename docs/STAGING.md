@@ -81,9 +81,32 @@ Copy each service's `.env.example` to a **staging** env file and apply the
 # distinct staging secrets (never reuse prod's):
 openssl rand -hex 48   # JWT_SECRET / JWT_REFRESH_SECRET / SYSTEM_MASTER_KEY / MIRROR_INTERNAL_SECRET
 ```
-Set `EMAIL_DRY_RUN=true` in staging so it can never send real email.
 The staging `MIRROR_INTERNAL_SECRET` must match between mirror-server-staging
 and admin-server-staging.
+
+**Email (staging).** Staging email uses the SAME variable NAMES as prod — only
+the VALUES differ. Two invariants (both enforced by the `email_health` staging-
+acceptance gate, and unit-proven in `tests/emailIsolation.test.ts`):
+1. **Enabled** — a provider key is set (`RESEND_API_KEY` / `EMAIL_API_KEY`), so
+   `/health` reports `email:enabled` and the `email-campaign-worker` (in
+   `ecosystem.staging.config.js`) has something to send with.
+2. **Isolated** — `APP_URL` and `EMAIL_PUBLIC_BASE_URL` point at the **staging**
+   origin, never prod. Otherwise a staging signup's verification link resolves
+   to production (the token lives in `mirror_staging`, so it fails on prod and
+   hands the tester to the live app). The gate fails a staging run if a link
+   base resolves to the prod host.
+
+Two ways to run it, both isolated:
+- **Separate key + staging sending subdomain** (recommended, true separation):
+  own `RESEND_API_KEY`, `EMAIL_FROM_ADDRESS=noreply@staging.<domain>`,
+  `EMAIL_DRY_RUN=false`. Staging bounces/quota/suppression never touch the prod
+  domain. Real emails deliver — click-the-link testing works end to end.
+- **Shared key + dry-run** (interim, zero external setup): reuse the prod
+  `RESEND_API_KEY` but set `EMAIL_DRY_RUN=true`. The provider is loaded
+  (`email:enabled`, gate passes) but is NEVER called — no sends, no prod
+  reputation/quota/webhook intertwining. Read verification links from
+  `pm2 logs mirror-server-staging`. Flip to `false` briefly for a one-off real
+  send to your own inbox.
 
 ### 4. PM2 (staging apps)
 Each server repo ships an `ecosystem.staging.config.js` (staging app names +
