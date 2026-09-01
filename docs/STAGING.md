@@ -120,6 +120,21 @@ Two ways to run it, both isolated:
   `pm2 logs mirror-server-staging`. Flip to `false` briefly for a one-off real
   send to your own inbox.
 
+**Notifications (web push / VAPID).** Push runs inside mirror-server (routes
+`/mirror/api/push`), so it is already part of the staging stack — it only needs
+its OWN VAPID keypair. Generate a distinct one and put it in the staging `.env`:
+```bash
+npx web-push generate-vapid-keys   # -> VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY
+```
+Set `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, and `VAPID_SUBJECT` (e.g.
+`mailto:ops@staging.<domain>`) in the staging env. **Never reuse prod's keys:**
+a browser push subscription is bound to BOTH the applicationServerKey (the public
+key) AND the origin, so sharing keys crosses environments. No client change is
+needed — the client fetches the public key at runtime from
+`GET /mirror/api/push/vapid-public-key`, so the staging client automatically
+subscribes with the staging key. The staging-acceptance `push_health` gate warns
+if the keypair is unset (notifications unconfigured) and passes once it is set.
+
 ### 4. PM2 (staging apps)
 Each server repo ships an `ecosystem.staging.config.js` (staging app names +
 staging env file + staging port). Start them once:

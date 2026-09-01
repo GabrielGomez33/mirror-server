@@ -90,6 +90,7 @@ import { createUserInDB, deleteUserFromDB, updateUserPassword } from './userCont
 import { listTierFiles, TierType } from './directoryController';
 import { emailService } from '../services/emailService';
 import { emailLinksLeakAcrossEnv } from '../utils/emailIsolation';
+import { getVapidPublicKey } from '../services/pushService';
 
 const logger = new Logger('IntakeSimulation');
 
@@ -671,6 +672,31 @@ async function runEmailHealthCheck(): Promise<{ detail: string; data?: Record<st
   };
 }
 
+// Push (web-notification) health gate: prove staging has its OWN VAPID keypair
+// configured, so notifications work AND stay isolated from prod. The client
+// fetches this public key at runtime from /mirror/api/push/vapid-public-key, so
+// a present, well-shaped key here means the whole staging push path is wired.
+// Unset -> warn (notifications unconfigured; not intake-critical, so non-blocking).
+async function runPushHealthCheck(): Promise<{ detail: string; data?: Record<string, unknown>; severity?: StepSeverity }> {
+  const key = getVapidPublicKey();
+  if (!key) {
+    return {
+      severity: 'warn',
+      detail: 'Web push DISABLED — no VAPID_PUBLIC_KEY set. Generate a DISTINCT staging keypair (npx web-push generate-vapid-keys) so notifications work in staging.',
+      data: { enabled: false },
+    };
+  }
+  // A base64url-encoded uncompressed P-256 public key is 87–88 chars.
+  const looksValid = /^[A-Za-z0-9_-]{80,100}$/.test(key);
+  return {
+    severity: looksValid ? 'pass' : 'warn',
+    detail: looksValid
+      ? 'Web push enabled — staging VAPID public key present (client fetches it at runtime; isolated from prod).'
+      : 'VAPID_PUBLIC_KEY is set but its shape is unexpected for a base64url P-256 key — verify the staging keypair.',
+    data: { enabled: true, keyLength: key.length },
+  };
+}
+
 // Email SEND gate: prove the pipeline end to end, not just its config. Sends a
 // real verification email through the actual template+provider path to a canary
 // recipient (STAGING_EMAIL_CANARY) and asserts the provider ACCEPTED it
@@ -843,6 +869,7 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
         return { detail: `DB reachable; self base ${SELF_BASE_URL}; sim domain @${SIM_EMAIL_DOMAIN}` };
       });
       await step(steps, 'email_health', runEmailHealthCheck);
+      await step(steps, 'push_health', runPushHealthCheck);
       const anyFail = steps.some((s) => s.severity === 'fail');
       report.status = anyFail ? 'failed' : (steps.some((s) => s.severity === 'warn') ? 'passed_with_warnings' : 'passed');
       return report;
@@ -852,6 +879,8 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
     await step(steps, 'email_health', runEmailHealthCheck);
     // ---- 0b. EMAIL SEND (exercise the real send pipeline to a canary) ------
     await step(steps, 'email_send', runEmailSendCheck);
+    // ---- 0c. PUSH HEALTH (staging web-push notifications configured + isolated)
+    await step(steps, 'push_health', runPushHealthCheck);
 
     // ---- 1. REGISTER (provision via the same fns /auth/register uses) ------
     await step(steps, 'register', async () => {
