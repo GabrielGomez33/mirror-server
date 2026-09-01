@@ -67,6 +67,12 @@ export interface StepDraft {
   status: StepStatus;
   completedAt: string | null;
   draftState: Record<string, unknown> | null;
+  // TOMBSTONE flag for cross-device authoritative erase. A `not_started` ROW only
+  // ever exists because an explicit erase turned an in-progress draft into one
+  // (a never-started step has NO row). So `erased` = "a row exists and it is
+  // not_started" is the durable signal a second device reads on hydrate to wipe
+  // its own stale local draft. false for a completed/in-progress row or no row.
+  erased: boolean;
 }
 
 /**
@@ -76,7 +82,7 @@ export interface StepDraft {
  * non-object / unparseable value degrades safely to null rather than throwing.
  */
 export function projectStepDraft(step: CoreStep, row: Record<string, any> | undefined | null): StepDraft {
-  if (!row) return { step, status: 'not_started', completedAt: null, draftState: null };
+  if (!row) return { step, status: 'not_started', completedAt: null, draftState: null, erased: false };
   let draftState: Record<string, unknown> | null = null;
   const raw = row.draft_state;
   if (raw !== null && raw !== undefined) {
@@ -89,10 +95,12 @@ export function projectStepDraft(step: CoreStep, row: Record<string, any> | unde
       draftState = null;
     }
   }
+  const status = (row.status as StepStatus) ?? 'not_started';
   return {
     step,
-    status: (row.status as StepStatus) ?? 'not_started',
+    status,
     completedAt: row.completed_at ? new Date(row.completed_at).toISOString() : null,
     draftState,
+    erased: status === 'not_started', // a row that is not_started is an erase tombstone
   };
 }
