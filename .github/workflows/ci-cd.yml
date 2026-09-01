@@ -470,17 +470,23 @@ jobs:
       - name: Run intake simulation against staging
         run: |
           # Loopback call on the host to staging mirror-server's internal
-          # simulation API (gated by the STAGING internal secret). dryRun=false,
-          # cleanup on (default) so the throwaway sim user is deleted after.
+          # simulation API (gated by MIRROR_INTERNAL_SECRET). That secret is a
+          # RUNTIME admin<->mirror secret living in the staging server's .env —
+          # NOT a CI secret. We read it from that .env over the SSH we already
+          # have (single source of truth), rather than duplicating it into
+          # GitHub where it would drift. dryRun=false, cleanup on (default).
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} \
-            "curl -sk -X POST https://127.0.0.1:9444/mirror/api/admin/simulation/intake/run \
+            "cd '${{ secrets.STAGING_DEPLOY_PATH }}' && \
+             SECRET=\$(grep -E '^MIRROR_INTERNAL_SECRET=' .env | head -n1 | cut -d= -f2-) && \
+             if [ -z \"\$SECRET\" ]; then echo '{\"data\":{\"status\":\"missing\"},\"error\":\"MIRROR_INTERNAL_SECRET absent in staging .env\"}'; exit 0; fi && \
+             curl -sk -X POST https://127.0.0.1:9444/mirror/api/admin/simulation/intake/run \
                -H 'Content-Type: application/json' \
-               -H 'x-internal-secret: ${{ secrets.STAGING_MIRROR_INTERNAL_SECRET }}' \
+               -H \"x-internal-secret: \$SECRET\" \
                -H 'x-admin-user: ci-acceptance' \
                -d '{\"dryRun\":false,\"label\":\"ci-staging-acceptance\"}'" > sim.json
           echo "--- simulation report ---"; cat sim.json | python3 -m json.tool || cat sim.json
-          STATUS=$(python3 -c "import json;print(json.load(open('sim.json')).get('data',{}).get('status','missing'))")
+          STATUS=$(python3 -c "import json; print(json.load(open('sim.json')).get('data',{}).get('status','missing'))" 2>/dev/null || echo missing)
           echo "sim status: $STATUS"
           if [ "$STATUS" = "failed" ] || [ "$STATUS" = "missing" ]; then
             echo "::error::Staging acceptance FAILED — intake simulation status=$STATUS. Do not promote."
