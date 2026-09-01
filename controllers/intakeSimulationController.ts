@@ -657,18 +657,17 @@ async function runEmailHealthCheck(): Promise<{ detail: string; data?: Record<st
   if (verdict.leaksToProd) {
     return { severity: 'fail', detail: `Email enabled but NOT isolated: ${verdict.reason}`, data: { enabled: true, ...verdict } };
   }
+  // Deliberately NO live verifyConnection() probe here: a send-scoped provider
+  // key (correct least-privilege for staging) can't read the account/domains
+  // endpoint that probe hits, so it reports "unhealthy" even when sending works
+  // perfectly — a false alarm that erodes trust in the gate. The authoritative
+  // send proof is the separate email_send step (a real accepted send). This step
+  // asserts the two deterministic invariants: enabled + isolated.
   const dryRun = (process.env.EMAIL_DRY_RUN || '').toLowerCase() === 'true';
-  if (dryRun) {
-    return { severity: 'pass', detail: 'Email enabled (GLOBAL DRY-RUN — provider not called); link base isolated.', data: { enabled: true, dryRun: true, ...verdict } };
-  }
-  // Live: a lightweight, non-sending provider auth check. A transient flake must
-  // warn (not fail CI) — enablement + isolation are the hard invariants.
-  let providerStatus = 'unknown';
-  try { providerStatus = (await emailService.healthCheck()).status; } catch { providerStatus = 'unreachable'; }
   return {
-    severity: providerStatus === 'connected' ? 'pass' : 'warn',
-    detail: `Email enabled (provider health: ${providerStatus}); link base isolated.`,
-    data: { enabled: true, dryRun: false, providerStatus, ...verdict },
+    severity: 'pass',
+    detail: `Email enabled and isolated (staging link base + sender)${dryRun ? '; GLOBAL DRY-RUN' : ''}. Real-send proof: see email_send.`,
+    data: { enabled: true, dryRun, ...verdict },
   };
 }
 
