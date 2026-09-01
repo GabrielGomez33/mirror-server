@@ -1001,9 +1001,40 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
       if ('photoDataUrl' in d) throw new Error('SECURITY: media-named key photoDataUrl was NOT stripped from the stored draft');
       if (d.note !== null) throw new Error(`SECURITY: data: URL under 'note' was NOT stripped (got ${JSON.stringify(d.note)})`);
       if (get.body?.status !== 'in_progress') throw new Error(`expected status in_progress after draft save, got ${get.body?.status}`);
+
+      // ---- ERASE: DELETE resets an in-progress draft to not_started ----------
+      const del = await selfRequest('DELETE', '/mirror/api/intake/progress/iq', { token: accessToken });
+      if (del.status !== 200 || del.body?.success !== true) {
+        throw new Error(`draft DELETE failed: HTTP ${del.status} ${JSON.stringify(del.body)}`);
+      }
+      if (del.body?.reset !== true) throw new Error('expected reset=true when erasing an in-progress draft');
+      const afterErase = await selfRequest('GET', '/mirror/api/intake/progress/iq', { token: accessToken });
+      if (afterErase.body?.status !== 'not_started') {
+        throw new Error(`erase did not reset step: expected not_started, got ${afterErase.body?.status}`);
+      }
+      if (afterErase.body?.draftState !== null) {
+        throw new Error(`erase left a draft behind: ${JSON.stringify(afterErase.body?.draftState)}`);
+      }
+
+      // ---- INVARIANT: DELETE NEVER downgrades a COMPLETED step ---------------
+      // Complete the step, then attempt to erase it: the guard must leave it
+      // completed (protects the completion invariant + any commit/erase race).
+      const done = await selfRequest('POST', '/mirror/api/intake/progress/iq/complete', { json: {}, token: accessToken });
+      if (done.status !== 200 || done.body?.success !== true) {
+        throw new Error(`completing iq failed: HTTP ${done.status} ${JSON.stringify(done.body)}`);
+      }
+      const delDone = await selfRequest('DELETE', '/mirror/api/intake/progress/iq', { token: accessToken });
+      if (delDone.body?.reset !== false) {
+        throw new Error('SECURITY/INVARIANT: DELETE reported it erased a COMPLETED step (reset should be false)');
+      }
+      const afterGuard = await selfRequest('GET', '/mirror/api/intake/progress/iq', { token: accessToken });
+      if (afterGuard.body?.status !== 'completed') {
+        throw new Error(`SECURITY/INVARIANT: DELETE downgraded a completed step to ${afterGuard.body?.status}`);
+      }
+
       return {
-        detail: 'Draft round-trip OK — answers persisted, smuggled media stripped, status=in_progress',
-        data: { currentQuestionIndex: d.currentQuestionIndex, mediaStripped: true },
+        detail: 'Draft round-trip + media strip OK; erase resets to not_started; DELETE never downgrades a completed step',
+        data: { currentQuestionIndex: d.currentQuestionIndex, mediaStripped: true, eraseResets: true, completedGuardHeld: true },
       };
     });
 

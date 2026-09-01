@@ -14,6 +14,7 @@ import {
   getProgressHandler,
   getProgressStepHandler,
   putProgressStepHandler,
+  resetProgressStepHandler,
   completeProgressStepHandler,
 } from '../controllers/intakeProgressController';
 
@@ -77,6 +78,9 @@ router.get('/progress/:step', verify, getProgressStepHandler);
 
 /** PUT a resumable draft for one step (server-side "come back later"). */
 router.put('/progress/:step', verify, putProgressStepHandler);
+
+/** DELETE a resumable draft for one step (the "erase progress" affordance). */
+router.delete('/progress/:step', verify, resetProgressStepHandler);
 
 /** POST to mark one step complete and re-derive intake_completed. */
 router.post('/progress/:step/complete', verify, completeProgressStepHandler);

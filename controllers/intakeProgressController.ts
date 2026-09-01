@@ -12,6 +12,7 @@ import {
   getProgress,
   getStepDraft,
   saveStepDraft,
+  resetStepDraft,
   completeStep,
   isCoreStep,
   isIntakeComplete,
@@ -87,6 +88,32 @@ export const putProgressStepHandler: RequestHandler = async (req, res) => {
       return;
     }
     res.status(500).json({ success: false, error: 'Failed to save intake draft.' });
+  }
+};
+
+/**
+ * DELETE /mirror/api/intake/progress/:step — erase a resumable draft, resetting
+ * the step to not_started. Self-scoped by the JWT (no :userId) and allowlisted
+ * on :step, same as the sibling handlers. A completed step is never affected
+ * (the service guards WHERE status <> 'completed'); `reset` reports whether an
+ * in-progress draft was actually removed.
+ */
+export const resetProgressStepHandler: RequestHandler = async (req, res) => {
+  const userId = requireSelf(req);
+  if (userId === null) {
+    res.status(401).json({ success: false, error: 'Unauthenticated.' });
+    return;
+  }
+  const step = req.params.step;
+  if (!isCoreStep(step)) {
+    res.status(400).json({ success: false, error: 'Unknown intake step.' });
+    return;
+  }
+  try {
+    const reset = await resetStepDraft(userId, step);
+    res.json({ success: true, reset });
+  } catch (err) {
+    res.status(500).json({ success: false, error: 'Failed to reset intake draft.' });
   }
 };
 
