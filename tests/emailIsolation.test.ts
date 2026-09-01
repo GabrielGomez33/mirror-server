@@ -50,9 +50,22 @@ const v = emailLinksLeakAcrossEnv({ dbName: 'mirror_staging', appUrl: PROD, emai
 ok(/APP_URL/.test(v.reason) && !/EMAIL_PUBLIC_BASE_URL/.test(v.reason), 'reason names only the offending var');
 
 // ---------------------------------------------------------------------------
+group('sender-domain isolation — staging must not send as the bare prod domain');
+ok(emailLinksLeakAcrossEnv({ dbName: 'mirror_staging', appUrl: STAGE, emailPublicBaseUrl: STAGE_BASE, fromAddress: 'noreply@theundergroundrailroad.world' }).leaksToProd === true,
+  'staging sending as bare prod domain -> LEAK');
+ok(/EMAIL_FROM_ADDRESS/.test(emailLinksLeakAcrossEnv({ dbName: 'mirror_staging', appUrl: STAGE, emailPublicBaseUrl: STAGE_BASE, fromAddress: 'noreply@theundergroundrailroad.world' }).reason),
+  'reason names EMAIL_FROM_ADDRESS');
+ok(emailLinksLeakAcrossEnv({ dbName: 'mirror_staging', appUrl: STAGE, emailPublicBaseUrl: STAGE_BASE, fromAddress: 'noreply@staging.theundergroundrailroad.world' }).leaksToProd === false,
+  'staging subdomain sender -> isolated (OK)');
+ok(emailLinksLeakAcrossEnv({ dbName: 'mirror', appUrl: PROD, emailPublicBaseUrl: PROD_BASE, fromAddress: 'noreply@theundergroundrailroad.world' }).leaksToProd === false,
+  'prod sending as prod domain -> NOT a leak');
+ok(emailLinksLeakAcrossEnv({ dbName: 'mirror_staging' }).leaksToProd === false,
+  'no from-address set -> no sender leak');
+
+// ---------------------------------------------------------------------------
 group('no leak — staging correctly isolated');
-ok(emailLinksLeakAcrossEnv({ dbName: 'mirror_staging', appUrl: STAGE, emailPublicBaseUrl: STAGE_BASE }).leaksToProd === false,
-  'staging + staging bases -> isolated');
+ok(emailLinksLeakAcrossEnv({ dbName: 'mirror_staging', appUrl: STAGE, emailPublicBaseUrl: STAGE_BASE, fromAddress: 'noreply@staging.theundergroundrailroad.world' }).leaksToProd === false,
+  'staging + staging bases + staging sender -> isolated');
 ok(emailLinksLeakAcrossEnv({ dbName: 'mirror_staging', appUrl: STAGE, emailPublicBaseUrl: STAGE_BASE }).isStaging === true,
   'still reported as staging');
 
