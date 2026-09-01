@@ -652,6 +652,7 @@ async function runEmailHealthCheck(): Promise<{ detail: string; data?: Record<st
     dbName: process.env.DB_NAME,
     appUrl: process.env.APP_URL,
     emailPublicBaseUrl: process.env.EMAIL_PUBLIC_BASE_URL,
+    fromAddress: process.env.EMAIL_FROM_ADDRESS,
   });
   if (verdict.leaksToProd) {
     return { severity: 'fail', detail: `Email enabled but NOT isolated: ${verdict.reason}`, data: { enabled: true, ...verdict } };
