@@ -165,8 +165,15 @@ function logSecurityEvent(event: string, details: any): void {
 // ENVIRONMENT SETUP
 // ============================================================================
 
-// Load environment variables
-dotenv.config();
+// Load environment variables.
+// override:true makes .env the AUTHORITATIVE source — it wins over any value
+// already present in the process/pm2-daemon environment. Without this, dotenv's
+// default (no override) lets a stale ambient var (e.g. an EMAIL_PUBLIC_BASE_URL
+// captured into the pm2 daemon from an earlier config) silently shadow the
+// current .env — which is exactly how a staging box kept emitting prod email
+// bases after its .env had been corrected. This app is fully .env-driven, so
+// .env winning is the intended, drift-proof behavior in every environment.
+dotenv.config({ override: true });
 
 // Validate required environment variables
 const requiredEnvs = [
