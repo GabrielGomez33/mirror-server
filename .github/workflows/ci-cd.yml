@@ -66,6 +66,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    # Throwaway MySQL for the DB-backed integration proof (draft storage +
+    # the never-downgrade-completed invariant). Ephemeral to the job; the test
+    # creates/drops its own tables in mirror_ci_test and touches nothing else.
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: ci_root_pw
+          MYSQL_DATABASE: mirror_ci_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci_root_pw"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=15
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -88,6 +105,21 @@ jobs:
       # previously reached production unnoticed because CI ran no tests.
       - name: Unit tests
         run: npm run test:ci
+
+      # BLOCKING: DB-backed integration proof against the throwaway MySQL above.
+      # Proves what only a real database can — the draft round-trip, media strip
+      # on store, and the data-integrity INVARIANT that a completed step can
+      # never be downgraded by a re-save or an erase. INTEGRATION_DB=1 makes the
+      # test run (it self-skips without it) and DB_NAME must match /test|ci/i or
+      # the test refuses to run its destructive DDL.
+      - name: Integration tests (DB round-trip + reset invariant)
+        env:
+          INTEGRATION_DB: '1'
+          DB_HOST: 127.0.0.1
+          DB_USER: root
+          DB_PASSWORD: ci_root_pw
+          DB_NAME: mirror_ci_test
+        run: npm run test:db
 
       - name: Build production artifacts
         run: npm run build
