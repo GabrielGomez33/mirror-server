@@ -1038,6 +1038,32 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
       };
     });
 
+    // ---- 1c. CONVERSION ANALYTICS (anonymous ingest reachability + validation)
+    await step(steps, 'conversion_analytics', async () => {
+      // Valid funnel event → 204 (accepted). Anonymous endpoint; no token needed.
+      const good = await selfRequest('POST', '/mirror/api/analytics/conversion', {
+        json: { stage: 'signup_completed', sessionToken: '11111111-2222-4333-8444-555566667777', utmSource: 'instagram', surface: 'web' },
+      });
+      if (good.status !== 204) throw new Error(`valid conversion event expected 204, got ${good.status}`);
+
+      // Unknown stage → 400 (rejected, never stored).
+      const bad = await selfRequest('POST', '/mirror/api/analytics/conversion', { json: { stage: 'definitely_not_a_stage' } });
+      if (bad.status !== 400) throw new Error(`unknown stage expected 400, got ${bad.status}`);
+
+      // Smuggled PII on a VALID stage → still 204, and the allowlist sanitizer
+      // guarantees only funnel fields are stored (proven exhaustively in the unit
+      // + integration tests; here we prove the endpoint accepts without error).
+      const pii = await selfRequest('POST', '/mirror/api/analytics/conversion', {
+        json: { stage: 'landing_view', email: 'victim@example.com', userId: 42, ip: '203.0.113.7', birthDate: '1990-01-01' },
+      });
+      if (pii.status !== 204) throw new Error(`PII-laden valid-stage event expected 204, got ${pii.status}`);
+
+      return {
+        detail: 'Conversion ingest OK — valid=204, unknown stage=400, PII-laden accepted (allowlist strips at store)',
+        data: { validAccepted: true, unknownRejected: true, piiEndpointOk: true },
+      };
+    });
+
     // ---- 2. VISUAL (real upload -> /storage/store tier1) -------------------
     await step(steps, 'visual', async () => {
       const ref = await uploadToStorage(userId!, 'tier1', samplePhoto(), accessToken);

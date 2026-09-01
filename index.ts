@@ -115,8 +115,10 @@ import { emailService } from './services/emailService';
 // ============================================================================
 import adminEmailRoutes from './routes/adminEmail';
 import adminSimulationRoutes from './routes/adminSimulation';
+import analyticsAdminRoutes from './routes/analyticsAdmin';
 import emailPublicRoutes from './routes/emailPublic';
 import waitlistRoutes from './routes/waitlist';
+import analyticsRoutes from './routes/analytics';
 
 // ============================================================================
 // ERROR HANDLING UTILITIES
@@ -331,6 +333,11 @@ APP.use(((req, res, next) => {
 // shared secret (requireInternalSecret) over localhost.
 APP.use('/mirror/api/admin/email', express.json({ limit: process.env.EMAIL_JSON_LIMIT || '12mb', strict: true }) as express.RequestHandler);
 
+// Anonymous conversion-funnel beacons are tiny; cap them tightly (before the
+// global parser wins for this path) so a hostile client can't post a large body
+// to the public ingest endpoint.
+APP.use('/mirror/api/analytics', express.json({ limit: '8kb', strict: true }) as express.RequestHandler);
+
 // Request body parsing with size limits
 APP.use(express.json({ limit: '100kb', strict: true }));
 APP.use(express.urlencoded({ extended: false, limit: '50kb' }));
@@ -398,6 +405,14 @@ console.log('[ROUTES] Public email routes mounted at /mirror/api/email (unsubscr
 APP.use('/mirror/api/waitlist', waitlistRoutes);
 console.log('[ROUTES] Public waitlist route mounted at /mirror/api/waitlist');
 
+// Public anonymous conversion-funnel ingest — NO auth/subscription gate. Visitors
+// (often pre-signup) POST funnel-stage beacons here. The events are anonymous +
+// aggregate (no user id, no IP/UA stored); protection is the allowlist sanitizer
+// + per-IP rate limit in the controller, plus origin-restricted CORS. Must stay
+// ungated. Admin aggregate/compliance reads live behind the internal secret.
+APP.use('/mirror/api/analytics', analyticsRoutes);
+console.log('[ROUTES] Public conversion-analytics ingest mounted at /mirror/api/analytics');
+
 // Admin email broadcasts — reached only by the admin-server over localhost,
 // gated by the internal shared secret inside the router (requireInternalSecret).
 APP.use('/mirror/api/admin/email', adminEmailRoutes);
@@ -408,6 +423,12 @@ console.log('[ROUTES] Admin email routes mounted at /mirror/api/admin/email');
 // Runs a real end-to-end intake against a throwaway sim user, then deletes it.
 APP.use('/mirror/api/admin/simulation', adminSimulationRoutes);
 console.log('[ROUTES] Admin intake-simulation routes mounted at /mirror/api/admin/simulation');
+
+// Admin conversion-analytics + compliance — reached only by the admin-server
+// over localhost, gated by the internal shared secret (requireInternalSecret).
+// Aggregate funnel reads + the live, drift-proof compliance record for entities.
+APP.use('/mirror/api/admin/analytics', analyticsAdminRoutes);
+console.log('[ROUTES] Admin analytics/compliance routes mounted at /mirror/api/admin/analytics');
 
 // ============================================================================
 // MOUNT MIRRORGROUPS ROUTES (PHASE 1 + PHASE 3 + PHASE 4)
