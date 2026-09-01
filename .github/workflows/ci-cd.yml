@@ -482,7 +482,7 @@ jobs:
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
             ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} \
             "cd '${{ secrets.STAGING_DEPLOY_PATH }}' && \
-             SECRET=\$(grep -E '^MIRROR_INTERNAL_SECRET=' .env | head -n1 | cut -d= -f2-) && \
+             SECRET=\$(node -e \"require('dotenv').config();process.stdout.write((process.env.MIRROR_INTERNAL_SECRET||'').trim())\") && \
              if [ -z \"\$SECRET\" ]; then echo '{\"data\":{\"status\":\"missing\"},\"error\":\"MIRROR_INTERNAL_SECRET absent in staging .env\"}'; exit 0; fi && \
              curl -sk -X POST https://127.0.0.1:9444/mirror/api/admin/simulation/intake/run \
                -H 'Content-Type: application/json' \
