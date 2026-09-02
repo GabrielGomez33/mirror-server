@@ -407,19 +407,40 @@ cd /var/www/staging/dina-server && sudo pm2 start ecosystem.staging.config.js &&
 curl -sk https://127.0.0.1:9445/dina/api/v1/health    # -> {"status":"healthy",...}
 ```
 
-## D6 — wire mirror-staging -> dina-staging (real DINA, and close the isolation leak)
-In mirror-staging's `.env` (mirror's DinaWebSocketClient defaults to prod 8445 if
-DINA_WS_URL is unset — always set it):
+## D6 — wire mirror-staging -> dina-staging THE SAME WAY PROD DOES (equivalence)
+Staging must reach dina through the PUBLIC ORIGIN fronted by the reverse proxy
+with a VALID cert — exactly as prod does (`https://www.theundergroundrailroad
+.world/dina/...`) — NOT loopback `127.0.0.1:9445`. Why this matters: the
+personal-analysis and truthstream workers call dina with a plain `fetch` that
+verifies TLS. Against a loopback self-signed cert that fetch fails ("fetch
+failed"), so personal analysis never completes and its completion push
+notification never fires — a divergence that makes staging NOT a faithful
+reflection of prod. (The @Dina WS client tolerated loopback via
+`rejectUnauthorized:false`, which is exactly why dina-chat "worked" while
+personal-analysis silently failed — masking the divergence.)
+
+1) Staging vhost — proxy `/dina` + `/dina/ws` to dina-staging (mirror how prod
+   proxies `/dina` -> 8445). The `staging.theundergroundrailroad.world` TLS cert
+   already exists, so the workers get a valid cert:
+```apache
+   # inside the staging.theundergroundrailroad.world :443 vhost
+   ProxyPass        /dina/ws  ws://127.0.0.1:9445/dina/ws
+   ProxyPassReverse /dina/ws  ws://127.0.0.1:9445/dina/ws
+   ProxyPass        /dina     http://127.0.0.1:9445/dina
+   ProxyPassReverse /dina     http://127.0.0.1:9445/dina
+```
+2) mirror-staging `.env` — point every dina link at the PUBLIC staging origin:
 ```
 USE_DINA_STUB=false
-DINA_ENDPOINT=https://127.0.0.1:9445/dina/api/v1/
-DINA_WS_URL=wss://127.0.0.1:9445/dina/ws
-DINA_SERVER_URL=https://127.0.0.1:9445
+DINA_ENDPOINT=https://staging.theundergroundrailroad.world/dina/api/v1
+DINA_WS_URL=wss://staging.theundergroundrailroad.world/dina/ws
+DINA_SERVER_URL=https://staging.theundergroundrailroad.world
 ```
-`sudo pm2 restart ecosystem.staging.config.js --update-env`, then re-run the sim —
-`group_dina_chat` must report "@Dina replied in group chat" (a real LLM answer,
-proven in dina-server-staging logs). The mirror WS client uses
-`rejectUnauthorized:false`, so the prod cert on the loopback listener is fine.
+`sudo pm2 restart ecosystem.staging.config.js --update-env`, then re-run the sim.
+`group_dina_chat` must report "@Dina replied in group chat", AND a
+`personal-analysis` job must reach `status='completed'` (dina-staging log shows
+the generate call), which fires the `personal_analysis_complete` push. No TLS
+verification is relaxed anywhere — the path is byte-for-byte the prod shape.
 
 ## D7 — reference data (see Step 2b): the Dina system user (mirror_staging.users
 id DINA_USER_ID_SQL) MUST be seeded, or @Dina generates a reply but cannot insert
