@@ -408,39 +408,36 @@ curl -sk https://127.0.0.1:9445/dina/api/v1/health    # -> {"status":"healthy",.
 ```
 
 ## D6 — wire mirror-staging -> dina-staging THE SAME WAY PROD DOES (equivalence)
-Staging must reach dina through the PUBLIC ORIGIN fronted by the reverse proxy
-with a VALID cert — exactly as prod does (`https://www.theundergroundrailroad
-.world/dina/...`) — NOT loopback `127.0.0.1:9445`. Why this matters: the
-personal-analysis and truthstream workers call dina with a plain `fetch` that
-verifies TLS. Against a loopback self-signed cert that fetch fails ("fetch
-failed"), so personal analysis never completes and its completion push
-notification never fires — a divergence that makes staging NOT a faithful
-reflection of prod. (The @Dina WS client tolerated loopback via
-`rejectUnauthorized:false`, which is exactly why dina-chat "worked" while
-personal-analysis silently failed — masking the divergence.)
+Address dina by the DOMAIN NAME on its port, exactly like prod — prod uses
+`https://www.theundergroundrailroad.world:8445` (BASE/WS) directly on dina's
+port. Staging is identical with the staging PORT 9445. No reverse proxy.
 
-1) Staging vhost — proxy `/dina` + `/dina/ws` to dina-staging (mirror how prod
-   proxies `/dina` -> 8445). The `staging.theundergroundrailroad.world` TLS cert
-   already exists, so the workers get a valid cert:
-```apache
-   # inside the staging.theundergroundrailroad.world :443 vhost
-   ProxyPass        /dina/ws  ws://127.0.0.1:9445/dina/ws
-   ProxyPassReverse /dina/ws  ws://127.0.0.1:9445/dina/ws
-   ProxyPass        /dina     http://127.0.0.1:9445/dina
-   ProxyPassReverse /dina     http://127.0.0.1:9445/dina
-```
-2) mirror-staging `.env` — point every dina link at the PUBLIC staging origin:
+Why the DOMAIN, never the IP: the personal-analysis / truthstream workers call
+dina with a plain `fetch` that verifies TLS, and TLS is verified against the URL
+HOSTNAME, not the port. dina's cert is the domain cert (valid for
+`www.theundergroundrailroad.world`; staging reuses the prod cert). So
+`https://127.0.0.1:9445` FAILS (the IP isn't on the cert → "fetch failed" →
+personal analysis never completes → its completion push never fires), while
+`https://www.theundergroundrailroad.world:9445` VERIFIES (hostname matches) and
+`:9445` is a distinct port so it reaches dina-STAGING, not prod dina. The port
+was never the issue — using the IP instead of the domain name was. (The @Dina WS
+client set `rejectUnauthorized:false`, so it tolerated the IP — which is exactly
+why dina-chat "worked" while personal-analysis silently failed, masking it.)
+
+mirror-staging `.env` — mirror prod, changing only the port 8445 -> 9445:
 ```
 USE_DINA_STUB=false
-DINA_ENDPOINT=https://staging.theundergroundrailroad.world/dina/api/v1
-DINA_WS_URL=wss://staging.theundergroundrailroad.world/dina/ws
-DINA_SERVER_URL=https://staging.theundergroundrailroad.world
+DINA_ENDPOINT=https://www.theundergroundrailroad.world:9445/dina/api/v1/
+DINA_WS_URL=wss://www.theundergroundrailroad.world:9445/dina/ws
+DINA_BASE_URL=https://www.theundergroundrailroad.world:9445
+DINA_SERVER_URL=https://www.theundergroundrailroad.world
 ```
 `sudo pm2 restart ecosystem.staging.config.js --update-env`, then re-run the sim.
-`group_dina_chat` must report "@Dina replied in group chat", AND a
-`personal-analysis` job must reach `status='completed'` (dina-staging log shows
-the generate call), which fires the `personal_analysis_complete` push. No TLS
-verification is relaxed anywhere — the path is byte-for-byte the prod shape.
+The `dina_http` gate must pass, `group_dina_chat` must report "@Dina replied in
+group chat", AND a `personal-analysis` job must reach `status='completed'`
+(dina-staging log shows the generate call), which fires the
+`personal_analysis_complete` push. No TLS verification is relaxed anywhere — the
+path is byte-for-byte the prod shape.
 
 ## D7 — reference data (see Step 2b): the Dina system user (mirror_staging.users
 id DINA_USER_ID_SQL) MUST be seeded, or @Dina generates a reply but cannot insert

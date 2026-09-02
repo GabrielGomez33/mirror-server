@@ -730,8 +730,9 @@ async function runDinaHttpHealthCheck(): Promise<{ detail: string; data?: Record
       severity: 'fail',
       detail:
         `DINA HTTP fetch FAILED to ${host}: ${(err as Error).message}. ` +
-        `If dina is configured on loopback (127.0.0.1:9445), the workers' TLS-verifying fetch rejects the self-signed cert — ` +
-        `route staging dina through the PUBLIC origin (valid cert), exactly like prod. See docs/STAGING.md D6.`,
+        `Common cause: dina is addressed by IP (e.g. 127.0.0.1:9445), which the workers' TLS-verifying fetch rejects because ` +
+        `the cert is valid for the DOMAIN, not the IP. Use the domain name on the staging port ` +
+        `(https://www.<domain>:9445/dina/api/v1), exactly like prod on 8445. See docs/STAGING.md D6.`,
       data: { host, healthUrl },
     };
   }
