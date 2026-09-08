@@ -130,8 +130,15 @@ async function main() {
     const d = await getStepDraft(userId, 'iq');
     ok(d.status === 'not_started', 'erase: step is not_started after reset');
     ok(d.draftState === null, 'erase: draft is gone after reset');
+    ok(d.erased === true, 'erase: leaves a cross-device TOMBSTONE (erased=true), not a deleted row');
     const again = await resetStepDraft(userId, 'iq');
-    ok(again === false, 'erase: reset reports false when nothing to erase');
+    ok(again === false, 'erase: reset reports false when nothing to erase (already a tombstone)');
+    // A fresh save anywhere clears the tombstone (erased -> false, back in_progress).
+    await saveStepDraft(userId, 'iq', { currentQuestionIndex: 1, userAnswers: { q1: 'a' } });
+    const resumed = await getStepDraft(userId, 'iq');
+    ok(resumed.status === 'in_progress' && resumed.erased === false, 'a new save clears the tombstone');
+    // Re-erase to restore not_started for the completed-guard block below.
+    await resetStepDraft(userId, 'iq');
   }
 
   // --- 4/5. INVARIANT: a completed step can NEVER be downgraded ---------------

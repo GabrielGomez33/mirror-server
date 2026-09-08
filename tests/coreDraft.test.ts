@@ -96,19 +96,27 @@ eq(stripMedia(null), null, 'null passthrough');
 group('projectStepDraft — DB row -> API shape');
 eq(
   projectStepDraft('iq', undefined),
-  { step: 'iq', status: 'not_started', completedAt: null, draftState: null },
-  'missing row -> not_started + null draft',
+  { step: 'iq', status: 'not_started', completedAt: null, draftState: null, erased: false },
+  'missing row -> not_started + null draft, NOT an erase tombstone',
 );
 eq(
   projectStepDraft('personality', { step_key: 'personality', status: 'in_progress', completed_at: null, draft_state: { index: 2 } }),
-  { step: 'personality', status: 'in_progress', completedAt: null, draftState: { index: 2 } },
+  { step: 'personality', status: 'in_progress', completedAt: null, draftState: { index: 2 }, erased: false },
   'object draft_state (mysql2 JSON) passed through',
 );
 eq(
   projectStepDraft('iq', { status: 'in_progress', completed_at: null, draft_state: '{"currentQuestionIndex":4}' }),
-  { step: 'iq', status: 'in_progress', completedAt: null, draftState: { currentQuestionIndex: 4 } },
+  { step: 'iq', status: 'in_progress', completedAt: null, draftState: { currentQuestionIndex: 4 }, erased: false },
   'string draft_state parsed',
 );
+// TOMBSTONE: a not_started ROW is the cross-device erase signal.
+{
+  const t = projectStepDraft('iq', { status: 'not_started', completed_at: null, draft_state: null });
+  ok(t.erased === true, 'not_started row -> erased tombstone (cross-device erase signal)');
+  ok(projectStepDraft('iq', undefined).erased === false, 'no row -> NOT erased (never-started, keep local)');
+  ok(projectStepDraft('iq', { status: 'completed', completed_at: null, draft_state: null }).erased === false, 'completed row -> not erased');
+  ok(projectStepDraft('iq', { status: 'in_progress', completed_at: null, draft_state: '{"currentQuestionIndex":4}' }).erased === false, 'in_progress -> not erased');
+}
 ok(
   projectStepDraft('iq', { status: 'in_progress', completed_at: null, draft_state: '{not json' }).draftState === null,
   'unparseable draft_state -> null (no throw)',

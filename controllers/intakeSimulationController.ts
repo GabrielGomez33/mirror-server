@@ -90,6 +90,7 @@ import { createUserInDB, deleteUserFromDB, updateUserPassword } from './userCont
 import { listTierFiles, TierType } from './directoryController';
 import { emailService } from '../services/emailService';
 import { emailLinksLeakAcrossEnv } from '../utils/emailIsolation';
+import { getVapidPublicKey } from '../services/pushService';
 
 const logger = new Logger('IntakeSimulation');
 
@@ -671,6 +672,72 @@ async function runEmailHealthCheck(): Promise<{ detail: string; data?: Record<st
   };
 }
 
+// Push (web-notification) health gate: prove staging has its OWN VAPID keypair
+// configured, so notifications work AND stay isolated from prod. The client
+// fetches this public key at runtime from /mirror/api/push/vapid-public-key, so
+// a present, well-shaped key here means the whole staging push path is wired.
+// Unset -> warn (notifications unconfigured; not intake-critical, so non-blocking).
+async function runPushHealthCheck(): Promise<{ detail: string; data?: Record<string, unknown>; severity?: StepSeverity }> {
+  const key = getVapidPublicKey();
+  if (!key) {
+    return {
+      severity: 'warn',
+      detail: 'Web push DISABLED — no VAPID_PUBLIC_KEY set. Generate a DISTINCT staging keypair (npx web-push generate-vapid-keys) so notifications work in staging.',
+      data: { enabled: false },
+    };
+  }
+  // A base64url-encoded uncompressed P-256 public key is 87–88 chars.
+  const looksValid = /^[A-Za-z0-9_-]{80,100}$/.test(key);
+  return {
+    severity: looksValid ? 'pass' : 'warn',
+    detail: looksValid
+      ? 'Web push enabled — staging VAPID public key present (client fetches it at runtime; isolated from prod).'
+      : 'VAPID_PUBLIC_KEY is set but its shape is unexpected for a base64url P-256 key — verify the staging keypair.',
+    data: { enabled: true, keyLength: key.length },
+  };
+}
+
+// DINA HTTP-path gate: prove the workers can reach dina over the SAME
+// TLS-verifying `fetch` they use in prod. The @Dina WS client relaxes TLS
+// (rejectUnauthorized:false), so group_dina_chat passes even when dina is only
+// reachable over a loopback self-signed cert — masking the fact that the
+// personal-analysis / truthstream workers (plain fetch, TLS verified) CANNOT
+// reach it, so personal analysis never completes and its push never fires. This
+// gate uses a bare fetch (no TLS relaxation) against the configured dina URL, so
+// it fails loudly on the loopback-self-signed divergence and passes only when
+// staging routes dina through the public origin with a valid cert — like prod.
+async function runDinaHttpHealthCheck(): Promise<{ detail: string; data?: Record<string, unknown>; severity?: StepSeverity }> {
+  if ((process.env.USE_DINA_STUB || '').toLowerCase() === 'true') {
+    return { severity: 'warn', detail: 'DINA stubbed (USE_DINA_STUB=true) — real dina HTTP path not exercised.' };
+  }
+  const endpoint = (process.env.DINA_ENDPOINT || '').replace(/\/+$/, '');
+  const server = (process.env.DINA_SERVER_URL || '').replace(/\/+$/, '');
+  const healthUrl = endpoint ? `${endpoint}/health` : server ? `${server}/dina/api/v1/health` : '';
+  if (!healthUrl) {
+    return { severity: 'warn', detail: 'No DINA_ENDPOINT/DINA_SERVER_URL set — cannot verify the dina HTTP path.' };
+  }
+  let host = healthUrl;
+  try { host = new URL(healthUrl).host; } catch { /* keep full url */ }
+  try {
+    // Bare fetch — identical TLS behavior to the workers (NO rejectUnauthorized).
+    const res = await fetch(healthUrl, { signal: AbortSignal.timeout(8000) });
+    if (res.status === 200) {
+      return { severity: 'pass', detail: `DINA HTTP path OK via ${host} (TLS verified — prod-equivalent).`, data: { host } };
+    }
+    return { severity: 'fail', detail: `DINA HTTP health returned HTTP ${res.status} at ${healthUrl}.`, data: { host, status: res.status } };
+  } catch (err) {
+    return {
+      severity: 'fail',
+      detail:
+        `DINA HTTP fetch FAILED to ${host}: ${(err as Error).message}. ` +
+        `Common cause: dina is addressed by IP (e.g. 127.0.0.1:9445), which the workers' TLS-verifying fetch rejects because ` +
+        `the cert is valid for the DOMAIN, not the IP. Use the domain name on the staging port ` +
+        `(https://www.<domain>:9445/dina/api/v1), exactly like prod on 8445. See docs/STAGING.md D6.`,
+      data: { host, healthUrl },
+    };
+  }
+}
+
 // Email SEND gate: prove the pipeline end to end, not just its config. Sends a
 // real verification email through the actual template+provider path to a canary
 // recipient (STAGING_EMAIL_CANARY) and asserts the provider ACCEPTED it
@@ -843,6 +910,8 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
         return { detail: `DB reachable; self base ${SELF_BASE_URL}; sim domain @${SIM_EMAIL_DOMAIN}` };
       });
       await step(steps, 'email_health', runEmailHealthCheck);
+      await step(steps, 'push_health', runPushHealthCheck);
+      await step(steps, 'dina_http', runDinaHttpHealthCheck);
       const anyFail = steps.some((s) => s.severity === 'fail');
       report.status = anyFail ? 'failed' : (steps.some((s) => s.severity === 'warn') ? 'passed_with_warnings' : 'passed');
       return report;
@@ -852,6 +921,10 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
     await step(steps, 'email_health', runEmailHealthCheck);
     // ---- 0b. EMAIL SEND (exercise the real send pipeline to a canary) ------
     await step(steps, 'email_send', runEmailSendCheck);
+    // ---- 0c. PUSH HEALTH (staging web-push notifications configured + isolated)
+    await step(steps, 'push_health', runPushHealthCheck);
+    // ---- 0d. DINA HTTP PATH (workers' TLS-verifying fetch reaches dina, prod-equivalent)
+    await step(steps, 'dina_http', runDinaHttpHealthCheck);
 
     // ---- 1. REGISTER (provision via the same fns /auth/register uses) ------
     await step(steps, 'register', async () => {

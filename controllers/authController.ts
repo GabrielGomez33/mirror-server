@@ -55,6 +55,11 @@ import bcrypt from 'bcrypt';
 import { createUserInDB, userLogin, fetchUserInfo, deleteUserFromDB } from './userController';
 import { writeToTier } from './directoryController';
 import { DB } from '../db';
+import {
+  loadUserContext,
+  UserContextUnavailableError,
+  type UserContextFields,
+} from '../utils/userContext';
 import { emailService } from '../services/emailService';
 import { Logger } from '../utils/logger';
 import {
@@ -348,54 +353,14 @@ async function dispatchInitialVerificationEmail(
 // ============================================================================
 // Helper — load the latest user fields the frontend cares about
 // ============================================================================
-async function loadUserContextFields(
-  userId: number
-): Promise<{ email: string; emailVerified: boolean; intakeCompleted: boolean; initialIntakeCompleted: boolean; subscriptionStatus: 'free' | 'premium' | 'enterprise' }> {
-  try {
-    const [rows] = await DB.query(
-      `SELECT email, email_verified, intake_completed, initial_intake_completed FROM users WHERE id = ? LIMIT 1`,
-      [userId]
-    );
-    const row = (rows as any[])[0] || {};
-
-    // subscriptionStatus is computed from the paywall table when available,
-    // otherwise defaults to 'free'. We avoid failing the whole call if the
-    // paywall tables are missing in older environments.
-    //
-    // Read `user_subscriptions` FIRST — that is the table the premium gate
-    // (subscriptionService) actually enforces, so the login/refresh response
-    // stays consistent with what the gate allows (previously this read a legacy
-    // `subscriptions` table that could disagree with the gate, so premium users
-    // were shown the upgrade wall even though the backend allowed them through).
-    // Fall back to `subscriptions` for environments that only have that table.
-    // Table names below are hard-coded literals, never user input.
-    let subscriptionStatus: 'free' | 'premium' | 'enterprise' = 'free';
-    for (const table of ['user_subscriptions', 'subscriptions']) {
-      try {
-        const [subRows] = await DB.query(
-          `SELECT tier FROM ${table} WHERE user_id = ? AND status IN ('active','trialing','past_due') ORDER BY id DESC LIMIT 1`,
-          [userId]
-        );
-        const tier = (subRows as any[])[0]?.tier;
-        if (tier === 'premium' || tier === 'enterprise') {
-          subscriptionStatus = tier;
-          break;
-        }
-      } catch {
-        // table missing in this environment — try the next one
-      }
-    }
-
-    return {
-      email: String(row.email || ''),
-      emailVerified: Boolean(row.email_verified),
-      intakeCompleted: Boolean(row.intake_completed),
-      initialIntakeCompleted: Boolean(row.initial_intake_completed),
-      subscriptionStatus,
-    };
-  } catch {
-    return { email: '', emailVerified: false, intakeCompleted: false, initialIntakeCompleted: false, subscriptionStatus: 'free' };
-  }
+// Thin adapter over the injectable, unit-tested loader (utils/userContext).
+// HARDENING: a failed CORE read now THROWS UserContextUnavailableError instead
+// of silently returning an all-false ("unverified / not-onboarded / free")
+// identity. The login and verifyToken handlers translate that throw into a
+// retryable 503 — a transient DB blip must never mislead the client into
+// re-onboarding an established user or hiding their premium/verified state.
+async function loadUserContextFields(userId: number): Promise<UserContextFields> {
+  return loadUserContext(userId, (sql, params) => DB.query(sql, params) as any);
 }
 
 // ============================================================================
@@ -640,7 +605,23 @@ export const loginUser: RequestHandler = async (req, res) => {
     const userInfo = await fetchUserInfo(email);
 
     // Hydrate verification + intake + subscription state for the response.
-    const contextFields = await loadUserContextFields(userInfo.id);
+    // A DB READ failure here must NOT be swallowed into an all-false identity
+    // (which would strand an onboarded user in onboarding and hide premium);
+    // answer a retryable 503 instead, BEFORE any session is created.
+    let contextFields: UserContextFields;
+    try {
+      contextFields = await loadUserContextFields(userInfo.id);
+    } catch (e) {
+      if (e instanceof UserContextUnavailableError) {
+        authLogger.error('login: user context unavailable', { userId: userInfo.id, err: (e as Error).message });
+        res.status(503).json({
+          error: 'Account data is temporarily unavailable. Please try again in a moment.',
+          code: 'CONTEXT_UNAVAILABLE',
+        });
+        return;
+      }
+      throw e;
+    }
 
     // Opt-in gating: block login for unverified users when explicitly enabled.
     if (
@@ -929,7 +910,24 @@ export const verifyToken: RequestHandler = async (req, res) => {
       return;
     }
 
-    const ctx = await loadUserContextFields(decoded.id);
+    // The token is already proven valid + session live at this point. A DB READ
+    // failure loading the user's context is NOT a token problem — answer a
+    // retryable 503, never a 401 (a 401 here would log a healthy user out on a
+    // transient blip) and never a fabricated all-false identity.
+    let ctx: UserContextFields;
+    try {
+      ctx = await loadUserContextFields(decoded.id);
+    } catch (e) {
+      if (e instanceof UserContextUnavailableError) {
+        console.error('[verifyToken] user context unavailable:', (e as Error).message);
+        res.status(503).json({
+          error: 'Account data is temporarily unavailable. Please retry.',
+          code: 'CONTEXT_UNAVAILABLE',
+        });
+        return;
+      }
+      throw e;
+    }
 
     res.status(200).json({
       valid: true,

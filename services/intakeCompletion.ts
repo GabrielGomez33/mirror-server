@@ -141,17 +141,25 @@ export async function getStepDraft(userId: number, step: CoreStep): Promise<Step
 }
 
 /**
- * Reset ONE step's progress to 'not_started' by deleting its row — the "erase
- * progress" affordance for a resumable draft. SECURITY/INVARIANT: it NEVER
- * touches a 'completed' row (WHERE status <> 'completed'), so a finished section
- * can't be silently un-completed, and a commit/erase race can't lose a
- * completion regardless of which request lands first. Returns true iff a row was
- * actually removed (an in-progress draft existed and was cleared).
+ * Reset ONE step's progress — the "erase progress" affordance for a resumable
+ * draft. Rather than DELETE the row, it turns an in-progress draft into a
+ * not_started TOMBSTONE (status='not_started', draft_state=NULL). That row is
+ * the durable, cross-device signal an erase happened: a second device reads it
+ * on hydrate (StepDraft.erased) and wipes its own stale local draft, so erase is
+ * authoritative everywhere, not just on the device that clicked it.
+ *
+ * SECURITY/INVARIANT: the `AND status = 'in_progress'` guard means a COMPLETED
+ * step is never touched (never silently un-completed) and a commit/erase race
+ * cannot lose a completion — whichever of complete/erase runs first, a completed
+ * row no longer matches the WHERE. Returns true iff an in-progress draft was
+ * actually cleared (a second erase, a completed step, or a never-started step
+ * all report false — there was nothing to erase).
  */
 export async function resetStepDraft(userId: number, step: CoreStep): Promise<boolean> {
   const [result] = await DB.query(
-    `DELETE FROM core_intake_progress
-       WHERE user_id = ? AND step_key = ? AND status <> 'completed'`,
+    `UPDATE core_intake_progress
+        SET status = 'not_started', draft_state = NULL, completed_at = NULL
+      WHERE user_id = ? AND step_key = ? AND status = 'in_progress'`,
     [userId, step]
   );
   return (result as { affectedRows?: number }).affectedRows ? true : false;
