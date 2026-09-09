@@ -85,7 +85,14 @@ export const submitEntryHandler: RequestHandler = async (req, res) => {
 
 /**
  * GET /mirror/api/intake/entry/status
- * -> { completed: boolean, result: EntryResult | null }
+ * -> { completed, intakeCompleted, entrySatisfied, result }
+ *
+ * The SERVER-AUTHORITATIVE onboarding gate. `completed` = entry done (the DB
+ * flag, or an entry_intake_results row exists); `intakeCompleted` = Core done;
+ * `entrySatisfied` = entry OR core — the single "this user is onboarded, do NOT
+ * route them to /entry" answer, read straight from the users row. Clients route
+ * on this instead of a localStorage cache (which is erasable, and absent
+ * entirely when "remember me" is off).
  */
 export const getEntryStatusHandler: RequestHandler = async (req, res) => {
   const userId = requireSelf(req);
@@ -95,12 +102,20 @@ export const getEntryStatusHandler: RequestHandler = async (req, res) => {
   }
   try {
     const [rows] = await DB.query(
-      'SELECT initial_intake_completed FROM users WHERE id = ? LIMIT 1',
+      'SELECT initial_intake_completed, intake_completed FROM users WHERE id = ? LIMIT 1',
       [userId]
     );
-    const flag = !!(rows as any[])[0]?.initial_intake_completed;
+    const row = (rows as any[])[0] || {};
     const result = await getEntryResult(userId);
-    res.json({ success: true, completed: flag || result !== null, result });
+    const completed = !!row.initial_intake_completed || result !== null;
+    const intakeCompleted = !!row.intake_completed;
+    res.json({
+      success: true,
+      completed,
+      intakeCompleted,
+      entrySatisfied: completed || intakeCompleted,
+      result,
+    });
   } catch (err) {
     res.status(500).json({ success: false, error: 'Failed to load entry status.' });
   }
