@@ -33,6 +33,25 @@ import WebSocket from 'ws';
 import { EventEmitter } from 'events';
 import { v4 as uuidv4 } from 'uuid';
 
+// ----------------------------------------------------------------------------
+// TLS policy: verify the DINA certificate for any REMOTE host; relax ONLY for a
+// loopback target (localhost/127.0.0.1/::1), where DINA presents a self-signed
+// cert on the same box. Previously this client set `rejectUnauthorized: false`
+// UNCONDITIONALLY, which silently disabled cert verification even against a
+// remote hostname — a real MITM surface. This mirrors the loopback-gated policy
+// the intake simulation already uses for its self-HTTP calls. DINA_WS_URL
+// defaults to wss://localhost:8445, so the common path is unchanged; a remote
+// DINA now (correctly) requires a valid certificate.
+// ----------------------------------------------------------------------------
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+export function isLoopbackWsUrl(wsUrl: string): boolean {
+  try {
+    return LOOPBACK_HOSTS.has(new URL(wsUrl).hostname.toLowerCase());
+  } catch {
+    return false; // unparseable URL -> treat as remote -> verify (fail safe)
+  }
+}
+
 // ============================================================================
 // TYPES
 // ============================================================================
@@ -217,7 +236,8 @@ export class DinaWebSocketClient extends EventEmitter {
 
       try {
         this.ws = new WebSocket(this.config.url, {
-          rejectUnauthorized: false,
+          // Verify the cert for a remote DINA; relax only for a loopback self-signed one.
+          rejectUnauthorized: !isLoopbackWsUrl(this.config.url),
           handshakeTimeout: 10000,
         });
 

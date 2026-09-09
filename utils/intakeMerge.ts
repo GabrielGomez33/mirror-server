@@ -106,5 +106,10 @@ export function mergeCoreOverEntry(
   const hasEntry = Object.keys(entrySections).length > 0;
   const hasCore = !!core && Object.keys(core).length > 0;
   if (!hasEntry && !hasCore) return null;
-  return { ...entrySections, ...(core || {}) };
+  // DEEP overlay (Core wins at every LEAF, Entry fills the gaps) — NOT a shallow
+  // `{...entry, ...core}`. A shallow spread let a PARTIAL core section replace a
+  // fuller entry section wholesale (e.g. a core `astrologicalResult:{western:{sunSign}}`
+  // would discard entry's full chart incl. moon/rising/numerology). Deep overlay
+  // keeps entry's leaves wherever core is empty, while core still wins where present.
+  return deepOverlay(entrySections, core || {});
 }

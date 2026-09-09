@@ -24,6 +24,7 @@ import AuthMiddleware, { SecurityLevel } from '../middleware/authMiddleware';
 import { groupEncryptionManager } from '../systems/GroupEncryptionManager';
 import { publicAssessmentAggregator } from '../managers/PublicAssessmentAggregator';
 import { groupDataExtractor, ShareableDataType } from '../services/GroupDataExtractor';
+import { getGroupShareFreshness } from '../services/groupShareFreshness';
 import { mirrorGroupNotifications } from '../systems/mirrorGroupNotifications';
 import { isUserOnline } from '../wss/setupWSS';
 
@@ -2224,9 +2225,13 @@ const shareDataHandler: RequestHandler = async (req, res) => {
     const keyId = (keyRows as any[])[0].id;
     const keyVersion = (keyRows as any[])[0].key_version;
 
+    // forceFresh: this is the authoritative, consented snapshot write, so it must
+    // capture the user's CURRENT merged intake — not a possibly-stale cached
+    // profile (e.g. right after a retake). See services/groupShareFreshness.ts.
     const extractionResult = await groupDataExtractor.extractData({
       userId: user.id,
-      dataTypes: typesToShare as ShareableDataType[]
+      dataTypes: typesToShare as ShareableDataType[],
+      forceFresh: true
     });
 
     if (!extractionResult.success || !extractionResult.data || extractionResult.data.length === 0) {
@@ -2438,6 +2443,29 @@ const getDataSummaryHandler: RequestHandler = async (req, res) => {
   }
 };
 
+/**
+ * GET /shared-data/freshness — for each group the caller actively belongs to,
+ * whether the snapshot they shared is now STALE relative to their current
+ * intake (e.g. after a retake). Powers the client's "Update what this group
+ * sees" prompt. Read-only; never mutates a share. Fail-safe: on error it
+ * returns an empty list so the groups UI still renders.
+ */
+const getSharedDataFreshnessHandler: RequestHandler = async (req, res) => {
+  try {
+    const user = (req as any).user;
+    if (!user?.id) {
+      res.status(401).json({ success: false, error: 'Unauthorized' });
+      return;
+    }
+    const groups = await getGroupShareFreshness(Number(user.id));
+    res.json({ success: true, data: { groups, outdatedCount: groups.filter((g) => g.outdated).length } });
+  } catch (error) {
+    console.error('Error computing shared-data freshness:', error);
+    // Fail-safe: an empty list degrades to "nothing to update", never a broken UI.
+    res.json({ success: true, data: { groups: [], outdatedCount: 0 } });
+  }
+};
+
 /* ============================================================================
    ROUTE REGISTRATION - UPDATED WITH PHASE 6 ENDPOINTS
 ============================================================================ */
@@ -2517,5 +2545,7 @@ router.get('/:groupId/banned', verified, getBannedMembersHandler);
 router.post('/:groupId/share-data', verified, basicSecurity, shareDataHandler);
 router.get('/:groupId/shared-data', verified, getSharedDataHandler);
 router.get('/data-summary', verified, getDataSummaryHandler);
+// Two-segment path — safe against the one-segment `/:groupId` route above.
+router.get('/shared-data/freshness', verified, getSharedDataFreshnessHandler);
 
 export default router;

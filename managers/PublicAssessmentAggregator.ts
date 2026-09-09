@@ -70,20 +70,30 @@ export class PublicAssessmentAggregator {
    * Aggregate all public-facing assessments for a user
    * Uses correct property access from IntakeDataStructure
    */
-  async aggregateForUser(userId: number): Promise<AggregationResult> {
+  async aggregateForUser(
+    userId: number,
+    opts: { forceFresh?: boolean } = {}
+  ): Promise<AggregationResult> {
     try {
       console.log(`📊 Aggregating public assessments for user ${userId}`);
 
-      // 1. Check cache first
+      // 1. Check cache first — UNLESS the caller demands a fresh read. The 1h
+      // cache is a convenience for repeated reads; the AUTHORITATIVE snapshot
+      // write (share / re-share) must reflect the user's CURRENT data, so it
+      // passes forceFresh. Without this, a re-share after a retake could freeze
+      // a stale profile into the group for up to an hour (there is no cache
+      // invalidation elsewhere — see services/groupShareFreshness.ts).
       const cacheKey = `assessment:public:${userId}`;
-      const cached = await mirrorRedis.get(cacheKey);
-      if (cached) {
-        console.log(`✅ Retrieved cached assessment for user ${userId}`);
-        return {
-          success: true,
-          data: JSON.parse(cached),
-          cached: true
-        };
+      if (!opts.forceFresh) {
+        const cached = await mirrorRedis.get(cacheKey);
+        if (cached) {
+          console.log(`✅ Retrieved cached assessment for user ${userId}`);
+          return {
+            success: true,
+            data: JSON.parse(cached),
+            cached: true
+          };
+        }
       }
 
       // 2. Get intake data using IntakeDataManager
