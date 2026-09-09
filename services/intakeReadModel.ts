@@ -18,16 +18,15 @@ import {
   entryToIntakeSections,
   mergeCoreOverEntry,
   mergeCoreRecordsNewestFirst,
-  isNonEmptyValue,
   type EntryResult,
 } from '../utils/intakeMerge';
 
 // Re-export the pure helpers so existing importers of this module keep working.
 export { coerceJson, entryToIntakeSections, mergeCoreOverEntry, EntryResult };
 
-// The load-bearing Core sections. Once all are gathered we can stop scanning.
-const CORE_SECTION_KEYS = ['personalityResult', 'astrologicalResult', 'iqResults', 'faceAnalysis', 'voiceMetadata'];
-// Cap the number of historical records we decrypt per resolve (perf bound).
+// Cap the number of historical records we decrypt per resolve (perf bound). We
+// scan up to this many newest records and DEEP-merge them (leaf newest-non-empty
+// wins) — we do NOT early-stop on section presence (see getMergedCoreIntake).
 const MAX_CORE_RECORDS_SCANNED = 8;
 
 /**
@@ -51,7 +50,6 @@ export async function getMergedCoreIntake(
   if (!metas || metas.length === 0) return null;
 
   const recordsNewestFirst: Array<Record<string, any>> = [];
-  const found = new Set<string>();
   let scanned = 0;
   for (const m of metas) {
     if (scanned >= MAX_CORE_RECORDS_SCANNED) break;
@@ -59,14 +57,19 @@ export async function getMergedCoreIntake(
     try {
       const r = await IntakeDataManager.retrieveIntakeData(String(userId), m.intakeId, context, false);
       const rec = r?.intakeData as Record<string, any> | undefined;
-      if (rec) {
-        recordsNewestFirst.push(rec);
-        for (const k of CORE_SECTION_KEYS) if (isNonEmptyValue(rec[k])) found.add(k);
-      }
+      if (rec) recordsNewestFirst.push(rec);
     } catch (e) {
       console.error(`[intakeReadModel] retrieve ${m.intakeId} failed for user ${userId}:`, (e as Error)?.message || e);
     }
-    if (found.size === CORE_SECTION_KEYS.length) break; // full profile assembled
+    // NOTE: we DELIBERATELY do not early-stop when each section is "present".
+    // The old code broke as soon as every CORE_SECTION_KEY was non-empty at the
+    // SECTION level (`{western:{sunSign}}` counts as a present astrologicalResult),
+    // so a newer PARTIAL record (e.g. one carrying only `western.sunSign`, an empty
+    // `big5Profile`, an empty `expressions`) made the loop stop before ever reading
+    // the older FULL records — masking a complete profile behind a skeletal latest.
+    // We now scan all records up to the bound and let the LEAF-level deep merge
+    // below reconstruct the fullest profile (newer non-empty leaves win; a newer
+    // EMPTY leaf never erases an older full one). MAX_CORE_RECORDS_SCANNED bounds it.
   }
   const merged = mergeCoreRecordsNewestFirst(recordsNewestFirst);
   return Object.keys(merged).length ? merged : null;
