@@ -77,6 +77,37 @@ export async function getMergedCoreIntake(
 
 // --- DB-backed API ----------------------------------------------------------
 
+/**
+ * When did this user's intake data last CHANGE? The newest of the two sources
+ * resolveLatest merges: the latest Core intake record
+ * (intake_metadata.submission_date) and the Entry result row
+ * (entry_intake_results.updated_at). null when the user has no intake at all.
+ *
+ * This is the single "my data changed at" timestamp behind every downstream
+ * freshness check (group shared-snapshots, personal-analysis reports), so it
+ * lives HERE with the read model — not duplicated per consumer. Two simple
+ * MAX() reads maxed in JS, avoiding SQL COALESCE/GREATEST timezone pitfalls.
+ * Note the differing user_id column types: intake_metadata.user_id is VARCHAR,
+ * entry_intake_results.user_id is INT.
+ */
+export async function getLatestIntakeChangeAt(userId: number): Promise<Date | null> {
+  const [coreRows] = await DB.query(
+    `SELECT MAX(submission_date) AS t FROM intake_metadata WHERE user_id = ?`,
+    [String(userId)]
+  );
+  const [entryRows] = await DB.query(
+    `SELECT MAX(updated_at) AS t FROM entry_intake_results WHERE user_id = ?`,
+    [userId]
+  );
+  const times: number[] = [];
+  for (const raw of [(coreRows as any[])[0]?.t, (entryRows as any[])[0]?.t]) {
+    if (!raw) continue;
+    const d = new Date(raw);
+    if (!Number.isNaN(d.getTime())) times.push(d.getTime());
+  }
+  return times.length ? new Date(Math.max(...times)) : null;
+}
+
 /** Read the single Entry result row for a user (or null). */
 export async function getEntryResult(userId: number): Promise<EntryResult | null> {
   const [rows] = await DB.query(

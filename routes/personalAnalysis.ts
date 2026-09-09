@@ -29,6 +29,8 @@ import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import { DB } from '../db';
 import AuthMiddleware from '../middleware/authMiddleware';
+import { getLatestIntakeChangeAt } from '../services/intakeReadModel';
+import { isDataChangedSince } from '../utils/intakeFreshness';
 
 const router = express.Router();
 
@@ -233,6 +235,23 @@ const getLatestAnalysis: RequestHandler = async (req, res) => {
     }
 
     const row = rows[0];
+
+    // Freshness: is this report older than the user's current intake? If they
+    // retook/updated an assessment after it was generated, the report no longer
+    // reflects their data — surface an "outdated" flag so the UI can prompt a
+    // regenerate. Fail-safe: if the change-time read throws, treat as current
+    // (never block or falsely flag a report on a transient DB hiccup).
+    let dataChangedAt: string | null = null;
+    let outdated = false;
+    try {
+      const changedAt = await getLatestIntakeChangeAt(Number(userId));
+      dataChangedAt = changedAt ? changedAt.toISOString() : null;
+      outdated = isDataChangedSince(changedAt, row.created_at ? new Date(row.created_at) : null);
+    } catch (freshnessErr) {
+      console.warn('[personalAnalysis] freshness check failed (report served as current):',
+        (freshnessErr as Error).message);
+    }
+
     res.json({
       success: true,
       data: {
@@ -244,6 +263,9 @@ const getLatestAnalysis: RequestHandler = async (req, res) => {
         journalEntriesAnalyzed: row.journal_entries_analyzed,
         intakeSectionsAvailable: row.intake_sections_available,
         createdAt: row.created_at,
+        // Set when the user's intake changed after this report was generated.
+        outdated,
+        dataChangedAt,
       },
     });
 
