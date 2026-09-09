@@ -124,9 +124,14 @@ jobs:
       - name: Build production artifacts
         run: npm run build
 
-      - name: Security audit
-        run: npm audit --audit-level=high
-        continue-on-error: true
+      # BLOCKING security gate (dependency half of the Phase-6 security review).
+      # Fails on ANY high/critical advisory not covered by a reviewed, unexpired
+      # entry in .security-audit-allowlist.json. Known transitive debt is tracked
+      # with an expiry there; a NEW advisory blocks the pipeline. The CODE half of
+      # the review (IDOR, sim-teardown safety, TLS/proxy, context-503 invariants)
+      # runs in the "Unit tests" step above via tests/securityInvariants.test.ts.
+      - name: Security gate (dependency advisories)
+        run: node scripts/auditGate.mjs
 
       - name: Scan for secrets in code
         run: |
