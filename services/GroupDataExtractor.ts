@@ -53,6 +53,12 @@ export interface ExtractionOptions {
   userId: number;
   dataTypes: ShareableDataType[];
   includeTimestamp?: boolean;
+  /**
+   * Bypass the aggregator's 1h cache and read the user's CURRENT merged intake.
+   * The share/re-share write passes this so a snapshot never freezes stale data
+   * (e.g. right after a retake). Read-only callers can leave it false.
+   */
+  forceFresh?: boolean;
 }
 
 // ============================================================================
@@ -65,12 +71,12 @@ export class GroupDataExtractor {
    */
   async extractData(options: ExtractionOptions): Promise<ExtractionResult> {
     try {
-      const { userId, dataTypes, includeTimestamp = true } = options;
+      const { userId, dataTypes, includeTimestamp = true, forceFresh = false } = options;
 
-      console.log(`📦 Extracting data for user ${userId}: ${dataTypes.join(', ')}`);
+      console.log(`📦 Extracting data for user ${userId}: ${dataTypes.join(', ')}${forceFresh ? ' (fresh)' : ''}`);
 
-      // 1. Get aggregated assessment data
-      const aggregationResult = await publicAssessmentAggregator.aggregateForUser(userId);
+      // 1. Get aggregated assessment data (fresh when writing a snapshot).
+      const aggregationResult = await publicAssessmentAggregator.aggregateForUser(userId, { forceFresh });
 
       if (!aggregationResult.success || !aggregationResult.data) {
         return {
