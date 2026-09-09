@@ -7,6 +7,8 @@
 // re-exports these so existing importers keep one entry point.
 // ----------------------------------------------------------------------------
 
+import { isDataChangedSince } from './intakeFreshness';
+
 export interface GroupShareFreshness {
   groupId: string;
   groupName: string;
@@ -32,6 +34,6 @@ export function isShareOutdated(
   latestIntakeChangeAt: Date | null,
   sharedAt: Date | null
 ): boolean {
-  if (!sharedAt || !latestIntakeChangeAt) return false;
-  return latestIntakeChangeAt.getTime() > sharedAt.getTime();
+  // Same predicate as every freshness check: did intake change after the share?
+  return isDataChangedSince(latestIntakeChangeAt, sharedAt);
 }

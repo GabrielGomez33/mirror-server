@@ -15,39 +15,15 @@
 // ----------------------------------------------------------------------------
 
 import { DB } from '../db';
+import { getLatestIntakeChangeAt } from './intakeReadModel';
 import { isShareOutdated, type GroupShareFreshness } from '../utils/groupShareFreshness';
 
-// Re-export the pure helpers so existing importers keep a single entry point.
-// The pure logic lives in utils/ (no DB import) so it is unit-testable without
-// dragging the connection pool into the test runner.
+// Re-export the pure helper so existing importers keep a single entry point. The
+// pure logic lives in utils/ (no DB import) so it is unit-testable without
+// dragging the connection pool into the test runner. "When did intake change?"
+// now lives with the read model (intakeReadModel.getLatestIntakeChangeAt) so it
+// is shared with the personal-analysis freshness check rather than duplicated.
 export { isShareOutdated, GroupShareFreshness };
-
-/**
- * When did this user's shareable assessment data last CHANGE? The newest of the
- * two sources resolveLatest merges: the latest Core intake record
- * (intake_metadata.submission_date) and the Entry result row
- * (entry_intake_results.updated_at). null when the user has no intake at all.
- * Two simple MAX() reads maxed in JS — avoids SQL COALESCE/GREATEST timezone
- * and NULL-sentinel pitfalls. Note the differing user_id column types:
- * intake_metadata.user_id is VARCHAR, entry_intake_results.user_id is INT.
- */
-export async function getLatestIntakeChangeAt(userId: number): Promise<Date | null> {
-  const [coreRows] = await DB.query(
-    `SELECT MAX(submission_date) AS t FROM intake_metadata WHERE user_id = ?`,
-    [String(userId)]
-  );
-  const [entryRows] = await DB.query(
-    `SELECT MAX(updated_at) AS t FROM entry_intake_results WHERE user_id = ?`,
-    [userId]
-  );
-  const times: number[] = [];
-  for (const raw of [(coreRows as any[])[0]?.t, (entryRows as any[])[0]?.t]) {
-    if (!raw) continue;
-    const d = new Date(raw);
-    if (!Number.isNaN(d.getTime())) times.push(d.getTime());
-  }
-  return times.length ? new Date(Math.max(...times)) : null;
-}
 
 /**
  * For every group the user is an ACTIVE member of, report whether their shared
