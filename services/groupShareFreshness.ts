@@ -1,0 +1,84 @@
+// services/groupShareFreshness.ts
+// ----------------------------------------------------------------------------
+// FRESHNESS SEAM between a user's intake data and the SNAPSHOT that Mirror
+// Groups holds. Groups do not read intake live — a member's assessment is
+// frozen into mirror_group_shared_data at explicit share time (with consent),
+// so when the user later RETAKES a section their groups keep showing the old
+// snapshot. Rather than silently re-disclosing new data into groups from the
+// intake write path (which would couple two domains and bypass a fresh consent),
+// we DETECT staleness here and let the UI prompt the user to re-share.
+//
+// This module owns ONLY the read-side freshness question ("is what a group sees
+// older than my current data?"). The actual (re)capture stays the existing,
+// consented POST /:groupId/share-data. Pure comparison split out from the DB
+// reads so it is unit-tested in isolation (tests/groupShareFreshness.test.ts).
+// ----------------------------------------------------------------------------
+
+import { DB } from '../db';
+import { isShareOutdated, type GroupShareFreshness } from '../utils/groupShareFreshness';
+
+// Re-export the pure helpers so existing importers keep a single entry point.
+// The pure logic lives in utils/ (no DB import) so it is unit-testable without
+// dragging the connection pool into the test runner.
+export { isShareOutdated, GroupShareFreshness };
+
+/**
+ * When did this user's shareable assessment data last CHANGE? The newest of the
+ * two sources resolveLatest merges: the latest Core intake record
+ * (intake_metadata.submission_date) and the Entry result row
+ * (entry_intake_results.updated_at). null when the user has no intake at all.
+ * Two simple MAX() reads maxed in JS — avoids SQL COALESCE/GREATEST timezone
+ * and NULL-sentinel pitfalls. Note the differing user_id column types:
+ * intake_metadata.user_id is VARCHAR, entry_intake_results.user_id is INT.
+ */
+export async function getLatestIntakeChangeAt(userId: number): Promise<Date | null> {
+  const [coreRows] = await DB.query(
+    `SELECT MAX(submission_date) AS t FROM intake_metadata WHERE user_id = ?`,
+    [String(userId)]
+  );
+  const [entryRows] = await DB.query(
+    `SELECT MAX(updated_at) AS t FROM entry_intake_results WHERE user_id = ?`,
+    [userId]
+  );
+  const times: number[] = [];
+  for (const raw of [(coreRows as any[])[0]?.t, (entryRows as any[])[0]?.t]) {
+    if (!raw) continue;
+    const d = new Date(raw);
+    if (!Number.isNaN(d.getTime())) times.push(d.getTime());
+  }
+  return times.length ? new Date(Math.max(...times)) : null;
+}
+
+/**
+ * For every group the user is an ACTIVE member of, report whether their shared
+ * snapshot is stale relative to their current intake. Groups they haven't shared
+ * with come back with sharedAt=null / outdated=false. One intake-change read +
+ * one grouped share read; the comparison is the pure helper above.
+ */
+export async function getGroupShareFreshness(userId: number): Promise<GroupShareFreshness[]> {
+  const [rows] = await DB.query(
+    `SELECT g.id AS group_id, g.name AS group_name,
+            MAX(sd.shared_at) AS shared_at,
+            GROUP_CONCAT(DISTINCT sd.data_type) AS data_types
+       FROM mirror_group_members m
+       JOIN mirror_groups g ON g.id = m.group_id
+       LEFT JOIN mirror_group_shared_data sd
+         ON sd.group_id = m.group_id AND sd.user_id = m.user_id
+      WHERE m.user_id = ? AND m.status = 'active'
+      GROUP BY g.id, g.name`,
+    [userId]
+  );
+
+  const latestChange = await getLatestIntakeChangeAt(userId);
+
+  return (rows as any[]).map((r) => {
+    const sharedAt = r.shared_at ? new Date(r.shared_at) : null;
+    return {
+      groupId: String(r.group_id),
+      groupName: r.group_name,
+      sharedAt: sharedAt ? sharedAt.toISOString() : null,
+      outdated: isShareOutdated(latestChange, sharedAt),
+      dataTypes: r.data_types ? String(r.data_types).split(',').filter(Boolean) : [],
+    };
+  });
+}
