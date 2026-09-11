@@ -212,9 +212,10 @@ class DirectoryController {
         encrypted = true;
       }
       
-      // Write file with appropriate permissions
+      // Write file with appropriate permissions — ATOMICALLY (see atomicWrite),
+      // so a concurrent reader never observes a half-written payload.
       const fileMode = tier === 'tier1' ? 0o644 : 0o600; // More restrictive for sensitive tiers
-      await fs.writeFile(filePath, finalData, { mode: fileMode });
+      await this.atomicWrite(filePath, finalData, fileMode);
       
       // Calculate checksum for integrity verification
       const checksum = hashData(finalData);
@@ -307,9 +308,14 @@ class DirectoryController {
         data = decryptBuffer(data, userKeys.aesKey);
       }
       
-      // Update last accessed time
+      // Update last accessed time — BEST-EFFORT ONLY. The payload is already
+      // read and decrypted above; touching the sidecar is an audit nicety, so a
+      // failure here must never fail (or race) the read. Fire-and-forget with a
+      // swallowed error keeps a read pure from the caller's perspective.
       metadata.lastAccessed = new Date();
-      await this.writeMetadata(userId, tier, filename, metadata);
+      await this.writeMetadata(userId, tier, filename, metadata).catch((e) => {
+        console.warn(`[DirectoryController]: lastAccessed touch skipped for ${tier}/${filename}: ${(e as Error)?.message || e}`);
+      });
       
       // Log data access
       if (context) {
@@ -427,20 +433,60 @@ class DirectoryController {
   // ===== METADATA OPERATIONS =====
 
   /**
-   * Write metadata for a file
+   * ATOMIC file write: serialize to a UNIQUE temp file in the SAME directory,
+   * then rename() over the target. rename(2) is atomic on a POSIX filesystem, so
+   * a concurrent reader always observes EITHER the old complete file OR the new
+   * complete file — never a half-written/truncated one. A plain fs.writeFile
+   * opens the target with O_TRUNC and writes incrementally, so a reader that
+   * opens it mid-write sees an empty/partial file (JSON.parse then throws
+   * "Unexpected end of JSON input") or a torn payload (checksum mismatch).
+   *
+   * This is the fix for the faceAnalysis-drop bug: /intake/latest issues TWO
+   * concurrent full reads (resolveLatest ‖ getLatestIntakeData), each of which
+   * rewrites a file's metadata sidecar (lastAccessed) on read. Under a non-root
+   * service account the readers reliably raced on the FIRST component in
+   * iteration order (faceAnalysis), tearing its sidecar and dropping it from the
+   * merged result. Every tier write (payload AND sidecar) now goes through here.
+   * The unique suffix (pid+time+random) keeps two concurrent writers from
+   * sharing — and thus tearing — the same temp file.
    */
+  private async atomicWrite(targetPath: string, data: Buffer | string, mode: number): Promise<void> {
+    await fs.mkdir(path.dirname(targetPath), { recursive: true, mode: 0o750 });
+    const tmpPath = `${targetPath}.tmp.${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}`;
+    try {
+      await fs.writeFile(tmpPath, data, { mode });
+      await fs.rename(tmpPath, targetPath);
+    } catch (error) {
+      // Never leave a stray temp file behind on failure.
+      await fs.unlink(tmpPath).catch(() => {});
+      throw error;
+    }
+  }
+
   private async writeMetadata(userId: string, tier: TierType, filename: string, metadata: FileMetadata): Promise<void> {
     const metadataPath = path.join(this.basePath, userId, tier, 'meta', `${filename}.json`);
-    await fs.writeFile(metadataPath, JSON.stringify(metadata, null, 2), { mode: 0o600 });
+    await this.atomicWrite(metadataPath, JSON.stringify(metadata, null, 2), 0o600);
   }
 
   /**
-   * Read metadata for a file
+   * Read metadata for a file. Tolerates a momentary inconsistency by retrying
+   * once: with atomic writes above a torn read cannot occur, but a single retry
+   * is cheap insurance against any other writer and against transient FS hiccups
+   * (e.g. a rename landing between our open and read). A parse/read failure here
+   * must never be the reason a data read is lost.
    */
   private async readMetadata(userId: string, tier: TierType, filename: string): Promise<FileMetadata> {
     const metadataPath = path.join(this.basePath, userId, tier, 'meta', `${filename}.json`);
-    const data = await fs.readFile(metadataPath, 'utf8');
-    return JSON.parse(data);
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const data = await fs.readFile(metadataPath, 'utf8');
+        return JSON.parse(data) as FileMetadata;
+      } catch (error) {
+        lastErr = error;
+      }
+    }
+    throw lastErr;
   }
 
   /**
