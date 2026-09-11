@@ -46,6 +46,13 @@ module.exports = {
       name,
       script: path.join(DIST, a.script),
       cwd: CWD,
+      // Least privilege: the root pm2 daemon spawns each app as mirror_app, so a
+      // compromise is contained to that account instead of root. Prereqs (all
+      // met on this host): the checkout (dist/node_modules), the staging .env,
+      // and the staging storage trees must be mirror_app-readable/owned. Revert
+      // = remove these two lines + `sudo pm2 restart ecosystem.staging.config.js`.
+      uid: 'mirror_app',
+      gid: 'mirror_app',
       autorestart: true,
       max_restarts: a.name === 'mirror-server' ? 15 : 10,
       min_uptime: '10s',
