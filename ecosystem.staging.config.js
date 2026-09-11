@@ -52,7 +52,14 @@ module.exports = {
       // and the staging storage trees must be mirror_app-readable/owned. Revert
       // = remove these two lines + `sudo pm2 restart ecosystem.staging.config.js`.
       uid: 'mirror_app',
-      gid: 'mirror_app',
+      // gid: mirror-server opens the HTTPS listener and must read the Let's
+      // Encrypt private key, which is group-readable via `sslcert`. pm2's uid/gid
+      // drop does NOT call initgroups(), so the process gets ONLY this gid (no
+      // supplementary groups) — therefore mirror-server runs with gid `sslcert`
+      // to keep cert-read, while the workers (no TLS listener) use `mirror_app`.
+      // uid stays `mirror_app` either way: the root-blast-radius fix is unchanged;
+      // `sslcert` is an unprivileged cert-read group.
+      gid: a.name === 'mirror-server' ? 'sslcert' : 'mirror_app',
       autorestart: true,
       max_restarts: a.name === 'mirror-server' ? 15 : 10,
       min_uptime: '10s',
