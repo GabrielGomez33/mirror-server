@@ -1,11 +1,4 @@
 {
-  "_comment": "Reviewed exceptions for scripts/auditGate.mjs. Each entry acknowledges a KNOWN high/critical advisory that cannot be fixed without a major/coordinated dependency bump (npm audit fix is a no-op — the fixes fall outside our declared semver ranges and/or are pinned by socket.io). Every entry has an EXPIRY: past it, the gate treats the advisory as a fresh offender so this debt is revisited, not buried. A brand-new advisory not listed here fails CI immediately. TODO: land a dedicated deps-hardening PR (major bumps of multer, ws/socket.io, mysql2) and delete these entries.",
-  "advisories": {
-    "1121089": { "package": "multer", "severity": "high", "reason": "DoS via deeply nested field names; requires major multer bump. Intake uploads are auth-gated + size-capped. Tracked for deps PR.", "reviewedBy": "gabrielelythgomez@gmail.com", "expires": "2026-11-10" },
-    "1193790": { "package": "multer", "severity": "high", "reason": "DoS via crafted multipart field names; same major-bump requirement as 1121089.", "reviewedBy": "gabrielelythgomez@gmail.com", "expires": "2026-11-10" },
-    "1193793": { "package": "multer", "severity": "high", "reason": "DoS via oversized array index in field names; same major-bump requirement as 1121089.", "reviewedBy": "gabrielelythgomez@gmail.com", "expires": "2026-11-10" },
-    "1123259": { "package": "ws", "severity": "high", "reason": "Memory-exhaustion DoS; ws is pinned transitively by socket.io. Requires coordinated socket.io major bump. Tracked for deps PR.", "reviewedBy": "gabrielelythgomez@gmail.com", "expires": "2026-11-10" },
-    "1130713": { "package": "socket.io-parser", "severity": "high", "reason": "Zero-attachment memory exhaustion; fixed by the same socket.io major bump as ws. Tracked for deps PR.", "reviewedBy": "gabrielelythgomez@gmail.com", "expires": "2026-11-10" },
-    "1153173": { "package": "mysql2", "severity": "high", "reason": "Auth-plugin downgrade could leak credentials to a MALICIOUS MySQL server; mirror-server connects only to a trusted localhost MySQL, so not exploitable in this deployment. Bump mysql2 in the deps PR regardless.", "reviewedBy": "gabrielelythgomez@gmail.com", "expires": "2026-11-10" }
-  }
+  "_comment": "Reviewed exceptions for scripts/auditGate.mjs. Each entry acknowledges a KNOWN high/critical advisory that cannot be fixed yet, with a reason, reviewer, and EXPIRY (past it the gate treats the advisory as a fresh offender). A brand-new advisory not listed here fails CI immediately. Currently EMPTY: the multer/ws/socket.io/mysql2 debt was cleared by bumping to fixed versions within their existing majors (2026-09), so the gate now enforces a clean tree with no exceptions.",
+  "advisories": {}
 }
