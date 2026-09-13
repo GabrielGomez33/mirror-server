@@ -759,46 +759,93 @@ async function runEmailSendCheck(): Promise<{ detail: string; data?: Record<stri
   }
   const dryRun = (process.env.EMAIL_DRY_RUN || '').toLowerCase() === 'true';
   const appUrl = (process.env.APP_URL || '').replace(/\/+$/, '');
+  const canaryEmail = canary.toLowerCase(); // createUserInDB canonicalizes to lower-case
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const mintToken = async (userId: number): Promise<string> => {
+    const t = crypto.randomBytes(32).toString('hex');
+    await DB.query(
+      `INSERT INTO email_verification_tokens (user_id, token, expires_at) VALUES (?, ?, ?)`,
+      [userId, t, new Date(Date.now() + DAY_MS)],
+    );
+    return t;
+  };
 
-  // Build a WELL-FORMED verification link (64 hex — exactly what the real app
-  // mints), never the old `CANARY_<ts>` sentinel that tripped the format
-  // validator and made the emailed link read as "Invalid token format" (which
-  // looked like broken link-creation on every staging deploy). If the canary
-  // address belongs to a real staging account, bind the token to it so clicking
-  // the link actually VERIFIES that account (idempotent) — a true end-to-end
-  // proof a human can see. Otherwise the token is well-formed but unbound, so a
-  // click yields the benign "token not found or already expired", never a
-  // format error. The send test (provider acceptance) is unchanged.
-  const token = crypto.randomBytes(32).toString('hex');
-  let linkKind = 'well-formed (unbound — no staging account for this address)';
+  // FULL PIPELINE on a persistent, dedicated staging canary account:
+  //   1. ensure the account exists (reserved `__canary_` username so we own it
+  //      and never mutate a real user's account),
+  //   2. PROVE the whole loop in-process — reset email_verified=0, mint a real
+  //      64-hex token, POST it to the REAL /verify-email endpoint, and assert the
+  //      DB flag flipped false->true (this is the visible "true completion"),
+  //   3. reset again + mint a FRESH token, and email THAT so a human clicking the
+  //      link also completes the flip (or gets idempotent success). The provider
+  //      send-acceptance test is preserved.
+  // If the address already belongs to a NON-canary account we do NOT touch its
+  // state — we only bind+send (click → idempotent verify), so a real account is
+  // never reset by the gate.
+  let canaryUserId: number;
+  let ownedCanary = false;
+  let createdNew = false;
   try {
-    const [urows] = await DB.query('SELECT id FROM users WHERE email = ? LIMIT 1', [canary]);
-    const canaryUserId = (urows as any[])[0]?.id;
-    if (canaryUserId) {
-      await DB.query(
-        `INSERT INTO email_verification_tokens (user_id, token, expires_at) VALUES (?, ?, ?)`,
-        [canaryUserId, token, new Date(Date.now() + 24 * 60 * 60 * 1000)],
-      );
-      linkKind = 'bound to the existing canary account — clicking verifies it (idempotent)';
+    const [urows] = await DB.query('SELECT id, username FROM users WHERE LOWER(email) = ? LIMIT 1', [canaryEmail]);
+    const existing = (urows as any[])[0];
+    if (existing) {
+      canaryUserId = Number(existing.id);
+      ownedCanary = String(existing.username || '').startsWith('__canary_');
+    } else {
+      try {
+        canaryUserId = await createUserInDB(`__canary_${crypto.randomBytes(4).toString('hex')}`, canaryEmail, strongRandomPassword());
+      } catch {
+        // Lost a create race (unique email) — re-read the row the winner made.
+        const [again] = await DB.query('SELECT id, username FROM users WHERE LOWER(email) = ? LIMIT 1', [canaryEmail]);
+        const row = (again as any[])[0];
+        if (!row) throw new Error('canary account create failed and no row found');
+        canaryUserId = Number(row.id);
+        ownedCanary = String(row.username || '').startsWith('__canary_');
+      }
+      if (canaryUserId && !ownedCanary) { createdNew = true; ownedCanary = true; }
     }
   } catch (e) {
-    // Non-fatal: fall back to the unbound well-formed token. The send test still runs.
-    linkKind = `well-formed (account lookup skipped: ${errMsg(e)})`;
+    return { severity: 'fail', detail: `Canary account setup FAILED: ${errMsg(e)}`, data: { to: canaryEmail } };
   }
 
+  // In-process full-loop proof (only on an account we own).
+  let flip: { before: boolean; verifyStatus: number; after: boolean } | null = null;
+  if (ownedCanary) {
+    await DB.query('UPDATE users SET email_verified = 0 WHERE id = ?', [canaryUserId]);
+    const proofToken = await mintToken(canaryUserId);
+    const vr = await selfRequest('POST', '/mirror/api/auth/verify-email', { json: { token: proofToken } });
+    const [after] = await DB.query('SELECT email_verified FROM users WHERE id = ?', [canaryUserId]);
+    const flipped = Number((after as any[])[0]?.email_verified) === 1;
+    flip = { before: false, verifyStatus: vr.status, after: flipped };
+    if (vr.status !== 200 || !flipped) {
+      return {
+        severity: 'fail',
+        detail: `Canary full-loop FAILED — /verify-email=${vr.status}, email_verified=${flipped ? 1 : 0} (expected 200 + flip to 1)`,
+        data: { canaryUserId, flip },
+      };
+    }
+    // Re-arm: reset + fresh token so the EMAILED link also flips on a human click.
+    await DB.query('UPDATE users SET email_verified = 0 WHERE id = ?', [canaryUserId]);
+  }
+
+  const emailToken = await mintToken(canaryUserId);
   const result = await emailService.sendTemplate(canary, 'email_verification', {
     username: 'staging-canary',
-    verificationUrl: `${appUrl}/verify-email?token=${token}`,
+    verificationUrl: `${appUrl}/verify-email?token=${emailToken}`,
   } as any);
   if (!result.success) {
-    return { severity: 'fail', detail: `Send pipeline FAILED: ${result.error || 'unknown provider error'}`, data: { to: canary } };
+    return { severity: 'fail', detail: `Send pipeline FAILED: ${result.error || 'unknown provider error'}`, data: { to: canary, canaryUserId, flip } };
   }
+
+  const flipNote = flip
+    ? `Full loop PROVEN: /verify-email flipped email_verified false→true on canary account #${canaryUserId}${createdNew ? ' (created)' : ''}. Emailed a fresh token — clicking it flips it again.`
+    : `Bound a token to pre-existing account #${canaryUserId} (not canary-owned; state untouched) — clicking verifies it (idempotent).`;
   return {
     severity: 'pass',
     detail: dryRun
-      ? 'Send path OK (EMAIL_DRY_RUN — provider not called; set false to exercise Resend for real).'
-      : `Real send ACCEPTED by provider (messageId=${result.messageId || 'n/a'}) -> ${canary}. Link is ${linkKind}. Confirm delivery in the canary inbox.`,
-    data: { messageId: result.messageId, dryRun, to: canary, linkKind },
+      ? `Send path OK (EMAIL_DRY_RUN — provider not called). ${flipNote}`
+      : `Real send ACCEPTED by provider (messageId=${result.messageId || 'n/a'}) -> ${canary}. ${flipNote} Confirm delivery in the canary inbox.`,
+    data: { messageId: result.messageId, dryRun, to: canary, canaryUserId, ownedCanary, createdNew, flip },
   };
 }
 
