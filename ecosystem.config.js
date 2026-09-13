@@ -34,6 +34,21 @@ const sharedEnv = {
   NODE_OPTIONS: '--enable-source-maps',
 };
 
+// Least privilege: the root pm2 daemon spawns each app as mirror_app (uid), so a
+// compromise is contained to that account instead of root. mirror-server also
+// needs gid=sslcert to READ the Let's Encrypt private key — pm2's uid/gid drop
+// does NOT call initgroups(), so the process gets ONLY this gid (no supplementary
+// groups); the workers open no TLS listener and stay gid=mirror_app. Host
+// prereqs (all verified on prod before enabling): the checkout/.env/dist/
+// node_modules are mirror_app-readable, the storage trees (MIRRORSTORAGE +
+// MIRRORUSERSTORAGE) are mirror_app-OWNED (chown -R — existing root-owned files
+// incl. per-user encryption keys would otherwise be unreadable), and the certs
+// are sslcert-group-readable with a renewal hook. Proven on staging first
+// (ecosystem.staging.config.js). Revert = drop uid/gid + `sudo pm2 restart`.
+const APP_UID = 'mirror_app';
+const TLS_GID = 'sslcert';    // mirror-server only — it reads the cert privkey
+const APP_GID = 'mirror_app'; // workers — no TLS listener, no cert read
+
 module.exports = {
   apps: [
     // ========================================================================
@@ -43,6 +58,8 @@ module.exports = {
       name: 'mirror-server',
       script: path.join(DIST, 'index.js'),
       cwd: CWD,
+      uid: APP_UID,
+      gid: TLS_GID, // reads the Let's Encrypt privkey for the HTTPS listener
 
       // Restart policy
       autorestart: true,
@@ -81,6 +98,8 @@ module.exports = {
       name: 'analysis-worker',
       script: path.join(DIST, 'workers', 'AnalysisQueueProcessor.js'),
       cwd: CWD,
+      uid: APP_UID,
+      gid: APP_GID,
 
       // Restart policy
       autorestart: true,
@@ -115,6 +134,8 @@ module.exports = {
       name: 'dina-chat-worker',
       script: path.join(DIST, 'workers', 'DinaChatQueueProcessor.js'),
       cwd: CWD,
+      uid: APP_UID,
+      gid: APP_GID,
 
       // Restart policy
       autorestart: true,
@@ -149,6 +170,8 @@ module.exports = {
       name: 'truthstream-worker',
       script: path.join(DIST, 'workers', 'TruthStreamQueueProcessor.js'),
       cwd: CWD,
+      uid: APP_UID,
+      gid: APP_GID,
 
       // Restart policy
       autorestart: true,
@@ -183,6 +206,8 @@ module.exports = {
       name: 'personal-analysis-worker',
       script: path.join(DIST, 'workers', 'PersonalAnalysisQueueProcessor.js'),
       cwd: CWD,
+      uid: APP_UID,
+      gid: APP_GID,
 
       // Restart policy
       autorestart: true,
@@ -220,6 +245,8 @@ module.exports = {
       name: 'email-campaign-worker',
       script: path.join(DIST, 'workers', 'EmailCampaignWorker.js'),
       cwd: CWD,
+      uid: APP_UID,
+      gid: APP_GID,
 
       // Restart policy
       autorestart: true,

@@ -241,7 +241,10 @@ jobs:
           # to 'restart' for bulletproof reload — graceful path occasionally
           # left workers in inconsistent state).
           echo "[6/6] Restarting PM2 processes..."
-          sudo pm2 restart ecosystem.config.js
+          # --update-env forces pm2 to re-read the ecosystem file's config on
+          # restart (matches the staging deploy), so changes like the per-app
+          # uid/gid de-privilege actually apply to the re-spawned processes.
+          sudo pm2 restart ecosystem.config.js --update-env
 
           echo ""
           echo "Deploy complete. Waiting for processes to stabilize..."
@@ -337,8 +340,10 @@ jobs:
           npm ci --production
           npm run build
           # Hard restart on rollback too — same reasoning as the deploy
-          # step (defends against stuck state in workers).
-          sudo pm2 restart ecosystem.config.js
+          # step (defends against stuck state in workers). --update-env re-reads
+          # the rolled-back ecosystem file so the process identity (uid/gid)
+          # reverts cleanly along with the code.
+          sudo pm2 restart ecosystem.config.js --update-env
 
           echo "Rollback complete. Waiting for stabilization..."
           sleep 15
