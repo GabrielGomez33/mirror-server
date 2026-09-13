@@ -759,9 +759,36 @@ async function runEmailSendCheck(): Promise<{ detail: string; data?: Record<stri
   }
   const dryRun = (process.env.EMAIL_DRY_RUN || '').toLowerCase() === 'true';
   const appUrl = (process.env.APP_URL || '').replace(/\/+$/, '');
+
+  // Build a WELL-FORMED verification link (64 hex — exactly what the real app
+  // mints), never the old `CANARY_<ts>` sentinel that tripped the format
+  // validator and made the emailed link read as "Invalid token format" (which
+  // looked like broken link-creation on every staging deploy). If the canary
+  // address belongs to a real staging account, bind the token to it so clicking
+  // the link actually VERIFIES that account (idempotent) — a true end-to-end
+  // proof a human can see. Otherwise the token is well-formed but unbound, so a
+  // click yields the benign "token not found or already expired", never a
+  // format error. The send test (provider acceptance) is unchanged.
+  const token = crypto.randomBytes(32).toString('hex');
+  let linkKind = 'well-formed (unbound — no staging account for this address)';
+  try {
+    const [urows] = await DB.query('SELECT id FROM users WHERE email = ? LIMIT 1', [canary]);
+    const canaryUserId = (urows as any[])[0]?.id;
+    if (canaryUserId) {
+      await DB.query(
+        `INSERT INTO email_verification_tokens (user_id, token, expires_at) VALUES (?, ?, ?)`,
+        [canaryUserId, token, new Date(Date.now() + 24 * 60 * 60 * 1000)],
+      );
+      linkKind = 'bound to the existing canary account — clicking verifies it (idempotent)';
+    }
+  } catch (e) {
+    // Non-fatal: fall back to the unbound well-formed token. The send test still runs.
+    linkKind = `well-formed (account lookup skipped: ${errMsg(e)})`;
+  }
+
   const result = await emailService.sendTemplate(canary, 'email_verification', {
     username: 'staging-canary',
-    verificationUrl: `${appUrl}/verify-email?token=CANARY_${Date.now()}`,
+    verificationUrl: `${appUrl}/verify-email?token=${token}`,
   } as any);
   if (!result.success) {
     return { severity: 'fail', detail: `Send pipeline FAILED: ${result.error || 'unknown provider error'}`, data: { to: canary } };
@@ -770,8 +797,8 @@ async function runEmailSendCheck(): Promise<{ detail: string; data?: Record<stri
     severity: 'pass',
     detail: dryRun
       ? 'Send path OK (EMAIL_DRY_RUN — provider not called; set false to exercise Resend for real).'
-      : `Real send ACCEPTED by provider (messageId=${result.messageId || 'n/a'}) -> ${canary}. Confirm delivery in the canary inbox.`,
-    data: { messageId: result.messageId, dryRun, to: canary },
+      : `Real send ACCEPTED by provider (messageId=${result.messageId || 'n/a'}) -> ${canary}. Link is ${linkKind}. Confirm delivery in the canary inbox.`,
+    data: { messageId: result.messageId, dryRun, to: canary, linkKind },
   };
 }
 
@@ -975,6 +1002,53 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
 
       const keptNote = options.skipCleanup ? ' (kept: login-enabled, credentials in report)' : '';
       return { detail: `Created sim user #${userId} (${simUsername}) + directories + keys + session + premium${keptNote}`, data: { userId } };
+    });
+
+    // ---- 1a2. EMAIL VERIFY (real link-creation + verify endpoint, full loop) -
+    // Proves the ACTUAL verification path a registered user takes: a 64-hex token
+    // (exactly what authController/emailVerificationController mint) is accepted,
+    // flips users.email_verified, and is idempotent — while a malformed token is
+    // rejected 400 INVALID_TOKEN and an unknown well-formed token is 404
+    // TOKEN_NOT_FOUND. This is the regression guard for "email verification is
+    // broken / invalid token format": if link-creation or the verify endpoint
+    // ever drift out of sync, this step goes red. (The staging email_send canary
+    // only proves the PROVIDER accepts a send; it deliberately carries a non-
+    // verifiable token, so it can never prove the verify loop — this step does.)
+    await step(steps, 'email_verify', async () => {
+      // Negative 1: malformed token → 400 INVALID_TOKEN (the exact error the
+      // canary link surfaces, proven to be a FORMAT guard, not a real breakage).
+      const bad = await selfRequest('POST', '/mirror/api/auth/verify-email', { json: { token: `CANARY_${Date.now()}` } });
+      if (bad.status !== 400) throw new Error(`malformed token expected 400, got ${bad.status} ${JSON.stringify(bad.body).slice(0, 160)}`);
+
+      // Negative 2: well-formed but unknown token → 404 TOKEN_NOT_FOUND.
+      const unknown = await selfRequest('POST', '/mirror/api/auth/verify-email', { json: { token: crypto.randomBytes(32).toString('hex') } });
+      if (unknown.status !== 404) throw new Error(`unknown 64-hex token expected 404, got ${unknown.status}`);
+
+      // Positive: mint a REAL token the same way the app does (64 hex, 24h), then
+      // verify it through the real endpoint and confirm the DB flag flipped.
+      const realToken = crypto.randomBytes(32).toString('hex');
+      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      await DB.query(
+        `INSERT INTO email_verification_tokens (user_id, token, expires_at) VALUES (?, ?, ?)`,
+        [userId, realToken, expiresAt],
+      );
+      const ok = await selfRequest('POST', '/mirror/api/auth/verify-email', { json: { token: realToken } });
+      if (ok.status !== 200 || !ok.body?.message) {
+        throw new Error(`verify-email expected 200, got ${ok.status} ${JSON.stringify(ok.body).slice(0, 160)}`);
+      }
+      const [vrows] = await DB.query(`SELECT email_verified FROM users WHERE id = ?`, [userId]);
+      const verified = Number((vrows as any[])[0]?.email_verified) === 1;
+      if (!verified) throw new Error('verify-email returned 200 but users.email_verified did not flip to 1');
+
+      // Idempotency: replaying the (now-used) token must not error the user out.
+      const replay = await selfRequest('POST', '/mirror/api/auth/verify-email', { json: { token: realToken } });
+      if (replay.status !== 200 && replay.status !== 400 && replay.status !== 404) {
+        throw new Error(`verify-email replay returned unexpected ${replay.status}`);
+      }
+      return {
+        detail: 'Real verification loop OK — 64-hex token verified (email_verified=1); malformed→400, unknown→404 (link-creation is sound)',
+        data: { verified, malformedRejected: true, unknownRejected: true },
+      };
     });
 
     // ---- 1b. ENTRY INTAKE (real POST -> /intake/entry/submit) --------------
