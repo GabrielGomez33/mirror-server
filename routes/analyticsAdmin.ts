@@ -16,7 +16,7 @@
 import express, { Request, Response } from 'express';
 import { requireInternalSecret } from '../middleware/internalAuth';
 import { Logger } from '../utils/logger';
-import { getFunnelAggregate } from '../services/conversionAnalytics';
+import { getFunnelAggregate, getFunnelAnalytics } from '../services/conversionAnalytics';
 import { buildComplianceRecord } from '../services/complianceRecord';
 
 const router = express.Router();
@@ -41,6 +41,21 @@ router.get('/funnel', async (req: Request, res: Response) => {
   } catch (err) {
     logger.error('Failed to read funnel aggregate', err as Error);
     res.status(500).json({ success: false, error: 'Failed to read funnel aggregate' });
+  }
+});
+
+// GET /insights?sinceDays=30 — full operator analytics: monotonic drop-off funnel,
+// stage→stage + milestone conversion, per-utm_source breakdown, and a daily trend.
+// Aggregate + anonymous (session-token counts only); no row-level or per-user data.
+router.get('/insights', async (req: Request, res: Response) => {
+  const sinceDays = Math.min(365, Math.max(1, parseInt(String(req.query.sinceDays ?? '30'), 10) || 30));
+  try {
+    const data = await getFunnelAnalytics(sinceDays);
+    audit('insights_read', req, { sinceDays, totalSessions: data.totalSessions });
+    res.json({ success: true, data });
+  } catch (err) {
+    logger.error('Failed to build funnel analytics', err as Error);
+    res.status(500).json({ success: false, error: 'Failed to build funnel analytics' });
   }
 });
 
