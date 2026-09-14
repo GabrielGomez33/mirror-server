@@ -16,12 +16,13 @@
 // ----------------------------------------------------------------------------
 
 import { DB } from '../db';
-import { sanitizeConversionEvent } from '../utils/conversionFunnel';
+import { sanitizeConversionEvent, FUNNEL_STAGES } from '../utils/conversionFunnel';
 import { findPiiColumns } from '../utils/piiColumnGuard';
 import {
   recordConversionEvent,
   pruneConversionEvents,
   getFunnelAggregate,
+  getFunnelAnalytics,
   getConversionInventory,
   getRetentionStatus,
 } from '../services/conversionAnalytics';
@@ -134,6 +135,57 @@ async function main() {
     ok(!!rec.policyVersion, 'compliance record: policy version present');
     ok(!!rec.accountData.dataSubjectRights.erasure && !!rec.accountData.dataSubjectRights.access_portability, 'compliance record: erasure + export rights described');
     ok(rec.privacySignals.globalPrivacyControl.toLowerCase().includes('honored'), 'compliance record: GPC honored');
+  }
+
+  // --- FULL ANALYTICS (getFunnelAnalytics): drop-off, per-source, trend -------
+  // Real-DB proof of the SQL that feeds the operator dashboard. Fresh fixture:
+  // sessions emit their whole prefix path so "furthest stage reached" is exact.
+  {
+    await DB.query('DELETE FROM conversion_events');
+    const emitPath = async (session: string, source: string, furthestOrder: number) => {
+      for (const st of FUNNEL_STAGES.slice(0, furthestOrder + 1)) {
+        const clean = sanitizeConversionEvent({ stage: st, sessionToken: session, utmSource: source, surface: 'web' });
+        if (!clean) throw new Error(`fixture stage not accepted: ${st}`);
+        await recordConversionEvent(clean);
+      }
+    };
+    // instagram: 1 stops at landing, 1 at signup_completed(order2), 1 goes all the way(order10)
+    await emitPath(crypto.randomUUID(), 'instagram', 0);
+    await emitPath(crypto.randomUUID(), 'instagram', 2);
+    await emitPath(crypto.randomUUID(), 'instagram', 10);
+    // organic: 1 stops at landing, 1 at entry_first_value(order4)
+    await emitPath(crypto.randomUUID(), 'organic', 0);
+    await emitPath(crypto.randomUUID(), 'organic', 4);
+
+    const a = await getFunnelAnalytics(30);
+    const reach = (stage: string) => a.metrics.steps.find((s) => s.stage === stage)!.sessionsReaching;
+
+    ok(a.totalSessions === 5, 'analytics: 5 distinct sessions total');
+    ok(a.metrics.entrySessions === 5, 'analytics: entrySessions = 5 (all reached landing)');
+    // Monotonic funnel from real SQL.
+    let mono = true;
+    for (let i = 1; i < a.metrics.steps.length; i++) if (a.metrics.steps[i].sessionsReaching > a.metrics.steps[i - 1].sessionsReaching) mono = false;
+    ok(mono, 'analytics: reached-funnel from SQL is monotonic non-increasing');
+    ok(reach('landing_view') === 5, 'analytics: landing reaching = 5');
+    ok(reach('signup_completed') === 3, 'analytics: signup_completed reaching = 3');
+    ok(reach('entry_first_value') === 2, 'analytics: entry_first_value reaching = 2');
+    ok(reach('premium_activated') === 1, 'analytics: premium_activated reaching = 1');
+    ok(a.metrics.overallConversionPct === 20, 'analytics: overall conversion = 1/5 = 20%');
+    ok(!!a.metrics.biggestDrop && a.metrics.biggestDrop.fromStage === 'landing_view' && a.metrics.biggestDrop.toStage === 'signup_view' && a.metrics.biggestDrop.sessionsLost === 2,
+       'analytics: biggest drop is landing_view→signup_view (2 lost)');
+
+    // Per-source breakdown.
+    const src = (name: string) => a.sources.find((s) => s.source === name);
+    ok(!!src('instagram') && src('instagram')!.sessions === 3 && src('instagram')!.premium === 1 && src('instagram')!.signups === 2,
+       'analytics: instagram source = 3 sessions, 2 signups, 1 premium');
+    ok(!!src('organic') && src('organic')!.sessions === 2 && src('organic')!.premium === 0 && src('organic')!.aha === 1,
+       'analytics: organic source = 2 sessions, 0 premium, 1 aha');
+    ok(a.sources[0].sessions >= a.sources[a.sources.length - 1].sessions, 'analytics: sources ordered by session volume desc');
+
+    // Trend: one day (fixtures created now), landing sessions sum to 5.
+    ok(a.trend.length >= 1, 'analytics: trend has at least one day');
+    ok(a.trend.reduce((s, p) => s + p.landing, 0) === 5, 'analytics: trend landing sessions sum to 5');
+    ok(/^\d{4}-\d{2}-\d{2}$/.test(a.trend[0].day), 'analytics: trend day is YYYY-MM-DD');
   }
 
   await DB.query('DROP TABLE IF EXISTS conversion_events');

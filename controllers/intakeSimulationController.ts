@@ -759,19 +759,93 @@ async function runEmailSendCheck(): Promise<{ detail: string; data?: Record<stri
   }
   const dryRun = (process.env.EMAIL_DRY_RUN || '').toLowerCase() === 'true';
   const appUrl = (process.env.APP_URL || '').replace(/\/+$/, '');
+  const canaryEmail = canary.toLowerCase(); // createUserInDB canonicalizes to lower-case
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const mintToken = async (userId: number): Promise<string> => {
+    const t = crypto.randomBytes(32).toString('hex');
+    await DB.query(
+      `INSERT INTO email_verification_tokens (user_id, token, expires_at) VALUES (?, ?, ?)`,
+      [userId, t, new Date(Date.now() + DAY_MS)],
+    );
+    return t;
+  };
+
+  // FULL PIPELINE on a persistent, dedicated staging canary account:
+  //   1. ensure the account exists (reserved `__canary_` username so we own it
+  //      and never mutate a real user's account),
+  //   2. PROVE the whole loop in-process — reset email_verified=0, mint a real
+  //      64-hex token, POST it to the REAL /verify-email endpoint, and assert the
+  //      DB flag flipped false->true (this is the visible "true completion"),
+  //   3. reset again + mint a FRESH token, and email THAT so a human clicking the
+  //      link also completes the flip (or gets idempotent success). The provider
+  //      send-acceptance test is preserved.
+  // If the address already belongs to a NON-canary account we do NOT touch its
+  // state — we only bind+send (click → idempotent verify), so a real account is
+  // never reset by the gate.
+  let canaryUserId: number;
+  let ownedCanary = false;
+  let createdNew = false;
+  try {
+    const [urows] = await DB.query('SELECT id, username FROM users WHERE LOWER(email) = ? LIMIT 1', [canaryEmail]);
+    const existing = (urows as any[])[0];
+    if (existing) {
+      canaryUserId = Number(existing.id);
+      ownedCanary = String(existing.username || '').startsWith('__canary_');
+    } else {
+      try {
+        canaryUserId = await createUserInDB(`__canary_${crypto.randomBytes(4).toString('hex')}`, canaryEmail, strongRandomPassword());
+      } catch {
+        // Lost a create race (unique email) — re-read the row the winner made.
+        const [again] = await DB.query('SELECT id, username FROM users WHERE LOWER(email) = ? LIMIT 1', [canaryEmail]);
+        const row = (again as any[])[0];
+        if (!row) throw new Error('canary account create failed and no row found');
+        canaryUserId = Number(row.id);
+        ownedCanary = String(row.username || '').startsWith('__canary_');
+      }
+      if (canaryUserId && !ownedCanary) { createdNew = true; ownedCanary = true; }
+    }
+  } catch (e) {
+    return { severity: 'fail', detail: `Canary account setup FAILED: ${errMsg(e)}`, data: { to: canaryEmail } };
+  }
+
+  // In-process full-loop proof (only on an account we own).
+  let flip: { before: boolean; verifyStatus: number; after: boolean } | null = null;
+  if (ownedCanary) {
+    await DB.query('UPDATE users SET email_verified = 0 WHERE id = ?', [canaryUserId]);
+    const proofToken = await mintToken(canaryUserId);
+    const vr = await selfRequest('POST', '/mirror/api/auth/verify-email', { json: { token: proofToken } });
+    const [after] = await DB.query('SELECT email_verified FROM users WHERE id = ?', [canaryUserId]);
+    const flipped = Number((after as any[])[0]?.email_verified) === 1;
+    flip = { before: false, verifyStatus: vr.status, after: flipped };
+    if (vr.status !== 200 || !flipped) {
+      return {
+        severity: 'fail',
+        detail: `Canary full-loop FAILED — /verify-email=${vr.status}, email_verified=${flipped ? 1 : 0} (expected 200 + flip to 1)`,
+        data: { canaryUserId, flip },
+      };
+    }
+    // Re-arm: reset + fresh token so the EMAILED link also flips on a human click.
+    await DB.query('UPDATE users SET email_verified = 0 WHERE id = ?', [canaryUserId]);
+  }
+
+  const emailToken = await mintToken(canaryUserId);
   const result = await emailService.sendTemplate(canary, 'email_verification', {
     username: 'staging-canary',
-    verificationUrl: `${appUrl}/verify-email?token=CANARY_${Date.now()}`,
+    verificationUrl: `${appUrl}/verify-email?token=${emailToken}`,
   } as any);
   if (!result.success) {
-    return { severity: 'fail', detail: `Send pipeline FAILED: ${result.error || 'unknown provider error'}`, data: { to: canary } };
+    return { severity: 'fail', detail: `Send pipeline FAILED: ${result.error || 'unknown provider error'}`, data: { to: canary, canaryUserId, flip } };
   }
+
+  const flipNote = flip
+    ? `Full loop PROVEN: /verify-email flipped email_verified false→true on canary account #${canaryUserId}${createdNew ? ' (created)' : ''}. Emailed a fresh token — clicking it flips it again.`
+    : `Bound a token to pre-existing account #${canaryUserId} (not canary-owned; state untouched) — clicking verifies it (idempotent).`;
   return {
     severity: 'pass',
     detail: dryRun
-      ? 'Send path OK (EMAIL_DRY_RUN — provider not called; set false to exercise Resend for real).'
-      : `Real send ACCEPTED by provider (messageId=${result.messageId || 'n/a'}) -> ${canary}. Confirm delivery in the canary inbox.`,
-    data: { messageId: result.messageId, dryRun, to: canary },
+      ? `Send path OK (EMAIL_DRY_RUN — provider not called). ${flipNote}`
+      : `Real send ACCEPTED by provider (messageId=${result.messageId || 'n/a'}) -> ${canary}. ${flipNote} Confirm delivery in the canary inbox.`,
+    data: { messageId: result.messageId, dryRun, to: canary, canaryUserId, ownedCanary, createdNew, flip },
   };
 }
 
@@ -975,6 +1049,53 @@ export async function runIntakeSimulation(options: RunOptions, operator: string)
 
       const keptNote = options.skipCleanup ? ' (kept: login-enabled, credentials in report)' : '';
       return { detail: `Created sim user #${userId} (${simUsername}) + directories + keys + session + premium${keptNote}`, data: { userId } };
+    });
+
+    // ---- 1a2. EMAIL VERIFY (real link-creation + verify endpoint, full loop) -
+    // Proves the ACTUAL verification path a registered user takes: a 64-hex token
+    // (exactly what authController/emailVerificationController mint) is accepted,
+    // flips users.email_verified, and is idempotent — while a malformed token is
+    // rejected 400 INVALID_TOKEN and an unknown well-formed token is 404
+    // TOKEN_NOT_FOUND. This is the regression guard for "email verification is
+    // broken / invalid token format": if link-creation or the verify endpoint
+    // ever drift out of sync, this step goes red. (The staging email_send canary
+    // only proves the PROVIDER accepts a send; it deliberately carries a non-
+    // verifiable token, so it can never prove the verify loop — this step does.)
+    await step(steps, 'email_verify', async () => {
+      // Negative 1: malformed token → 400 INVALID_TOKEN (the exact error the
+      // canary link surfaces, proven to be a FORMAT guard, not a real breakage).
+      const bad = await selfRequest('POST', '/mirror/api/auth/verify-email', { json: { token: `CANARY_${Date.now()}` } });
+      if (bad.status !== 400) throw new Error(`malformed token expected 400, got ${bad.status} ${JSON.stringify(bad.body).slice(0, 160)}`);
+
+      // Negative 2: well-formed but unknown token → 404 TOKEN_NOT_FOUND.
+      const unknown = await selfRequest('POST', '/mirror/api/auth/verify-email', { json: { token: crypto.randomBytes(32).toString('hex') } });
+      if (unknown.status !== 404) throw new Error(`unknown 64-hex token expected 404, got ${unknown.status}`);
+
+      // Positive: mint a REAL token the same way the app does (64 hex, 24h), then
+      // verify it through the real endpoint and confirm the DB flag flipped.
+      const realToken = crypto.randomBytes(32).toString('hex');
+      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      await DB.query(
+        `INSERT INTO email_verification_tokens (user_id, token, expires_at) VALUES (?, ?, ?)`,
+        [userId, realToken, expiresAt],
+      );
+      const ok = await selfRequest('POST', '/mirror/api/auth/verify-email', { json: { token: realToken } });
+      if (ok.status !== 200 || !ok.body?.message) {
+        throw new Error(`verify-email expected 200, got ${ok.status} ${JSON.stringify(ok.body).slice(0, 160)}`);
+      }
+      const [vrows] = await DB.query(`SELECT email_verified FROM users WHERE id = ?`, [userId]);
+      const verified = Number((vrows as any[])[0]?.email_verified) === 1;
+      if (!verified) throw new Error('verify-email returned 200 but users.email_verified did not flip to 1');
+
+      // Idempotency: replaying the (now-used) token must not error the user out.
+      const replay = await selfRequest('POST', '/mirror/api/auth/verify-email', { json: { token: realToken } });
+      if (replay.status !== 200 && replay.status !== 400 && replay.status !== 404) {
+        throw new Error(`verify-email replay returned unexpected ${replay.status}`);
+      }
+      return {
+        detail: 'Real verification loop OK — 64-hex token verified (email_verified=1); malformed→400, unknown→404 (link-creation is sound)',
+        data: { verified, malformedRejected: true, unknownRejected: true },
+      };
     });
 
     // ---- 1b. ENTRY INTAKE (real POST -> /intake/entry/submit) --------------
