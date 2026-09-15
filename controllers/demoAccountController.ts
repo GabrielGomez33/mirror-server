@@ -1,0 +1,156 @@
+// controllers/demoAccountController.ts
+// ----------------------------------------------------------------------------
+// DEMO / TRIAL account provisioner. Mints a REAL, persistent, premium-enabled
+// account whose credentials an operator hands to an umbrella client's testers.
+//
+// Deliberately SEPARATE from the intake simulation. The sim's whole safety model
+// is "everything I touch is disposable, lives in the __sim_ / *.invalid
+// namespace, and gets torn down". Demo accounts are the opposite — real,
+// persistent, real-domain email, must survive. Keeping them apart means the
+// sim's destructive teardown + orphan sweeper can NEVER see a demo account, and
+// this module can never invoke teardown. Shared low-level building blocks
+// (createUserInDB, grantPermanentPremium, strongRandomPassword) are reused so
+// there is no duplicated logic — only the orchestration differs.
+//
+// Namespace: username `demo_<id>`, email `demo+<id>@<DEMO_EMAIL_DOMAIN>`. Both
+// are provably outside the sim's reserved namespace (asserted in tests), so the
+// sim sweeper's `__sim_%` / `@*.invalid` criteria never match a demo account.
+//
+// The generated password is returned ONCE to the caller and is never logged or
+// persisted in plaintext (only the bcrypt hash exists, via createUserInDB). The
+// `demo_accounts` registry stores no password.
+// ----------------------------------------------------------------------------
+
+import { DB } from '../db';
+import { createUserInDB, deleteUserFromDB } from './userController';
+import { grantPermanentPremium } from '../services/premiumGrant';
+import { strongRandomPassword } from '../utils/passwordGen';
+import { newDemoIdentity, assertRevocable } from '../utils/demoIdentity';
+import { Logger } from '../utils/logger';
+
+const logger = new Logger('DemoAccount');
+
+/** Base URL a tester logs in at. Uses the deployment's APP_URL, else the app domain. */
+function loginUrl(): string {
+  const base = (process.env.APP_URL || 'https://www.trymirror.world').replace(/\/+$/, '');
+  return `${base}/login`;
+}
+
+export interface DemoAccount {
+  userId: number;
+  username: string;
+  email: string;
+  label: string | null;
+  createdBy: string | null;
+  createdAt: string;
+  userExists?: boolean; // list-only: false if the underlying user was removed out-of-band
+}
+export interface ProvisionedDemo extends DemoAccount {
+  password: string; // returned ONCE — never logged or stored
+  loginUrl: string;
+}
+
+/** Self-bootstrapping registry (additive; same pattern as intake_simulation_runs). */
+async function ensureRegistry(): Promise<void> {
+  await DB.query(`
+    CREATE TABLE IF NOT EXISTS demo_accounts (
+      user_id     BIGINT       PRIMARY KEY,
+      username    VARCHAR(64)  NOT NULL,
+      email       VARCHAR(255) NOT NULL,
+      label       VARCHAR(120) NULL,
+      created_by  VARCHAR(120) NULL,
+      created_at  TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_demo_created (created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`);
+}
+
+/**
+ * Provision one demo account: real user (dirs + keys + hashed pw) → email
+ * pre-verified (friction-free login) → permanent premium → registry row.
+ * Returns the credentials once. Retries on the rare identity collision.
+ */
+export async function provisionDemoAccount(opts: { label?: string | null; createdBy?: string | null } = {}): Promise<ProvisionedDemo> {
+  await ensureRegistry();
+  const label = opts.label ? String(opts.label).slice(0, 120) : null;
+  const createdBy = opts.createdBy ? String(opts.createdBy).slice(0, 120) : null;
+  const password = strongRandomPassword();
+
+  let userId: number | null = null;
+  let identity = newDemoIdentity();
+  for (let attempt = 0; attempt < 3 && userId === null; attempt++) {
+    try {
+      userId = await createUserInDB(identity.username, identity.email, password);
+    } catch (e) {
+      const msg = (e as Error)?.message || '';
+      if (msg === 'USERNAME_TAKEN' || msg === 'EMAIL_ALREADY_REGISTERED') {
+        identity = newDemoIdentity(); // fresh random id and retry
+        continue;
+      }
+      throw e;
+    }
+  }
+  if (userId === null) throw new Error('could not allocate a unique demo identity after retries');
+
+  // Pre-verify (login works without an email round-trip) + grant premium.
+  await DB.query('UPDATE users SET email_verified = 1 WHERE id = ?', [userId]);
+  await grantPermanentPremium(userId);
+
+  await DB.query(
+    `INSERT INTO demo_accounts (user_id, username, email, label, created_by) VALUES (?, ?, ?, ?, ?)`,
+    [userId, identity.username, identity.email, label, createdBy],
+  );
+
+  // Audit WITHOUT the password.
+  logger.info('Provisioned demo account', { userId, username: identity.username, label, createdBy });
+
+  return {
+    userId,
+    username: identity.username,
+    email: identity.email,
+    label,
+    createdBy,
+    createdAt: new Date().toISOString(),
+    password,
+    loginUrl: loginUrl(),
+  };
+}
+
+/** List demo accounts (newest first), flagging any whose underlying user is gone. */
+export async function listDemoAccounts(): Promise<DemoAccount[]> {
+  await ensureRegistry();
+  const [rows] = await DB.query(
+    `SELECT d.user_id, d.username, d.email, d.label, d.created_by, d.created_at,
+            EXISTS(SELECT 1 FROM users u WHERE u.id = d.user_id) AS user_exists
+       FROM demo_accounts d
+      ORDER BY d.created_at DESC
+      LIMIT 500`,
+  );
+  return (rows as any[]).map((r) => ({
+    userId: Number(r.user_id),
+    username: String(r.username),
+    email: String(r.email),
+    label: r.label ?? null,
+    createdBy: r.created_by ?? null,
+    createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+    userExists: Number(r.user_exists) === 1,
+  }));
+}
+
+/**
+ * Revoke a demo account: delete the user via the canonical teardown, then drop
+ * the registry row. GUARD (defense in depth): refuses any user_id NOT registered
+ * in demo_accounts, so this can never delete a real user even if handed one.
+ */
+export async function revokeDemoAccount(userId: number, revokedBy?: string | null): Promise<{ deleted: boolean }> {
+  await ensureRegistry();
+  const uid = Number(userId);
+  if (!Number.isInteger(uid) || uid <= 0) throw new Error('invalid user id');
+
+  const [rows] = await DB.query('SELECT user_id FROM demo_accounts WHERE user_id = ? LIMIT 1', [uid]);
+  assertRevocable((rows as any[]).length > 0);
+
+  await deleteUserFromDB(String(uid), uid); // filesystem + transactional DB cascade
+  await DB.query('DELETE FROM demo_accounts WHERE user_id = ?', [uid]);
+  logger.info('Revoked demo account', { userId: uid, revokedBy: revokedBy ? String(revokedBy).slice(0, 120) : null });
+  return { deleted: true };
+}

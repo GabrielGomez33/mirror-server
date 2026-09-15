@@ -116,6 +116,7 @@ import { emailService } from './services/emailService';
 import adminEmailRoutes from './routes/adminEmail';
 import adminSimulationRoutes from './routes/adminSimulation';
 import analyticsAdminRoutes from './routes/analyticsAdmin';
+import demoAdminRoutes from './routes/demoAdmin';
 import emailPublicRoutes from './routes/emailPublic';
 import waitlistRoutes from './routes/waitlist';
 import analyticsRoutes from './routes/analytics';
@@ -429,6 +430,9 @@ console.log('[ROUTES] Admin intake-simulation routes mounted at /mirror/api/admi
 // Aggregate funnel reads + the live, drift-proof compliance record for entities.
 APP.use('/mirror/api/admin/analytics', analyticsAdminRoutes);
 console.log('[ROUTES] Admin analytics/compliance routes mounted at /mirror/api/admin/analytics');
+
+APP.use('/mirror/api/admin/demo', demoAdminRoutes);
+console.log('[ROUTES] Admin demo-account routes mounted at /mirror/api/admin/demo');
 
 // ============================================================================
 // MOUNT MIRRORGROUPS ROUTES (PHASE 1 + PHASE 3 + PHASE 4)

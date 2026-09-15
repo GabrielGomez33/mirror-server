@@ -84,7 +84,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { DB } from '../db';
 import { Logger } from '../utils/logger';
-import { mirrorRedis } from '../config/redis';
+import { grantPermanentPremium } from '../services/premiumGrant';
+import { strongRandomPassword } from '../utils/passwordGen';
 import { TokenManager } from './authController';
 import { createUserInDB, deleteUserFromDB, updateUserPassword } from './userController';
 import { listTierFiles, TierType } from './directoryController';
@@ -298,23 +299,8 @@ function isLoopback(hostname: string): boolean {
   return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1';
 }
 
-/** Generate a password that satisfies the registration policy (upper, lower,
- *  digit, special, length 8–128). Used only for the throwaway sim user. */
-function strongRandomPassword(): string {
-  const upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
-  const lower = 'abcdefghijkmnpqrstuvwxyz';
-  const digit = '23456789';
-  const special = '!@#$%^&*()-_=+';
-  const pick = (set: string) => set[crypto.randomInt(set.length)];
-  const core = [pick(upper), pick(lower), pick(digit), pick(special)];
-  const all = upper + lower + digit + special;
-  for (let i = 0; i < 20; i++) core.push(pick(all));
-  for (let i = core.length - 1; i > 0; i--) {
-    const j = crypto.randomInt(i + 1);
-    [core[i], core[j]] = [core[j], core[i]];
-  }
-  return core.join('');
-}
+// strongRandomPassword now lives in utils/passwordGen (shared with the demo
+// provisioner) — imported above so both stay policy-correct from one source.
 
 /** True only for users this tool created. Teardown gates on this. */
 function looksLikeSimUser(username: string | null | undefined, email: string | null | undefined): boolean {
@@ -330,20 +316,9 @@ function looksLikeSimUser(username: string | null | undefined, email: string | n
  *  the MySQL TIMESTAMP 2038 ceiling) and clear the 5-minute subscription cache
  *  so it takes effect immediately. The row CASCADE-deletes with the user. */
 async function ensureSimUserPremium(userId: number): Promise<void> {
-  try {
-    await DB.query(
-      `INSERT INTO user_subscriptions (user_id, tier, status, provider)
-       VALUES (?, 'premium', 'active', 'manual')
-       ON DUPLICATE KEY UPDATE tier = 'premium', status = 'active', provider = 'manual',
-         cancelled_at = NULL, grace_period_end = NULL, cancel_reason = NULL, updated_at = CURRENT_TIMESTAMP`,
-      [userId],
-    );
-  } catch (e) {
-    // Surface clearly — without premium, downstream TruthStream steps will 403.
-    throw new Error(`failed to grant premium to user ${userId}: ${errMsg(e)}`);
-  }
-  // Best-effort cache bust so the gate sees premium on the very next request.
-  try { await mirrorRedis.del(`subscription:${userId}`); } catch { /* cache optional */ }
+  // Delegates to the shared grant (services/premiumGrant) so the sim and the
+  // demo provisioner grant premium identically — one source of truth.
+  await grantPermanentPremium(userId);
 }
 
 /** Admin action: (re-)assert ACTIVE premium for ANY user and bust the
