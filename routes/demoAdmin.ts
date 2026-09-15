@@ -31,9 +31,16 @@ function operator(req: Request): string {
 router.post('/provision', async (req: Request, res: Response) => {
   try {
     const label = typeof req.body?.label === 'string' && req.body.label.trim() ? req.body.label.trim() : null;
-    const acct = await provisionDemoAccount({ label, createdBy: operator(req) });
+    // Optional: email the tester their credentials. Passed through only when the
+    // key is present, so provisioning without email stays the default.
+    const deliverTo = typeof req.body?.deliverTo === 'string' && req.body.deliverTo.trim()
+      ? req.body.deliverTo.trim() : undefined;
+    const acct = await provisionDemoAccount({ label, createdBy: operator(req), deliverTo });
     // Audit WITHOUT the password (acct.password is intentionally omitted here).
-    logger.info('DEMO_AUDIT provision', { operator: operator(req), userId: acct.userId, username: acct.username, label: acct.label });
+    logger.info('DEMO_AUDIT provision', {
+      operator: operator(req), userId: acct.userId, username: acct.username, label: acct.label,
+      emailedTo: acct.emailDelivery?.to || null, emailSent: !!acct.emailDelivery?.sent,
+    });
     res.json({ success: true, data: acct });
   } catch (err) {
     logger.error('Failed to provision demo account', err as Error);

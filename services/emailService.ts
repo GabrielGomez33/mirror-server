@@ -97,7 +97,8 @@ export type EmailTemplateName =
   | 'student_verification'
   | 'student_access_granted'
   | 'student_access_expiring'
-  | 'student_access_expired';
+  | 'student_access_expired'
+  | 'demo_credentials';
 
 export interface EmailTemplateData {
   [key: string]: string | number | boolean | undefined;
@@ -410,6 +411,49 @@ const EMAIL_TEMPLATES: Record<EmailTemplateName, {
       </div>
     `,
     text: (data) => `Your student Mirror Premium has ended and your account is on the free plan. Still enrolled? Re-verify: ${data.reverifyUrl}`,
+  },
+
+  // --------------------------------------------------------------------------
+  // demo_credentials — sent by the admin demo-account provisioner when an
+  // operator asks to email a tester their brand-new trial credentials. Carries
+  // the ONE-TIME plaintext password (it exists nowhere else — only the bcrypt
+  // hash is stored), so the copy stresses saving it now. Premium is already
+  // active on the account. Required `data` keys:
+  //   loginUrl    — absolute sign-in URL
+  //   email       — the account's login email
+  //   password    — the one-time generated password
+  //   greetingName — who to greet (label, or "there")
+  // --------------------------------------------------------------------------
+  demo_credentials: {
+    subject: 'Your Mirror Premium access is ready',
+    html: (data) => `
+      <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 40px 20px; background: #0a0a0f; color: #e0e0e0;">
+        <div style="text-align: center; margin-bottom: 32px;">
+          <h1 style="color: #ffffff; font-size: 28px; margin: 0;">Mirror</h1>
+          <p style="color: #888; font-size: 14px; margin: 8px 0 0;">See yourself in the world, and the world in you</p>
+        </div>
+        <div style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 32px;">
+          <h2 style="color: #fff; margin: 0 0 16px;">Welcome, ${data.greetingName || 'there'} — your Premium access is ready</h2>
+          <p style="color: #ccc; line-height: 1.6;">An account with <strong style="color:#fff;">Mirror Premium</strong> has been set up for you. Sign in with the credentials below — Premium is already active, so everything is unlocked from your first visit.</p>
+          <div style="background: rgba(255,255,255,0.04); border: 1px solid rgba(139,92,246,0.3); border-radius: 8px; padding: 20px; margin: 24px 0; font-family: 'SF Mono', Consolas, monospace; font-size: 14px; color: #ddd;">
+            <div style="margin-bottom: 10px;"><span style="color:#8b5cf6; display:inline-block; width:92px;">Email</span> <span style="color:#fff; user-select:all;">${data.email}</span></div>
+            <div><span style="color:#8b5cf6; display:inline-block; width:92px;">Password</span> <span style="color:#fff; user-select:all;">${data.password}</span></div>
+          </div>
+          <div style="text-align: center; margin: 32px 0;">
+            <a href="${data.loginUrl}" style="display: inline-block; background: linear-gradient(135deg, #6366f1, #8b5cf6); color: #fff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-weight: 600;">Sign in to Mirror</a>
+          </div>
+          <p style="color: #888; font-size: 13px;">If the button doesn't work, go to ${data.loginUrl} and sign in with the email and password above.</p>
+          <hr style="border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 24px 0;" />
+          <p style="color: #888; font-size: 13px; line-height: 1.6;"><strong style="color: #ccc;">Keep this safe.</strong> For your security this password is shown only in this email — it isn't stored anywhere and can't be looked up later. You can change it any time from your account settings once you're in.</p>
+        </div>
+        <p style="color: #666; font-size: 12px; text-align: center; margin-top: 32px;">Mirror — &copy; ${new Date().getFullYear()}</p>
+      </div>
+    `,
+    text: (data) =>
+      `Welcome, ${data.greetingName || 'there'} — your Mirror Premium access is ready.\n\n` +
+      `Sign in at: ${data.loginUrl}\nEmail: ${data.email}\nPassword: ${data.password}\n\n` +
+      `Premium is already active. Keep this safe — the password is shown only in this email and isn't stored anywhere; ` +
+      `you can change it from your account settings after signing in.`,
   },
 };
 

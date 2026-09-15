@@ -25,7 +25,8 @@ import { DB } from '../db';
 import { createUserInDB, deleteUserFromDB } from './userController';
 import { grantPermanentPremium } from '../services/premiumGrant';
 import { strongRandomPassword } from '../utils/passwordGen';
-import { newDemoIdentity, assertRevocable } from '../utils/demoIdentity';
+import { newDemoIdentity, assertRevocable, normalizeRecipientEmail } from '../utils/demoIdentity';
+import { emailService } from '../services/emailService';
 import { Logger } from '../utils/logger';
 
 const logger = new Logger('DemoAccount');
@@ -43,11 +44,22 @@ export interface DemoAccount {
   label: string | null;
   createdBy: string | null;
   createdAt: string;
-  userExists?: boolean; // list-only: false if the underlying user was removed out-of-band
+  userExists?: boolean;    // list-only: false if the underlying user was removed out-of-band
+  emailVerified?: boolean; // list-only: live status — should be true for a healthy demo account
+  premiumActive?: boolean; // list-only: live status — should be true for a healthy demo account
+  premiumTier?: string | null; // list-only: the subscription tier, if any
+}
+/** Best-effort outcome of the optional "email the credentials" step. */
+export interface DemoEmailDelivery {
+  attempted: boolean;
+  sent: boolean;
+  to?: string;
+  error?: string;
 }
 export interface ProvisionedDemo extends DemoAccount {
   password: string; // returned ONCE — never logged or stored
   loginUrl: string;
+  emailDelivery?: DemoEmailDelivery;
 }
 
 /** Self-bootstrapping registry (additive; same pattern as intake_simulation_runs). */
@@ -69,10 +81,14 @@ async function ensureRegistry(): Promise<void> {
  * pre-verified (friction-free login) → permanent premium → registry row.
  * Returns the credentials once. Retries on the rare identity collision.
  */
-export async function provisionDemoAccount(opts: { label?: string | null; createdBy?: string | null } = {}): Promise<ProvisionedDemo> {
+export async function provisionDemoAccount(
+  opts: { label?: string | null; createdBy?: string | null; deliverTo?: string | null } = {},
+): Promise<ProvisionedDemo> {
   await ensureRegistry();
   const label = opts.label ? String(opts.label).slice(0, 120) : null;
   const createdBy = opts.createdBy ? String(opts.createdBy).slice(0, 120) : null;
+  // Validate the optional credential-email recipient up front (pure check).
+  const deliverTo = normalizeRecipientEmail(opts.deliverTo);
   const password = strongRandomPassword();
 
   let userId: number | null = null;
@@ -103,6 +119,34 @@ export async function provisionDemoAccount(opts: { label?: string | null; create
   // Audit WITHOUT the password.
   logger.info('Provisioned demo account', { userId, username: identity.username, label, createdBy });
 
+  const url = loginUrl();
+
+  // Optional: email the tester their credentials, reusing the shared email
+  // service + a stylized template. Best-effort — a delivery failure NEVER fails
+  // the provision (the account already exists and the caller still gets the
+  // credentials on screen). The password is passed to the template but the
+  // email service logs only to/subject/messageId, never the body.
+  let emailDelivery: DemoEmailDelivery | undefined;
+  if (opts.deliverTo !== undefined) {
+    if (!deliverTo) {
+      emailDelivery = { attempted: true, sent: false, error: 'invalid recipient email' };
+    } else {
+      try {
+        const r = await emailService.sendTemplate(deliverTo, 'demo_credentials', {
+          greetingName: label || 'there',
+          email: identity.email,
+          password,
+          loginUrl: url,
+        });
+        emailDelivery = { attempted: true, sent: r.success, to: deliverTo, error: r.success ? undefined : (r.error || 'send failed') };
+      } catch (e) {
+        emailDelivery = { attempted: true, sent: false, to: deliverTo, error: (e as Error)?.message || 'send exception' };
+      }
+    }
+    // Audit the delivery attempt WITHOUT the password.
+    logger.info('Demo credential email', { userId, to: deliverTo || null, sent: !!emailDelivery?.sent });
+  }
+
   return {
     userId,
     username: identity.username,
@@ -111,29 +155,45 @@ export async function provisionDemoAccount(opts: { label?: string | null; create
     createdBy,
     createdAt: new Date().toISOString(),
     password,
-    loginUrl: loginUrl(),
+    loginUrl: url,
+    emailDelivery,
   };
 }
 
 /** List demo accounts (newest first), flagging any whose underlying user is gone. */
 export async function listDemoAccounts(): Promise<DemoAccount[]> {
   await ensureRegistry();
+  // Left-join the live user + subscription rows so the operator can confirm at
+  // a glance that each demo account is where it should be: user still exists,
+  // email verified, premium active. 'active' status alone confers the tier
+  // (see services/premiumGrant), matching how the app's own gate reads it.
   const [rows] = await DB.query(
     `SELECT d.user_id, d.username, d.email, d.label, d.created_by, d.created_at,
-            EXISTS(SELECT 1 FROM users u WHERE u.id = d.user_id) AS user_exists
+            u.id AS live_user_id, u.email_verified,
+            s.tier AS sub_tier, s.status AS sub_status
        FROM demo_accounts d
+       LEFT JOIN users u ON u.id = d.user_id
+       LEFT JOIN user_subscriptions s ON s.user_id = d.user_id
       ORDER BY d.created_at DESC
       LIMIT 500`,
   );
-  return (rows as any[]).map((r) => ({
-    userId: Number(r.user_id),
-    username: String(r.username),
-    email: String(r.email),
-    label: r.label ?? null,
-    createdBy: r.created_by ?? null,
-    createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
-    userExists: Number(r.user_exists) === 1,
-  }));
+  return (rows as any[]).map((r) => {
+    const userExists = r.live_user_id != null;
+    const premiumTier = r.sub_tier ?? null;
+    const premiumActive = userExists && r.sub_status === 'active' && premiumTier === 'premium';
+    return {
+      userId: Number(r.user_id),
+      username: String(r.username),
+      email: String(r.email),
+      label: r.label ?? null,
+      createdBy: r.created_by ?? null,
+      createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+      userExists,
+      emailVerified: userExists ? Number(r.email_verified) === 1 : false,
+      premiumActive,
+      premiumTier,
+    };
+  });
 }
 
 /**
