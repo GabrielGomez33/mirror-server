@@ -41,3 +41,20 @@ export function isSimNamespace(username: string | null | undefined, email: strin
 export function assertRevocable(isRegisteredDemo: boolean): void {
   if (!isRegisteredDemo) throw new Error('refused: user is not a registered demo account');
 }
+
+/**
+ * Conservative recipient-email validity check for the optional "email the
+ * credentials to this person" feature. Intentionally strict-but-simple: a
+ * single address, one @, non-empty local + domain, a dotted TLD, no spaces,
+ * length-bounded. Rejects lists, display-name forms and obvious junk so we
+ * never hand the provider (or our logs) a malformed recipient. Returns the
+ * trimmed address when valid, else null.
+ */
+export function normalizeRecipientEmail(input: string | null | undefined): string | null {
+  const raw = String(input ?? '').trim();
+  if (!raw || raw.length > 254) return null;
+  if (/\s/.test(raw)) return null; // no spaces, no comma-separated lists
+  // local@domain.tld — one @, a dotted domain, no angle brackets/quotes.
+  if (!/^[^\s@<>"]+@[^\s@<>"]+\.[^\s@<>".]+$/.test(raw)) return null;
+  return raw;
+}

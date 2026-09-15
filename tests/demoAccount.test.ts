@@ -12,6 +12,7 @@ import {
   newDemoIdentity,
   isSimNamespace,
   assertRevocable,
+  normalizeRecipientEmail,
   DEMO_USERNAME_PREFIX,
   DEMO_EMAIL_DOMAIN,
 } from '../utils/demoIdentity';
@@ -74,6 +75,19 @@ for (let i = 0; i < 200; i++) {
 }
 // Distinct draws (not a constant).
 ok(strongRandomPassword() !== strongRandomPassword(), 'two generated passwords differ');
+
+// --- recipient-email validation for the optional credential email ---
+ok(normalizeRecipientEmail('  tester@acme.com ') === 'tester@acme.com', 'valid email is trimmed + accepted');
+ok(normalizeRecipientEmail('a.b+tag@sub.example.co.uk') === 'a.b+tag@sub.example.co.uk', 'plus/dotted/subdomain email accepted');
+ok(normalizeRecipientEmail('') === null, 'empty rejected');
+ok(normalizeRecipientEmail(null) === null, 'null rejected');
+ok(normalizeRecipientEmail('not-an-email') === null, 'missing @ rejected');
+ok(normalizeRecipientEmail('a@b') === null, 'missing TLD rejected');
+ok(normalizeRecipientEmail('a@b.') === null, 'empty TLD rejected');
+ok(normalizeRecipientEmail('two@a.com, three@b.com') === null, 'comma list rejected');
+ok(normalizeRecipientEmail('has space@a.com') === null, 'address with space rejected');
+ok(normalizeRecipientEmail('"Name" <x@a.com>') === null, 'display-name form rejected');
+ok(normalizeRecipientEmail('x@a.com' + 'a'.repeat(250)) === null, 'over-long rejected');
 
 if (fail) { console.error(`\ndemoAccount: ${pass} passed, ${fail} FAILED`); process.exit(1); }
 console.log(`demoAccount: ${pass} passed — demo identity is sweeper-safe, revoke is guarded, passwords are policy-correct`);
