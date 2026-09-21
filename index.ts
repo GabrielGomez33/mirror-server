@@ -286,6 +286,11 @@ APP.use(helmet({
 const ALLOWED_ORIGINS = [
   'https://www.theundergroundrailroad.world',
   'https://theundergroundrailroad.world',
+  // Marketing landing (separate domain). It fires anonymous landing_view beacons
+  // to /mirror/api/analytics/conversion cross-origin, so its origin must be
+  // allowlisted for the funnel to see the true top of the funnel.
+  'https://www.trymirror.world',
+  'https://trymirror.world',
 ];
 
 // Additional production origins (e.g. a new marketing/app domain) can be added
