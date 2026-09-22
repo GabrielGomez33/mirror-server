@@ -19,17 +19,18 @@
 
 // Ordered acquisition funnel. Order matters for aggregation (stage N→N+1 drop-off).
 export const FUNNEL_STAGES = [
-  'landing_view',       // 0  marketing landing page seen
-  'signup_view',        // 1  registration form seen
-  'signup_completed',   // 2  account created  (highest-value signal)
-  'entry_started',      // 3  Entry intake begun
-  'entry_first_value',  // 4  Entry result shown — the "aha" (highest-value signal)
-  'dashboard_view',     // 5  first dashboard view
-  'mymirror_view',      // 6  MyMirror self-reflection surface seen
-  'core_started',       // 7  deep Core intake begun (enrichment)
-  'core_completed',     // 8  deep Core intake finished
-  'premium_view',       // 9  premium/upgrade wall seen
-  'premium_activated',  // 10 premium purchase activated
+  'landing_view',       // 0  marketing landing page seen (trymirror.world)
+  'cta_click',          // 1  tapped a "into the app" CTA on the landing page
+  'signup_view',        // 2  registration form seen (app loaded)
+  'signup_completed',   // 3  account created  (highest-value signal)
+  'entry_started',      // 4  Entry intake begun
+  'entry_first_value',  // 5  Entry result shown — the "aha" (highest-value signal)
+  'dashboard_view',     // 6  first dashboard view
+  'mymirror_view',      // 7  MyMirror self-reflection surface seen
+  'core_started',       // 8  deep Core intake begun (enrichment)
+  'core_completed',     // 9  deep Core intake finished
+  'premium_view',       // 10 premium/upgrade wall seen
+  'premium_activated',  // 11 premium purchase activated
 ] as const;
 
 export type FunnelStage = (typeof FUNNEL_STAGES)[number];

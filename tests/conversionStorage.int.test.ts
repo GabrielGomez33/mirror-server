@@ -95,7 +95,7 @@ async function main() {
   await record('signup_completed', sesA);
   {
     const agg = await getFunnelAggregate(30);
-    ok(agg.stages.length === 11, 'aggregate returns all 11 known stages (zero-filled)');
+    ok(agg.stages.length === 12, 'aggregate returns all 12 known stages (zero-filled)');
     ok(agg.stages[0].stage === 'landing_view' && agg.stages[0].order === 0, 'stages returned in funnel order');
     const byStage = new Map(agg.stages.map((s) => [s.stage, s]));
     ok(byStage.get('landing_view')!.events === 2, 'landing_view: 2 events');
@@ -149,13 +149,13 @@ async function main() {
         await recordConversionEvent(clean);
       }
     };
-    // instagram: 1 stops at landing, 1 at signup_completed(order2), 1 goes all the way(order10)
+    // instagram: 1 stops at landing, 1 at signup_completed(order3), 1 goes all the way(order11)
     await emitPath(crypto.randomUUID(), 'instagram', 0);
-    await emitPath(crypto.randomUUID(), 'instagram', 2);
-    await emitPath(crypto.randomUUID(), 'instagram', 10);
-    // organic: 1 stops at landing, 1 at entry_first_value(order4)
+    await emitPath(crypto.randomUUID(), 'instagram', 3);
+    await emitPath(crypto.randomUUID(), 'instagram', 11);
+    // organic: 1 stops at landing, 1 at entry_first_value(order5)
     await emitPath(crypto.randomUUID(), 'organic', 0);
-    await emitPath(crypto.randomUUID(), 'organic', 4);
+    await emitPath(crypto.randomUUID(), 'organic', 5);
 
     const a = await getFunnelAnalytics(30);
     const reach = (stage: string) => a.metrics.steps.find((s) => s.stage === stage)!.sessionsReaching;
@@ -171,8 +171,8 @@ async function main() {
     ok(reach('entry_first_value') === 2, 'analytics: entry_first_value reaching = 2');
     ok(reach('premium_activated') === 1, 'analytics: premium_activated reaching = 1');
     ok(a.metrics.overallConversionPct === 20, 'analytics: overall conversion = 1/5 = 20%');
-    ok(!!a.metrics.biggestDrop && a.metrics.biggestDrop.fromStage === 'landing_view' && a.metrics.biggestDrop.toStage === 'signup_view' && a.metrics.biggestDrop.sessionsLost === 2,
-       'analytics: biggest drop is landing_view→signup_view (2 lost)');
+    ok(!!a.metrics.biggestDrop && a.metrics.biggestDrop.fromStage === 'landing_view' && a.metrics.biggestDrop.toStage === 'cta_click' && a.metrics.biggestDrop.sessionsLost === 2,
+       'analytics: biggest drop is landing_view→cta_click (2 lost)');
 
     // Per-source breakdown.
     const src = (name: string) => a.sources.find((s) => s.source === name);
