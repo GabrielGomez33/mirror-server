@@ -24,6 +24,7 @@ import {
   buildWaitlistWhere,
   buildRecipientInsert,
   SUBSCRIBABLE_WAITLIST_STATUSES,
+  WAITLIST_SPAMTRAP_EXCLUSION,
   AudienceFilter,
 } from '../services/audienceResolver';
 
@@ -97,28 +98,33 @@ eq(
 group('buildWaitlistWhere — own columns + status allow-list');
 eq(
   buildWaitlistWhere({ mode: 'all', source: 'waitlist' }),
-  { where: "w.email IS NOT NULL AND w.email <> '' AND w.status IN (?)", params: [[...SUBSCRIBABLE_WAITLIST_STATUSES]] },
-  'default subscribable statuses',
+  { where: `w.email IS NOT NULL AND w.email <> '' AND w.status IN (?) AND ${WAITLIST_SPAMTRAP_EXCLUSION}`, params: [[...SUBSCRIBABLE_WAITLIST_STATUSES]] },
+  'default subscribable statuses + spam-trap exclusion',
 );
 eq(
   buildWaitlistWhere({ mode: 'all', source: 'waitlist', waitlistStatuses: ['invited'] }),
-  { where: "w.email IS NOT NULL AND w.email <> '' AND w.status IN (?)", params: [['invited']] },
+  { where: `w.email IS NOT NULL AND w.email <> '' AND w.status IN (?) AND ${WAITLIST_SPAMTRAP_EXCLUSION}`, params: [['invited']] },
   'explicit valid status',
 );
 eq(
   buildWaitlistWhere({ mode: 'all', source: 'waitlist', waitlistStatuses: ['invited', 'bogus'] }),
-  { where: "w.email IS NOT NULL AND w.email <> '' AND w.status IN (?)", params: [['invited']] },
+  { where: `w.email IS NOT NULL AND w.email <> '' AND w.status IN (?) AND ${WAITLIST_SPAMTRAP_EXCLUSION}`, params: [['invited']] },
   'invalid status dropped, valid kept',
 );
 eq(
   buildWaitlistWhere({ mode: 'all', source: 'waitlist', waitlistStatuses: ['bogus'] }),
-  { where: "w.email IS NOT NULL AND w.email <> '' AND w.status IN (?)", params: [[...SUBSCRIBABLE_WAITLIST_STATUSES]] },
+  { where: `w.email IS NOT NULL AND w.email <> '' AND w.status IN (?) AND ${WAITLIST_SPAMTRAP_EXCLUSION}`, params: [[...SUBSCRIBABLE_WAITLIST_STATUSES]] },
   'all invalid -> fall back to subscribable',
 );
 eq(
   buildWaitlistWhere({ mode: 'all', source: 'waitlist', waitlistSource: 'landing', registeredBefore: '2026-01-01' }),
-  { where: "w.email IS NOT NULL AND w.email <> '' AND w.status IN (?) AND w.source = ? AND w.created_at < ?", params: [[...SUBSCRIBABLE_WAITLIST_STATUSES], 'landing', '2026-01-01'] },
+  { where: `w.email IS NOT NULL AND w.email <> '' AND w.status IN (?) AND w.source = ? AND w.created_at < ? AND ${WAITLIST_SPAMTRAP_EXCLUSION}`, params: [[...SUBSCRIBABLE_WAITLIST_STATUSES], 'landing', '2026-01-01'] },
   'source + date filters',
+);
+eq(
+  buildWaitlistWhere({ mode: 'all', source: 'waitlist', excludeSuspicious: false }),
+  { where: "w.email IS NOT NULL AND w.email <> '' AND w.status IN (?)", params: [[...SUBSCRIBABLE_WAITLIST_STATUSES]] },
+  'excludeSuspicious:false omits the spam-trap clause (debug/inspection)',
 );
 
 // ---------------------------------------------------------------------------

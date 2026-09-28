@@ -68,6 +68,10 @@ export interface AudienceFilter {
   waitlistStatuses?: string[];
   /** Restrict to a single signup surface, e.g. 'landing'. */
   waitlistSource?: string | null;
+  /** Deliverability hygiene (waitlist source): when not false (the default),
+   *  exclude obvious Gmail "dot-trap" throwaway addresses from the audience.
+   *  Pass false only for debugging/inspection. */
+  excludeSuspicious?: boolean;
 }
 
 export interface AudiencePreview {
@@ -88,6 +92,17 @@ export const SUBSCRIBABLE_WAITLIST_STATUSES = ['pending', 'confirmed', 'invited'
 const ALL_WAITLIST_STATUSES = new Set<string>([
   'pending', 'confirmed', 'invited', 'converted', 'unsubscribed',
 ]);
+
+// Deliverability hygiene: skip obvious Gmail "dot-trap" throwaway signups.
+// Gmail ignores dots in the local part, so an address like
+// p.a.t.r.i.c.i.a...@gmail.com is a disposable/spam variant, and mailing these
+// (often honeypots) damages the sending domain's reputation. Conservative on
+// purpose — only Gmail/Googlemail locals with >= 4 dots, which real users
+// effectively never have. Pure static SQL (no user input) on the `w.email`
+// column; safe to inline. Exported so the test can assert the exact clause.
+export const WAITLIST_SPAMTRAP_EXCLUSION =
+  "NOT (LOWER(SUBSTRING_INDEX(w.email, '@', -1)) IN ('gmail.com', 'googlemail.com') " +
+  "AND (CHAR_LENGTH(SUBSTRING_INDEX(w.email, '@', 1)) - CHAR_LENGTH(REPLACE(SUBSTRING_INDEX(w.email, '@', 1), '.', ''))) >= 4)";
 
 export function resolveSource(filter: AudienceFilter | undefined | null): AudienceSource {
   return filter?.source === 'waitlist' ? 'waitlist' : 'users';
@@ -202,6 +217,11 @@ export function buildWaitlistWhere(filter: AudienceFilter): { where: string; par
   if (filter.registeredAfter) {
     clauses.push('w.created_at >= ?');
     params.push(filter.registeredAfter);
+  }
+
+  // Default-on deliverability hygiene: drop obvious Gmail dot-trap addresses.
+  if (filter.excludeSuspicious !== false) {
+    clauses.push(WAITLIST_SPAMTRAP_EXCLUSION);
   }
 
   return { where: clauses.join(' AND '), params };
