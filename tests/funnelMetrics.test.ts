@@ -27,13 +27,15 @@ ok(ratePct(5, 0) === null, 'ratePct x/0 -> null');
 ok(ratePct(3, 3) === 100, 'ratePct 3/3 -> 100');
 
 // Per-session furthest-stage counts (1-based FIELD positions):
-//   100 stopped at landing (pos1), 50 at signup_completed (pos3),
-//   20 at entry_first_value (pos5), 5 at premium_activated (pos11).
+//   100 stopped at landing (pos1), 50 at signup_completed (pos4),
+//   20 at entry_first_value (pos6), 5 at premium_activated (pos12).
+//   (positions are 1-based; cta_click at pos2 shifted everything from
+//   signup_view onward by one.)
 const rows: ReachedRow[] = [
   { reached: 1, sessions: 100 },
-  { reached: 3, sessions: 50 },
-  { reached: 5, sessions: 20 },
-  { reached: 11, sessions: 5 },
+  { reached: 4, sessions: 50 },
+  { reached: 6, sessions: 20 },
+  { reached: 12, sessions: 5 },
 ];
 const sr = buildReachedFunnel(rows);
 
@@ -58,8 +60,9 @@ ok(m.overallConversionPct === ratePct(5, 175), 'overall conversion = premium/lan
 const step = (stage: string) => m.steps.find((s) => s.stage === stage)!;
 ok(step('landing_view').stepConversionPct === null, 'first stage has no step-conversion');
 ok(step('landing_view').cumulativeConversionPct === 100, 'first stage cumulative = 100%');
-ok(step('signup_view').sessionsLostFromPrev === 100, 'landing→signup_view loses 100 sessions');
-ok(step('signup_view').stepDropoffPct === ratePct(100, 175), 'landing→signup_view drop-off % correct');
+ok(step('cta_click').sessionsLostFromPrev === 100, 'landing→cta_click loses 100 sessions');
+ok(step('cta_click').stepDropoffPct === ratePct(100, 175), 'landing→cta_click drop-off % correct');
+ok(step('signup_view').sessionsLostFromPrev === 0, 'cta_click→signup_view loses 0 (all who clicked reached the form here)');
 ok(step('premium_activated').cumulativeConversionPct === ratePct(5, 175), 'premium cumulative vs entry correct');
 
 // --- milestones map to the right stages + rates ---
@@ -71,8 +74,8 @@ ok(mil('core_to_premium').ratePct === 100, 'core→premium milestone = 5/5 = 100
 
 // --- biggest drop = the step losing the most sessions ---
 ok(!!m.biggestDrop, 'a biggest drop is identified');
-ok(m.biggestDrop!.fromStage === 'landing_view' && m.biggestDrop!.toStage === 'signup_view',
-   'biggest drop is landing_view → signup_view');
+ok(m.biggestDrop!.fromStage === 'landing_view' && m.biggestDrop!.toStage === 'cta_click',
+   'biggest drop is landing_view → cta_click');
 ok(m.biggestDrop!.sessionsLost === 100, 'biggest drop lost 100 sessions');
 
 // --- empty input: no crash, all null/zero ---
